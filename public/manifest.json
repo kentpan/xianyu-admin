@@ -1,0 +1,21 @@
+{
+  "name": "闲鱼超级管家",
+  "short_name": "闲鱼管家",
+  "description": "现代化的闲鱼自动回复与管理平台",
+  "start_url": "/xianyu/dashboard",
+  "scope": "/xianyu/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0b1120",
+  "theme_color": "#f59e0b",
+  "icons": [
+    {
+      "src": "/xianyu/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["business", "productivity"],
+  "lang": "zh-CN"
+}

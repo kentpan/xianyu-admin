@@ -1,0 +1,36 @@
+# Cloudflare Pages / Workers 配置模板
+# 部署到 Cloudflare 时使用此配置。
+# 1. 复制此文件为 wrangler.toml
+# 2. 修改 name 和 database_name 为你的项目名
+# 3. 运行: npx wrangler deploy
+
+name = "xianyu-admin"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "./.output/public"
+
+# D1 数据库绑定 (在安装向导中选择 D1 时使用)
+[[d1_databases]]
+binding = "DB"
+database_name = "xianyu-admin-db"
+database_id = "你的-D1-数据库-ID"  # 在 Cloudflare 控制台创建 D1 后填入
+
+# KV Namespace 绑定 (用于会话存储等)
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "你的-KV-namespace-ID"
+
+# 环境变量 (安装完成后会通过 Cloudflare API 自动设置)
+# 以下变量在首次安装时由安装向导通过 API 设置，无需手动填写:
+# - XY_ADMIN_SECRET: 管理密钥
+# - XY_JWT_SECRET: JWT 签发密钥
+# - XY_DB_DRIVER: 数据库驱动 (d1)
+# - XY_INSTALLED: 安装标记 (true)
+
+# 本地开发环境变量 (wrangler dev 时使用)
+[vars]
+XY_DB_DRIVER = "d1"
+XY_INSTALLED = "false"
+
+# 构建命令
+# [build]
+# command = "bun run build"
