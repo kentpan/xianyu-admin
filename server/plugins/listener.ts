@@ -6,8 +6,12 @@
  *   - 启动 5s 门控巡检调度器 (engines.is_active === builtin 才真正服务, 切远程代理自动待命)
  */
 export default defineNitroPlugin((nitro) => {
-  const preset = String(process.env.NITRO_PRESET || '')
-  if (preset.includes('cloudflare') || preset.includes('cloud_module')) {
+  // 运行时判别唯一真源 = detectRuntime() (server/utils/config.ts)。
+  // 不能用 process.env.NITRO_PRESET 判断: 它是构建期变量, 部署后的
+  // Worker bundle 内不存在, 守卫失效会让下方 setTimeout 在 Worker
+  // 全局作用域求值, Pages 发布验证直接报
+  // "Disallowed operation called within global scope" 部署失败。
+  if (detectRuntime() === 'cloudflare') {
     console.log('[xianyu-engine] Cloudflare 运行时不支持长驻监听, 内置引擎跳过 (请部署远程代理)')
     return
   }

@@ -1,4 +1,6 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
+import pkg from './package.json'
+
 export default defineNuxtConfig({
   compatibilityDate: '2025-01-01',
   devtools: { enabled: false },
@@ -32,7 +34,8 @@ export default defineNuxtConfig({
     installed: process.env.XY_INSTALLED === 'true',
     public: {
       appName: process.env.XY_APP_NAME || '闲鱼超级管家',
-      appVersion: '2.0.3',
+      // 全局版本号唯一真源 = package.json 的 version 字段
+      appVersion: pkg.version,
       brandColor: 'amber',
       basePath: '',
     },
@@ -65,6 +68,11 @@ export default defineNuxtConfig({
   },
 
   nitro: {
+    experimental: {
+      // crossws WebSocket: edge (cloudflare-durable 预设) 走 $DurableObject hibernation,
+      // node 走 crossws node 适配器; 实时端点见 server/api/realtime/ws.get.ts
+      websocket: true,
+    },
     // Honor PORT from .env (default 3000)
     port: Number(process.env.PORT) || 3000,
     host: '0.0.0.0',
