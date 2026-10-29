@@ -1,4 +1,4 @@
-/** PUT /api/settings/ai — update ai_model / ai_api_url. */
+/** PUT /api/settings/ai — update ai_model / ai_api_url / ai_api_key. */
 export default defineEventHandler(
   withApi(async (event) => {
     requireAdmin(event)
@@ -9,6 +9,9 @@ export default defineEventHandler(
     }
     if (body.ai_api_url !== undefined) {
       updates.push({ key: 'ai_api_url', value: String(body.ai_api_url) })
+    }
+    if (body.ai_api_key !== undefined) {
+      updates.push({ key: 'ai_api_key', value: String(body.ai_api_key) })
     }
     if (body.default_reply !== undefined) {
       updates.push({ key: 'default_reply', value: String(body.default_reply) })

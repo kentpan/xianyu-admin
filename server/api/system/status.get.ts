@@ -9,6 +9,8 @@ export default defineEventHandler(
       appName: config.public.appName,
       appVersion: config.public.appVersion,
       runtime: detectRuntime(),
+      // 实时通道形态: edge DO hub 部署 → 'ws' (WebSocket), 其余 → 'sse'
+      realtime: isRealtimeHubEnabled() ? 'ws' : 'sse',
     })
   }),
 )

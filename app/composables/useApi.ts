@@ -1,11 +1,14 @@
 /**
- * useApi — unified fetch wrapper that:
- *  - prefixes API calls with the app basePath on the client (so requests route
- *    through the Next.js /admin/* proxy); on the server calls go direct to
- *    Nitro's /api/* (internal).
- *  - forwards the JWT cookie (credentials: include + SSR cookie passthrough)
- *  - unwraps the unified { success, code, message, data } envelope
- *  - throws ApiRequestError for non-success
+ * useApi — 统一 fetch 封装:
+ *  - 自动加 runtimeConfig.public.basePath 前缀 (主服务器为空, 部署到子路径时统一变量)
+ *  - 转发 JWT cookie (credentials: include + SSR cookie 透传)
+ *  - 解包统一 { success, code, message, data } 响应
+ *  - 非 success 抛出 ApiRequestError
+ *
+ * basePath 来自 runtimeConfig.public.basePath (nuxt.config.ts), 默认空 = 根路径。
+ * 部署到子路径时只需改这一个变量, 前端无需改动。
+ *
+ * 所有 API 路径字符串应集中在 app/api/ 模块中定义, 组件 import 调用, 避免硬编码散落。
  */
 export interface ApiResult<T = any> {
   success: boolean
@@ -27,13 +30,10 @@ export class ApiRequestError extends Error {
 
 export function useApi() {
   const config = useRuntimeConfig()
-  // Nuxt 4 mounts ALL routes (pages + API) under app.baseURL, so both SSR and
-  // CSR API calls must be prefixed with basePath ('/xianyu').
   const basePath = config.public.basePath || ''
 
   function buildUrl(url: string): string {
     if (url.startsWith('http')) return url
-    // url is like '/api/auth/login' → prefix with basePath
     if (basePath && url.startsWith('/')) return basePath + url
     return url
   }

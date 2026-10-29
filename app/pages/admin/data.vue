@@ -164,14 +164,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAdminTables, getAdminTableData, deleteAdminRow, truncateAdminTable, exportBackup as exportBackupApi, importBackup } from '~/api/admin'
+import type { TableInfo } from '~/api/admin'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface TableInfo { name: string; rows: number }
 
 const loading = ref(false)
 const tables = ref<TableInfo[]>([])
@@ -196,7 +194,7 @@ const lastRefreshLabel = computed(() => {
 async function reload() {
   loading.value = true
   try {
-    const r = await api.get<{ tables: TableInfo[]; total: number }>('/api/admin/data')
+    const r = await getAdminTables()
     tables.value = r.tables
     totalRows.value = r.total
     lastRefresh.value = new Date()
@@ -262,8 +260,10 @@ async function openTable(name: string) {
 async function loadViewer() {
   viewerLoading.value = true
   try {
-    const qs = new URLSearchParams({ page: String(viewerPage.value), pageSize: String(viewerPageSize.value) }).toString()
-    const r = await api.get<{ columns: string[]; rows: any[]; total: number; page: number; pageSize: number }>(`/api/admin/data/${viewerTable.value}?${qs}`)
+    const r = await getAdminTableData(viewerTable.value, {
+      page: viewerPage.value,
+      pageSize: viewerPageSize.value,
+    })
     viewerColumns.value = r.columns
     viewerRows.value = r.rows
     viewerTotal.value = r.total
@@ -285,7 +285,7 @@ async function deleteRow(row: any) {
   if (!pk) { toast.error('未找到主键'); return }
   if (!confirm(`确认删除该行（${pk}）？`)) return
   try {
-    await api.del(`/api/admin/data/${viewerTable.value}/${encodeURIComponent(pk)}`)
+    await deleteAdminRow(viewerTable.value, String(pk))
     toast.success('已删除')
     loadViewer()
     reload()
@@ -310,7 +310,7 @@ async function doTruncate() {
   if (!truncateTarget.value) return
   truncating.value = true
   try {
-    await api.del(`/api/admin/data/${truncateTarget.value}`, { body: { confirm: true } })
+    await truncateAdminTable(truncateTarget.value)
     toast.success(`已清空 ${truncateTarget.value}`)
     truncateTarget.value = null
     reload()
@@ -325,7 +325,7 @@ async function doTruncate() {
 async function exportBackup() {
   try {
     // useApi 会自动加 basePath；端点返回原始 JSON（无 success 信封），useApi 会原样透传
-    const res: any = await api.get('/api/admin/backup/export')
+    const res: any = await exportBackupApi()
     const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -359,7 +359,7 @@ async function doImport() {
   catch (e: any) { toast.error('JSON 格式错误: ' + e.message); return }
   importing.value = true
   try {
-    const r = await api.post<{ report: Record<string, { inserted: number; updated: number; skipped: number }> }>('/api/admin/backup/import', payload)
+    const r = await importBackup(payload)
     let inserted = 0, updated = 0, skipped = 0
     for (const k of Object.keys(r.report || {})) {
       inserted += r.report[k].inserted

@@ -6,7 +6,7 @@ export default defineNuxtPlugin(() => {
   if (import.meta.client && 'serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker
-        .register('/xianyu/sw.js', { scope: '/xianyu/' })
+        .register('/sw.js', { scope: '/' })
         .catch(() => {
           // SW registration failed — silently ignore
         })

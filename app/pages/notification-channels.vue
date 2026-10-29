@@ -146,21 +146,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getChannels, createChannel, updateChannel, testChannel, deleteChannel } from '~/api/notifications'
+import type { Channel } from '~/api/notifications'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface Channel {
-  id: number
-  name: string
-  type: string
-  config: string
-  enabled: number
-  created_at: string
-}
 
 interface ConfigField {
   key: string
@@ -277,7 +268,7 @@ function onTypeChange() {
 async function reload() {
   loading.value = true
   try {
-    channels.value = await api.get<Channel[]>('/api/notifications/channels')
+    channels.value = await getChannels()
   } catch (e: any) {
     toast.error(e.message || '加载失败')
   } finally {
@@ -318,10 +309,10 @@ async function saveChannel() {
       enabled: form.value.enabled,
     }
     if (editing.value) {
-      await api.put(`/api/notifications/channels/${form.value.id}`, payload)
+      await updateChannel(form.value.id, payload)
       toast.success('渠道已更新')
     } else {
-      await api.post('/api/notifications/channels', payload)
+      await createChannel(payload)
       toast.success('渠道已创建')
     }
     modalOpen.value = false
@@ -335,7 +326,7 @@ async function saveChannel() {
 
 async function toggleEnabled(c: Channel) {
   try {
-    await api.put(`/api/notifications/channels/${c.id}`, { enabled: !c.enabled })
+    await updateChannel(c.id, { enabled: !c.enabled })
     c.enabled = c.enabled ? 0 : 1
     toast.success(c.enabled ? '已启用' : '已停用')
   } catch (e: any) {
@@ -347,9 +338,7 @@ async function testChannel(c: Channel) {
   if (testingId.value !== null) return
   testingId.value = c.id
   try {
-    const res = await api.post<{ sent?: boolean; error?: string; message?: string }>(
-      `/api/notifications/channels/${c.id}/test`,
-    )
+    const res = await testChannel(c.id)
     if (res && res.sent === false) {
       toast.error('发送失败: ' + (res.error || '未知错误'))
     } else if (res && res.message && res.message.includes('模拟')) {
@@ -372,7 +361,7 @@ async function doDelete() {
   if (!deleteTarget.value) return
   deleting.value = true
   try {
-    await api.del(`/api/notifications/channels/${deleteTarget.value.id}`)
+    await deleteChannel(deleteTarget.value.id)
     toast.success('渠道已删除')
     deleteTarget.value = null
     reload()

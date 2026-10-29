@@ -11,3 +11,4 @@ install.lock
 .DS_Store
 .env
 *.zip
+download/

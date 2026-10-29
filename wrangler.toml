@@ -1,0 +1,50 @@
+# wrangler.toml — xianyu-admin Cloudflare Pages 部署参考配置(Nuxt 4 + Nitro)
+#
+# ⚠️ 注意: 本文件仅作为本地参考与 `npx wrangler pages deploy dist` 手动部署用。
+# GitHub Actions 部署工作流(.github/workflows/pages-deploy.yml)会按 deploy.config.js
+# 动态重新生成此文件(填入实际 D1 database_id / DO 绑定等), 因此直接修改本文件不影响 CI 部署。
+#
+# ❗ Pages 项目不能在自身内创建/部署 DO 类(平台限制, 官方文档: "You cannot create and
+#   deploy a Durable Object within a Pages project") —— 但可以绑定外部 Worker 承载的 DO。
+#   本仓库自带配套实时 Worker(edge-realtime/, DO hub):
+#   1. 先部署配套 Worker(独立部署 DO hub, 自动应用 migrations):
+#        npx wrangler deploy -c edge-realtime/wrangler.toml
+#        printf '%s' "$JWT_SECRET" | npx wrangler secret put XY_JWT_SECRET -c edge-realtime/wrangler.toml
+#   2. 再部署站点(下方 REALTIME_DO 绑定 script_name 指向配套 Worker):
+#        NITRO_PRESET=cloudflare-pages npx nuxt build && npx wrangler pages deploy dist
+#   站点服务端 /api/realtime/ws 鉴权后把 WS 升级直呼转发进该 DO, publishToHub 广播同走
+#   绑定 —— 浏览器始终只连站点域名(同源), 前端零改动。CI(.github/workflows/
+#   pages-deploy.yml + deploy.config.js realtime 块)自动完成以上全部。
+#   详见 docs/cloudflare-durable-websocket.md。
+#   (不用 DO 时注释掉绑定段即可, 实时推送退回 SSE。)
+#
+# 部署链路(Nuxt 原生, 无适配层):
+#   1. NITRO_PRESET=cloudflare-pages npx nuxt build   # 产物 dist/(_worker.js/ + _routes.json + 静态资源)
+#   2. npx wrangler pages dev dist                    # 本地 workerd 预览(真实 Pages 运行时)
+#   3. npx wrangler pages deploy dist                 # 发布为 Pages 项目(需 CLOUDFLARE_API_TOKEN)
+#
+# 运行时数据层: D1 绑定(binding "DB", server/utils/db.ts 自动检测) → d1Orm 轻量 ORM;
+# 本地 Node 环境则走内置 node:sqlite 打开 prisma/xianyu_admin.db, 与 D1 同一套 SQL 方言。
+
+name = "xianyu-admin"
+# Pages 配置: pages_build_output_dir = Nitro cloudflare-pages preset 的产物目录
+pages_build_output_dir = "dist"
+compatibility_date = "2026-08-01"  # ≥2025-04-01: workerd 开放 node:sqlite(数据层依赖)
+compatibility_flags = ["nodejs_compat"]
+
+# ==== D1 绑定(部署绑定; CI 自动创建/填入实际 ID) ====
+# 本地手动部署前请先填入真实 database_id(或由 CI 生成):
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "xianyu-admin"
+# database_id = "<由 wrangler d1 create 返回>"
+
+# ==== DO hub 绑定(配套 edge-realtime Worker; Pages 不能自承载 DO 类) ====
+# 前置: 配套 Worker 已部署(npx wrangler deploy -c edge-realtime/wrangler.toml)
+# [[durable_objects.bindings]]
+# name = "REALTIME_DO"
+# class_name = "EdgeRealtimeDO"
+# script_name = "xianyu-admin-realtime"
+
+# [vars]
+# NODE_ENV = "production"

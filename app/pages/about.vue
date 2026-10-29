@@ -7,7 +7,7 @@
       <div class="absolute inset-0 bg-gradient-to-br from-brand-50 via-transparent to-transparent dark:from-brand-900/20" />
       <div class="relative">
         <div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 flex items-center justify-center text-white shadow-lg shadow-brand-500/30 mb-3">
-          <Icon name="message" class="text-3xl" />
+          <Icon name="fish" class="text-3xl" />
         </div>
         <h2 class="text-2xl font-bold text-slate-900 dark:text-white">{{ appName }}</h2>
         <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Xianyu Super Butler · v{{ version }}</p>
@@ -97,9 +97,6 @@
         <Icon name="info" class="text-brand-500" /> 链接与声明
       </h3>
       <div class="flex items-center gap-2 flex-wrap">
-        <a href="https://github.com/Mxucc/xianyu-super-butler" target="_blank" rel="noopener noreferrer" class="btn-secondary">
-          <Icon name="external" /> 源项目仓库
-        </a>
         <NuxtLink to="/disclaimer" class="btn-secondary">
           <Icon name="disclaimer" /> 免责声明
         </NuxtLink>
@@ -108,7 +105,7 @@
         </NuxtLink>
       </div>
       <div class="rounded-lg bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/30 p-3 text-xs text-amber-700 dark:text-amber-300">
-        本项目为对原 xianyu-super-butler 项目的 Nuxt 4 + Tailwind 3.4.19 技术栈复刻，仅供学习研究使用。使用者需自行承担一切后果，详见免责声明。
+        本项目为闲鱼账号管理工具，仅供学习研究使用。使用者需自行承担一切后果，详见免责声明。
       </div>
       <p class="text-xs text-slate-400 text-center pt-2">© {{ year }} {{ appName }} · Made with Nuxt & Tailwind</p>
     </div>
@@ -116,32 +113,13 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAboutStats } from '~/api/about'
+import type { ProjectMetrics } from '~/api/about'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
-
 const version = ref('1.0.0')
 const appName = ref('闲鱼超级管家')
-
-interface ProjectMetrics {
-  users: number
-  accounts: number
-  orders: number
-  items: number
-  keywords: number
-  cards: number
-  deliveryRules: number
-  channels: number
-  settings: number
-  logs: number
-  tableCount: number
-  driver: string
-  appName: string
-  appVersion: string
-  uptime: number
-}
 
 const metrics = ref<ProjectMetrics>({
   users: 0, accounts: 0, orders: 0, items: 0, keywords: 0, cards: 0,
@@ -191,7 +169,7 @@ const InfoRow = defineComponent({
 
 async function loadMetrics() {
   try {
-    const r = await api.get<ProjectMetrics>('/api/about/stats')
+    const r = await getAboutStats()
     metrics.value = r
     if (r.appName) appName.value = r.appName
     if (r.appVersion) version.value = r.appVersion

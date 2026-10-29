@@ -77,16 +77,14 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAccounts } from '~/api/accounts'
+import type { AccountLite } from '~/api/accounts'
+import { getChannels, getMessageNotifications, saveMessageNotification } from '~/api/notifications'
+import type { ChannelLite, MessageNotification } from '~/api/notifications'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface AccountLite { id: string; remark: string }
-interface ChannelLite { id: number; name: string; type: string; enabled: number }
-interface MessageNotification { id: number; cookie_id: string; channel_id: number; enabled: number }
 
 const CHANNEL_TYPE_META: Record<string, { label: string; icon: string; cls: string }> = {
   qq: { label: 'QQ', icon: 'message', cls: 'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-300' },
@@ -117,9 +115,9 @@ async function reload() {
   loading.value = true
   try {
     const [accs, chs, mns] = await Promise.all([
-      api.get<AccountLite[]>('/api/accounts'),
-      api.get<ChannelLite[]>('/api/notifications/channels'),
-      api.get<MessageNotification[]>('/api/notifications/messages'),
+      getAccounts(),
+      getChannels(),
+      getMessageNotifications(),
     ])
     accounts.value = accs
     channels.value = chs.filter((c) => c.enabled)
@@ -140,7 +138,7 @@ async function toggle(cookieId: string, channelId: number) {
   const next = !matrixKey(cookieId, channelId)
   toggling.value.add(key)
   try {
-    await api.post(`/api/notifications/messages/${encodeURIComponent(cookieId)}`, {
+    await saveMessageNotification(cookieId, {
       channel_id: channelId,
       enabled: next,
     })

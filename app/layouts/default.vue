@@ -21,6 +21,8 @@
     <CommandPalette v-model="cmdOpen" />
     <!-- Keyboard shortcut help (? key) -->
     <ShortcutHelp v-model="shortcutOpen" />
+    <!-- 风控人工验证全局弹窗 (token 连败 ≥3 次自动弹出) -->
+    <VerifySliderModal />
   </div>
 </template>
 

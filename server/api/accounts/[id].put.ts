@@ -1,13 +1,16 @@
 /** PUT /api/accounts/:id — update cookie fields. */
 export default defineEventHandler(
   withApi(async (event) => {
-    requireUser(event)
+    const payload = requireUser(event)
     const id = getRouterParam(event, 'id') || ''
     const db = await getDb()
     const body = await readBody(event) || {}
 
-    const existing = await db.get('SELECT id FROM cookies WHERE id = ?', [id])
+    const existing = await db.get('SELECT id, user_id FROM cookies WHERE id = ?', [id])
     if (!existing) throw new ApiError(404, '账号不存在')
+    if (!payload.isAdmin && existing.user_id !== payload.userId) {
+      throw new ApiError(403, '无权操作此账号')
+    }
 
     const fields: string[] = []
     const params: any[] = []

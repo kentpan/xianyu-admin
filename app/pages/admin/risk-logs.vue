@@ -97,24 +97,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getRiskLogs, deleteRiskLog } from '~/api/admin'
+import type { RiskLog } from '~/api/admin'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface RiskLog {
-  id: number
-  cookie_id: string
-  event_type: string
-  event_description: string | null
-  processing_result: string | null
-  processing_status: string
-  error_message: string | null
-  created_at: string
-  updated_at: string
-}
 
 const STATUS_META: Record<string, { cls: string; dot: string; label: string }> = {
   processing: { cls: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300', dot: 'bg-amber-500', label: '处理中' },
@@ -136,11 +124,12 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.v
 async function reload() {
   loading.value = true
   try {
-    const params: any = { page: page.value, pageSize: pageSize.value }
-    if (filters.cookie_id.trim()) params.cookie_id = filters.cookie_id.trim()
-    if (filters.status) params.status = filters.status
-    const qs = new URLSearchParams(params).toString()
-    const r = await api.get<{ data: RiskLog[]; total: number; page: number; pageSize: number }>(`/api/admin/risk-logs?${qs}`)
+    const r = await getRiskLogs({
+      page: page.value,
+      pageSize: pageSize.value,
+      cookie_id: filters.cookie_id.trim() || undefined,
+      status: filters.status || undefined,
+    })
     logs.value = r.data
     total.value = r.total
   } catch (e: any) {
@@ -164,7 +153,7 @@ function goPage(p: number) {
 async function deleteOne(r: RiskLog) {
   if (!confirm('确认删除该风控日志？')) return
   try {
-    await api.del(`/api/admin/risk-logs/${r.id}`)
+    await deleteRiskLog(r.id)
     toast.success('已删除')
     reload()
   } catch (e: any) {

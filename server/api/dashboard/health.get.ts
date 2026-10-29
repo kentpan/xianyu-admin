@@ -1,4 +1,6 @@
 /** GET /api/dashboard/health — system health (uptime, memory, DB size, table counts). */
+import { databaseFilePath } from '../../utils/db-config'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
@@ -18,7 +20,7 @@ export default defineEventHandler(
       try {
         const fs = await import('node:fs')
         const path = await import('node:path')
-        const dbPath = (state.dbUrl || 'data/xianyu_admin.db').replace(/^file:/, '')
+        const dbPath = databaseFilePath()
         if (fs.existsSync(dbPath)) {
           dbSize = fs.statSync(dbPath).size
         }

@@ -1,4 +1,6 @@
 /** Auth state shared across the app (Nuxt useState — SSR-friendly). */
+import { verifyAuth, login as apiLogin, logout as apiLogout } from '~/api/auth'
+
 export interface AuthUser {
   user_id: number
   username: string
@@ -25,11 +27,8 @@ export function useAuth() {
   }
 
   async function fetchUser() {
-    const api = useApi()
     try {
-      const data = await api.get<{ authenticated: boolean; user_id: number; username: string; is_admin: boolean; email?: string }>(
-        '/api/auth/verify',
-      )
+      const data = await verifyAuth()
       if (data?.authenticated) {
         user.value = {
           user_id: data.user_id,
@@ -52,16 +51,14 @@ export function useAuth() {
   }
 
   async function login(username: string, password: string) {
-    const api = useApi()
-    const data = await api.post<{ token: string; user: AuthUser }>('/api/auth/login', { username, password })
+    const data = await apiLogin(username, password)
     setAuth(data.token, data.user)
     return data
   }
 
   async function logout() {
-    const api = useApi()
     try {
-      await api.post('/api/auth/logout')
+      await apiLogout()
     } catch {
       /* ignore */
     }

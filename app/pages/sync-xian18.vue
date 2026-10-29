@@ -116,37 +116,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { syncXian18, consumeXian18 } from '~/api/sync'
+import type { Xian18Commodity, ConsumeResult } from '~/api/sync'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface Xian18Commodity {
-  id: number
-  name: string
-  description: string
-  price: number
-  userPrice: number
-  factoryPrice: number
-  code: string
-  categoryId: number
-  categoryName: string
-  cover: string
-  stock: number
-  cardStock: number
-  sort: number
-  minimum: number
-  maximum: number
-}
-
-interface ConsumeResult {
-  commodityId: number
-  commodityName: string
-  quantity: number
-  cards: { id: number; secret: string }[]
-}
 
 const list = ref<Xian18Commodity[]>([])
 const loading = ref(false)
@@ -164,7 +139,7 @@ async function loadList() {
 async function syncFromXian18() {
   syncing.value = true
   try {
-    const r = await api.get<{ commodities: Xian18Commodity[]; total: number; syncedAt: string }>('/api/sync/xian18')
+    const r = await syncXian18()
     list.value = r.commodities || []
     lastSyncedAt.value = new Date(r.syncedAt || Date.now()).toLocaleString('zh-CN')
     toast.success(`同步成功,共 ${r.total} 个商品`)
@@ -178,7 +153,7 @@ async function syncFromXian18() {
 async function consumeOne(c: Xian18Commodity) {
   consuming.value = c.id
   try {
-    const r = await api.post<ConsumeResult>('/api/sync/xian18-consume', {
+    const r = await consumeXian18({
       commodityId: c.id,
       quantity: 1,
       externalOrderNo: `xy-manual-${Date.now()}`,

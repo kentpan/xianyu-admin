@@ -99,34 +99,26 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAdminUsers, updateAdminUser, deleteAdminUser } from '~/api/admin'
+import type { AdminUser } from '~/api/admin'
+import { verifyAuth } from '~/api/auth'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface User {
-  id: number
-  username: string
-  email: string
-  is_active: number
-  is_admin: number
-  created_at: string
-}
 
 const loading = ref(false)
 const deleting = ref(false)
-const users = ref<User[]>([])
-const deleteTarget = ref<User | null>(null)
+const users = ref<AdminUser[]>([])
+const deleteTarget = ref<AdminUser | null>(null)
 const me = ref<{ userId: number } | null>(null)
 
 async function reload() {
   loading.value = true
   try {
     const [usersData, meData] = await Promise.all([
-      api.get<User[]>('/api/admin/users'),
-      api.get<{ userId: number; username: string; isAdmin: boolean }>('/api/auth/verify').catch(() => null),
+      getAdminUsers(),
+      verifyAuth().catch(() => null),
     ])
     users.value = usersData
     me.value = meData as any
@@ -137,9 +129,9 @@ async function reload() {
   }
 }
 
-async function toggleActive(u: User) {
+async function toggleActive(u: AdminUser) {
   try {
-    await api.put(`/api/admin/users/${u.id}`, { is_active: !u.is_active })
+    await updateAdminUser(u.id, { is_active: !u.is_active })
     u.is_active = u.is_active ? 0 : 1
     toast.success(u.is_active ? '已启用' : '已禁用')
   } catch (e: any) {
@@ -147,9 +139,9 @@ async function toggleActive(u: User) {
   }
 }
 
-async function toggleAdmin(u: User) {
+async function toggleAdmin(u: AdminUser) {
   try {
-    await api.put(`/api/admin/users/${u.id}`, { is_admin: !u.is_admin })
+    await updateAdminUser(u.id, { is_admin: !u.is_admin })
     u.is_admin = u.is_admin ? 0 : 1
     toast.success(u.is_admin ? '已设为管理员' : '已取消管理员')
   } catch (e: any) {
@@ -157,7 +149,7 @@ async function toggleAdmin(u: User) {
   }
 }
 
-function confirmDelete(u: User) {
+function confirmDelete(u: AdminUser) {
   if (me.value && u.id === me.value.userId) {
     toast.error('不能删除自己')
     return
@@ -169,7 +161,7 @@ async function doDelete() {
   if (!deleteTarget.value) return
   deleting.value = true
   try {
-    await api.del(`/api/admin/users/${deleteTarget.value.id}`)
+    await deleteAdminUser(deleteTarget.value.id)
     toast.success('用户已删除')
     deleteTarget.value = null
     reload()

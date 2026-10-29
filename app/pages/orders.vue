@@ -201,7 +201,9 @@
           </div>
           <div class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
             <span class="text-slate-400">金额</span>
-            <span class="col-span-2 font-medium">¥{{ detail.amount || '0' }} × {{ detail.quantity || 1 }}</span>
+            <span class="col-span-2">
+              <input v-model="editForm.amount" class="input !py-1 !h-8" placeholder="如 12.50" />
+            </span>
           </div>
           <div v-if="detail.spec_value" class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
             <span class="text-slate-400">规格</span>
@@ -303,36 +305,15 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi } from '~/api/orders'
+import type { Order } from '~/api/orders'
+import { getAccounts } from '~/api/accounts'
+import type { AccountLite } from '~/api/accounts'
+import { exportCsv } from '~/api/export'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface Order {
-  order_id: string
-  item_id: string | null
-  buyer_id: string | null
-  spec_name: string | null
-  spec_value: string | null
-  quantity: string | null
-  amount: string | null
-  order_status: string
-  cookie_id: string | null
-  chat_id: string
-  is_bargain: number
-  receiver_name: string
-  receiver_phone: string
-  receiver_address: string
-  receiver_city: string
-  created_at: string
-  updated_at: string
-  item_title?: string | null
-  cookie_remark?: string | null
-}
-
-interface AccountLite { id: string; remark: string }
 
 const statusOptions = [
   { value: 'all', label: '全部' },
@@ -401,7 +382,7 @@ async function doBatchAction(action: 'ship' | 'delete' | 'export') {
   if (!selectedIds.value.length) return
   batching.value = action
   try {
-    const r = await api.post<{ affected?: number; count?: number; orders?: any[] }>(`/api/orders/batch`, { ids: selectedIds.value, action })
+    const r = await batchOrders(selectedIds.value, action)
     if (action === 'export') {
       const blob = new Blob([JSON.stringify(r.orders || [], null, 2)], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
@@ -448,18 +429,19 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.v
 async function reload() {
   loading.value = true
   try {
-    const params: any = { page: page.value, pageSize: pageSize.value }
-    if (filters.status && filters.status !== 'all') params.status = filters.status
-    if (filters.cookie_id) params.cookie_id = filters.cookie_id
-    if (filters.keyword.trim()) params.keyword = filters.keyword.trim()
-    if (filters.dateFrom) params.dateFrom = filters.dateFrom
-    if (filters.dateTo) params.dateTo = filters.dateTo
-    if (filters.amountMin) params.amountMin = filters.amountMin
-    if (filters.amountMax) params.amountMax = filters.amountMax
-    const qs = new URLSearchParams(params).toString()
     const [ordersData, accountsData] = await Promise.all([
-      api.get<{ data: Order[]; total: number; page: number; pageSize: number }>(`/api/orders?${qs}`),
-      api.get<AccountLite[]>('/api/accounts'),
+      getOrders({
+        page: page.value,
+        pageSize: pageSize.value,
+        status: filters.status !== 'all' ? filters.status : undefined,
+        cookie_id: filters.cookie_id || undefined,
+        keyword: filters.keyword.trim() || undefined,
+        dateFrom: filters.dateFrom || undefined,
+        dateTo: filters.dateTo || undefined,
+        amountMin: filters.amountMin || undefined,
+        amountMax: filters.amountMax || undefined,
+      }),
+      getAccounts(),
     ])
     orders.value = ordersData.data
     total.value = ordersData.total
@@ -481,6 +463,7 @@ function openDetail(o: Order) {
   detail.value = o
   Object.assign(editForm, {
     order_status: o.order_status,
+    amount: o.amount || '',
     receiver_name: o.receiver_name || '',
     receiver_phone: o.receiver_phone || '',
     receiver_address: o.receiver_address || '',
@@ -493,7 +476,7 @@ async function saveDetail() {
   if (!detail.value) return
   saving.value = true
   try {
-    await api.put(`/api/orders/${encodeURIComponent(detail.value.order_id)}`, { ...editForm })
+    await updateOrder(detail.value.order_id, { ...editForm })
     toast.success('订单已更新')
     Object.assign(detail.value, editForm)
     detailOpen.value = false
@@ -507,7 +490,7 @@ async function saveDetail() {
 
 async function refreshOne(o: Order) {
   try {
-    await api.post(`/api/orders/${encodeURIComponent(o.order_id)}/refresh`)
+    await refreshOrder(o.order_id)
     toast.success(`订单 ${o.order_id} 已同步`)
   } catch (e: any) {
     toast.error(e.message || '同步失败')
@@ -515,30 +498,28 @@ async function refreshOne(o: Order) {
 }
 
 async function syncAll() {
-  if (!orders.value.length) {
-    toast.info('当前没有可同步的订单')
-    return
-  }
   syncing.value = true
-  let ok = 0
-  let fail = 0
-  await Promise.all(orders.value.map(async (o) => {
-    try {
-      await api.post(`/api/orders/${encodeURIComponent(o.order_id)}/refresh`)
-      ok++
-    } catch {
-      fail++
-    }
-  }))
-  syncing.value = false
-  toast.success(`已同步 ${ok} 个订单${fail ? `，失败 ${fail}` : ''}`)
-  reload()
+  try {
+    // 批量实查闲鱼订单详情 (服务端限速 300ms/单 + Cookie 复用, 终态订单自动跳过)
+    const r = await refreshAllOrders({ cookie_id: filters.cookie_id || undefined })
+    const parts = [`共 ${r.total} 单待刷新`]
+    if (r.updated) parts.push(`状态更新 ${r.updated}`)
+    if (r.no_change) parts.push(`无变化 ${r.no_change}`)
+    if (r.failed) parts.push(`失败 ${r.failed}`)
+    if (!r.total) toast.info('没有需要刷新的订单 (终态订单自动跳过)')
+    else toast.success(parts.join(', '))
+  } catch (e: any) {
+    toast.error(e.message || '同步失败')
+  } finally {
+    syncing.value = false
+    reload()
+  }
 }
 
 async function manualShip(o: Order | null) {
   if (!o) return
   try {
-    await api.post('/api/orders/manual-ship', { order_id: o.order_id, mode: 'status_only' })
+    await manualShipApi({ order_id: o.order_id, mode: 'status_only' })
     toast.success(`订单 ${o.order_id} 已标记为已发货`)
     if (detailOpen.value) detailOpen.value = false
     reload()
@@ -550,7 +531,7 @@ async function manualShip(o: Order | null) {
 async function deleteOne(o: Order) {
   if (!confirm(`确认删除订单「${o.order_id}」？`)) return
   try {
-    await api.del(`/api/orders/${encodeURIComponent(o.order_id)}`)
+    await deleteOrder(o.order_id)
     toast.success('订单已删除')
     reload()
   } catch (e: any) {
@@ -574,7 +555,7 @@ async function doImport() {
   }
   importing.value = true
   try {
-    const r = await api.post<{ inserted: number; updated: number }>('/api/orders/import', { orders: arr })
+    const r = await importOrders(arr)
     toast.success(`已导入 ${r.inserted} 条，更新 ${r.updated} 条`)
     importOpen.value = false
     reload()
@@ -587,7 +568,7 @@ async function doImport() {
 
 async function exportOrders() {
   try {
-    const r = await api.get<{ orders: Order[]; count: number }>('/api/orders/export')
+    const r = await exportOrdersApi()
     const blob = new Blob([JSON.stringify(r.orders, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -603,7 +584,7 @@ async function exportOrders() {
 
 async function exportCSV() {
   try {
-    const r = await api.get<{ orders: Order[]; count: number }>('/api/orders/export')
+    const r = await exportOrdersApi()
     const headers = ['订单号', '商品ID', '买家', '金额', '状态', '规格', '收货人', '手机号', '地址', '城市', '创建时间']
     const rows = r.orders.map((o) => [
       o.order_id, o.item_id || '', o.buyer_id || '', o.amount || '', o.order_status || '',
@@ -612,7 +593,7 @@ async function exportCSV() {
       o.created_at || '',
     ])
     // useApi 会自动加 basePath；csv 端点返回原始 CSV 字符串（无 success 信封），useApi 会原样透传
-    const csv = await api.post<string>('/api/export/csv', { filename: `orders-${Date.now()}.csv`, headers, rows })
+    const csv = await exportCsv({ filename: `orders-${Date.now()}.csv`, headers, rows })
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')

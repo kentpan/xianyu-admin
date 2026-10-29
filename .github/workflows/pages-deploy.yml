@@ -1,0 +1,1434 @@
+# ============================================================================
+# pages-deploy.yml — 通用 Cloudflare 部署工作流(npm + Pages/Workers 双部署类型版;
+# Nuxt/Next 自动识别)。项目名/D1 开关等全部配置收敛于 deploy.config.js, 本地
+# 数据库文件路径/名称唯一真源 = .env 的 DATABASE_URL; wrangler.toml 由本工作流
+# 按配置动态生成(仓库无需携带) —— 复制两件套(pages-deploy.yml +
+# deploy.config.js)到任何 Nuxt/Next 项目即可直接使用。
+# ============================================================================
+# 需要在 GitHub 仓库 Settings → Secrets and variables → Actions 配置:
+#   Secrets(必填):
+#     CLOUDFLARE_API_TOKEN  部署权限(Pages:Edit + Workers Scripts:Edit, 建议含 D1:Edit)
+#     ADMIN_SECRET          管理后台密码(与本地 .env 的 ADMIN_SECRET 一致)
+#     JWT_SECRET            JWT 签名密钥(与本地 .env 的 JWT_SECRET 一致)
+#   Variables(可选):
+#     DEPLOYTYPE            部署类型覆盖(workers|pages; 高于 deploy.config.js deployType)
+#     NEXT_PUBLIC_WS_URL    浏览器端直连远程 WS 地址(留空=本地网关)
+#     PROXY_MODE / LANGUAGE 站点代理模式与语言模式(覆盖仓库 .env)
+#   Secrets(可选):
+#     REMOTE_WS_URL         服务端使用的远程 WS 地址(可选; 兼容旧名 GEMTD_WS_URL)
+#     CLOUDFLARE_ACCOUNT_ID 账号 ID(缺省自动探测)
+#   边缘实时通道(v8.9.13): deploy.config.js realtime.enabled=true 即启用, 无需额外
+#     secret —— 配套 edge-realtime Worker 复用 JWT_SECRET 作为 XY_JWT_SECRET; 仓库
+#     须携带 edge-realtime/index.js(缺失报错终止)。免费计划 DO 配额:
+#     10 万请求/天 + 13,000 GB-s/天(Hibernation 空闲不计时长), 管理后台场景极富余。
+# ============================================================================
+
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: '项目名称(留空则读取 deploy.config.js)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: pages-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # OpenNext Cloudflare 适配器构建产物目录(worker.js + assets/; workers 部署入口)
+  OPENNEXT_OUTPUT_DIR: .open-next
+  # v8.9.12: npm ci 在 postinstall(prisma generate 等)阶段需要非空占位(不连接
+  # 数据库)。数据库文件路径唯一真源 = 仓库 .env 的 DATABASE_URL(由 "Resolve
+  # database file from .env" 步骤解析并导出 DATABASE_URL_VALUE, 各步骤引用);
+  # 此处静态值仅为 .env 缺失时的最终回落(与 server/utils/db.ts 内置默认一致)
+  DATABASE_URL: "file:./avatar-nuxt.db"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # 运行时密钥(部署前经 Pages API 写入项目 env_vars secret_text)
+      ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      # 可选：远程模式 websocket 地址（留空 = 本地网关; 兼容旧名 GEMTD_WS_URL）
+      REMOTE_WS_URL: ${{ secrets.REMOTE_WS_URL || secrets.GEMTD_WS_URL }}
+      NEXT_PUBLIC_WS_URL: ${{ vars.NEXT_PUBLIC_WS_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect framework (Nuxt / Next)
+        id: framework
+        run: |
+          # v8.7.0 需求1: 按 nuxt.config.js|.ts / next.config.js|.ts 判定框架,
+          # 后续编译/部署步骤按 FRAMEWORK 分支执行(两者共存或都不存在 → 报错退出)。
+          HAS_NUXT=false
+          HAS_NEXT=false
+          for f in nuxt.config.js nuxt.config.ts; do [ -f "$f" ] && HAS_NUXT=true; done
+          for f in next.config.js next.config.ts; do [ -f "$f" ] && HAS_NEXT=true; done
+
+          if [ "$HAS_NUXT" = "true" ] && [ "$HAS_NEXT" = "true" ]; then
+            echo "::error::同时检测到 nuxt.config.* 与 next.config.*, 无法判定框架, 请移除多余的框架配置文件。"
+            exit 1
+          fi
+
+          if [ "$HAS_NUXT" = "true" ]; then
+            FRAMEWORK="nuxt"
+            echo "::notice::检测到 nuxt.config.* → Nuxt 项目: Nitro 编译 → Cloudflare Pages/Workers 部署(按 deployType)"
+          elif [ "$HAS_NEXT" = "true" ]; then
+            FRAMEWORK="next"
+            echo "::notice::检测到 next.config.* → Next.js 项目: OpenNext + 自研适配层 编译 → Cloudflare Pages(高级模式 _worker.js) 部署"
+          else
+            echo "::error::未检测到 nuxt.config.js|.ts 或 next.config.js|.ts, 无法判定框架(Nuxt/Next)。"
+            exit 1
+          fi
+
+          echo "FRAMEWORK=$FRAMEWORK" >> $GITHUB_ENV
+          echo "✅ 框架检测完成: $FRAMEWORK"
+
+      - name: Setup Node.js (npm)
+        uses: actions/setup-node@v4
+        with:
+          # node:sqlite 需要 Node≥22.5; CI 构建期用 22 LTS(运行时为 workerd/nodejs_compat)
+          node-version: '22'
+
+      - name: Verify required secrets
+        run: |
+          # 必需 secret: CLOUDFLARE_API_TOKEN(部署用) + ADMIN_SECRET / JWT_SECRET(管理后台与 JWT 签名)
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Missing CLOUDFLARE_API_TOKEN secret."
+            exit 1
+          fi
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "::error::Missing ADMIN_SECRET secret (值应与本地 .env 的 ADMIN_SECRET 一致, 即管理后台密码)。"
+            exit 1
+          fi
+          if [ -z "$JWT_SECRET" ]; then
+            echo "::error::Missing JWT_SECRET secret (值应与本地 .env 的 JWT_SECRET 一致, 即 JWT 签名密钥)。"
+            exit 1
+          fi
+          echo "✓ Required secrets present (CLOUDFLARE_API_TOKEN, ADMIN_SECRET, JWT_SECRET)."
+
+      - name: Detect PROXY_MODE (proxy passthrough)
+        # v8.9.8: 移除 FRAMEWORK=='next' 门控 —— PROXY_MODE 是配置开关, 决定是否
+        # 跳过 D1/KV/seed, 与框架无关, 任何框架都要同样探测。
+        run: |
+          # v8.3.1 需求6/7: 仓库内 .env 配置了 PROXY_MODE(非 false/空)时, 本部署即
+          # 「代理透传站点」—— /api/* 由 Pages Functions 整体透传, 不需要本地数据库:
+          #   → 跳过 D1/KV 创建 与 schema/seed 应用(后续步骤按本 env 门控)
+          #   → 构建期注入 PROXY_MODE(next.config 求值期读取该变量; Nuxt 构建同理读取)
+          #   → 运行期 PATCH 到 Pages 项目 env_vars(_worker.js 适配层/SSR 运行时读取)
+          # .env 未提交到仓库时(.gitignore 默认排除 .env*, GitHub 上必然如此):
+          #   v8.9.5: PROXY_MODE 支持 repo Variables 或 repo Secrets 配置 —— apiKey 属
+          #   敏感值, 用户大概率配在 Secrets(2026-09 事故: 只读 vars 导致 Secret 里的
+          #   PROXY_MODE 永远读不到)。优先级: repo Variable > repo Secret > .env 文件
+          #   v8.9.7: ①输出一律脱敏(此前 ::notice 整值打印 PROXY_MODE —— 配在
+          #   Variables 时 apiKey 裸露在日志里, GitHub 只对 Secrets 自动打码);
+          #   ②来源标注 —— 本步骤输出就是"vars 是否被读到"的直接证据: 显示
+          #   来源=未配置即 GitHub 侧没配上, 而非步骤被跳过(步骤始终执行)。
+          RAW=""
+          SRC="未配置(vars/secrets/.env 均无)"
+          VARS_VAL="${{ vars.PROXY_MODE }}"
+          SECRETS_VAL="${{ secrets.PROXY_MODE }}"
+          if [ -n "$VARS_VAL" ]; then
+            RAW="$VARS_VAL"
+            SRC="repo Variable(vars.PROXY_MODE)"
+          elif [ -n "$SECRETS_VAL" ]; then
+            RAW="$SECRETS_VAL"
+            SRC="repo Secret(secrets.PROXY_MODE)"
+          fi
+          if [ -z "$RAW" ] && [ -f .env ]; then
+            RAW=$(grep -E '^\s*PROXY_MODE\s*=' .env | tail -1 | sed 's/^\s*PROXY_MODE\s*=\s*//' | tr -d '\r' | tr -d '"' || true)
+            [ -n "$RAW" ] && SRC="仓库 .env 文件"
+          fi
+          RAW=$(echo "$RAW" | xargs || true)
+          # 脱敏展示: 保留 apiKey 前 12 字符 + @域名, 绝不整值打印
+          mask_proxy() { echo "$1" | sed -E 's/^([^@]{0,12})[^@]*@/\1***@/'; }
+          if [ -n "$RAW" ] && [ "$RAW" != "false" ] && [ "$RAW" != "False" ] && [ "$RAW" != "0" ]; then
+            echo "PROXY_PASSTHROUGH=true" >> $GITHUB_ENV
+            echo "PROXY_MODE_RAW=$RAW" >> $GITHUB_ENV
+            echo "✅ PROXY_MODE 已解析 | 来源: $SRC | 值(脱敏): $(mask_proxy "$RAW")"
+            echo "::notice::代理透传模式开启 → 跳过 D1/KV 与 schema/seed, /api/* 全量经 Functions 透传"
+          else
+            echo "PROXY_PASSTHROUGH=false" >> $GITHUB_ENV
+            echo "✅ PROXY_MODE 未开启 | 来源: $SRC → 本地数据库模式(D1/KV 正常创建)"
+          fi
+
+      - name: Resolve LANGUAGE (site language mode)
+        run: |
+          # v8.8.7 需求2: 站点语言模式 —— v8.9.5: 优先级 repo Variable > repo Secret > .env
+          # (auto=导航栏语言切换默认中文 / cn|zh=固定中文 / en=固定英文; 非法值回落 auto)
+          # v8.9.7: 来源标注(值本身非敏感 cn/en/auto, 原样展示)
+          RAW=""
+          SRC="未配置(vars/secrets/.env 均无)"
+          VARS_VAL="${{ vars.LANGUAGE }}"
+          SECRETS_VAL="${{ secrets.LANGUAGE }}"
+          if [ -n "$VARS_VAL" ]; then
+            RAW="$VARS_VAL"
+            SRC="repo Variable(vars.LANGUAGE)"
+          elif [ -n "$SECRETS_VAL" ]; then
+            RAW="$SECRETS_VAL"
+            SRC="repo Secret(secrets.LANGUAGE)"
+          fi
+          if [ -z "$RAW" ] && [ -f .env ]; then
+            RAW=$(grep -E '^\s*LANGUAGE\s*=' .env | tail -1 | sed 's/^\s*LANGUAGE\s*=\s*//' | tr -d '\r' | tr -d '"' || true)
+            [ -n "$RAW" ] && SRC="仓库 .env 文件"
+          fi
+          RAW=$(echo "$RAW" | xargs || true)
+          echo "LANGUAGE_RAW=$RAW" >> $GITHUB_ENV
+          if [ -n "$RAW" ]; then
+            echo "✅ LANGUAGE 已解析 | 来源: $SRC | 值: $RAW"
+          else
+            echo "✅ LANGUAGE 未配置 → auto(导航栏语言切换)"
+          fi
+
+      - name: Resolve database file from .env
+        run: |
+          # v8.9.12: 本地 SQLite 数据库文件的路径/名称唯一真源 = .env 的 DATABASE_URL
+          # (deploy.config.js 的 database 仅是"是否执行 D1 操作"的布尔开关, 不携带
+          # 路径)。此处解析 .env → 导出 DATABASE_URL_VALUE(构建期占位/npm ci/
+          # prisma generate 统一引用)与 DATABASE_FILENAME(文件名), 全工作流
+          # 不再散落硬编码数据库文件名。
+          DB_URL=""
+          if [ -f .env ]; then
+            DB_URL=$(grep -E '^\s*DATABASE_URL\s*=' .env | tail -1 | sed 's/^\s*DATABASE_URL\s*=\s*//' | tr -d '\r' | tr -d '"' | tr -d "'" | xargs || true)
+            [ -n "$DB_URL" ] && SRC="仓库 .env 文件"
+          fi
+          if [ -z "$DB_URL" ]; then
+            # .env 缺失/未配置时回落默认库(与 server/utils/db.ts 内置默认一致)
+            DB_URL="file:./avatar-nuxt.db"
+            SRC="内置默认(.env 未配置)"
+          fi
+          # file: 前缀语义: 相对路径按 prisma/ 目录解析(Prisma 惯例) → prisma/<文件名>
+          DB_FILENAME=$(echo "$DB_URL" | sed 's/^file://' | awk -F/ '{print $NF}')
+          [ -z "$DB_FILENAME" ] && DB_FILENAME="avatar-nuxt.db"
+          echo "DATABASE_URL_VALUE=$DB_URL" >> $GITHUB_ENV
+          echo "DATABASE_FILENAME=$DB_FILENAME" >> $GITHUB_ENV
+          echo "✅ 数据库文件已解析 | 来源: $SRC | DATABASE_URL=$DB_URL | 文件名: $DB_FILENAME"
+
+      - name: Read deploy.config.js
+        id: deploy-config
+        run: |
+          # 读取 deploy.config.js 配置(ESM export default)。
+          # v8.9.10: 内联 data:URL 解析 —— 把文件内容包成 data:text/javascript;base64
+          # 再 import(), Node 强制按 ESM 语义解析, 项目有无 "type":"module" 都能读;
+          # 不再依赖 scripts/read-deploy-config.mjs 等任何配套脚本(两件套自包含)。
+          read_cfg() {
+            node -e '
+              const fs = require("node:fs");
+              const field = process.argv[1];
+              const src = fs.readFileSync("deploy.config.js", "utf8");
+              const url = "data:text/javascript;base64," + Buffer.from(src).toString("base64");
+              import(url).then((m) => {
+                // v8.9.13: 支持 dotted path(realtime.enabled) —— 逐段下探, 不存在/中途为空回落 ""
+                const seg = field.split(".");
+                let v = m.default;
+                for (const s of seg) { if (v == null) break; v = v[s]; }
+                console.log(String(v ?? ""));
+              }).catch((e) => {
+                console.error("::error::解析 deploy.config.js 失败(" + field + "): " + e.message);
+                process.exit(1);
+              });
+            ' "$1"
+          }
+          PROJECT_NAME="${{ inputs.project_name }}"
+          if [ -z "$PROJECT_NAME" ]; then
+            PROJECT_NAME=$(read_cfg projectName)
+          fi
+          D1_NAME=$(read_cfg d1Name)
+          KV_NAME=$(read_cfg kvName)
+          D1_ID=$(read_cfg d1Id)
+          KV_ID=$(read_cfg kvId)
+          CONFIG_ACCOUNT_ID=$(read_cfg accountId)
+          # v8.9.2 需求2: 部署类型配置(后续 Resolve deploy type 步骤再被 vars.DEPLOYTYPE 覆盖)
+          CONFIG_DEPLOY_TYPE=$(read_cfg deployType)
+
+          # v8.9.12: database = 布尔开关(是否执行 D1 数据库操作) —— 本地数据库
+          # 文件路径/名称不在此配置, 唯一真源 = .env 的 DATABASE_URL(见上方
+          # "Resolve database file from .env" 步骤)。
+          #   true / 1 / yes / on → 执行全部 D1 步骤(建库/schema 建表/seed 推送/绑定注入);
+          #   false / 0 / no / off / '' / 字段缺失 → 跳过全部 D1 步骤, 仅部署站点代码。
+          #   实现方式: 关闭时清空 D1 名称与 ID → 所有下游步骤(D1 创建、schema/seed
+          #   推送、wrangler.toml D1 段、Pages D1 绑定 PATCH)按"未配置"门控自然跳过。
+          RAW_DB_ORIG=$(read_cfg database | xargs || true)
+          RAW_DB=$(echo "$RAW_DB_ORIG" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          DB_ENABLED="true"
+          case "$RAW_DB" in
+            false|0|no|off|"")
+              DB_ENABLED="false"
+              D1_NAME=""; D1_ID=""
+              echo "::notice::deploy.config.js database 为 false/未配置 → 跳过全部 D1 数据库步骤, 仅部署站点代码"
+              ;;
+            *)
+              echo "✅ database=$RAW_DB_ORIG → D1 已启用(建库/建表/推送 seed)"
+              ;;
+          esac
+          if [ "$DB_ENABLED" = "true" ] && [ -z "$D1_NAME" ]; then
+            # d1Name 留空 → 云端库名自动使用 projectName(减少必配项)
+            D1_NAME="$PROJECT_NAME"
+            echo "::notice::d1Name 未配置 → D1 云端库名自动使用 projectName: $D1_NAME"
+          fi
+
+          echo "DATABASE_ENABLED=$DB_ENABLED" >> $GITHUB_ENV
+          echo "DATABASE_RAW=$RAW_DB_ORIG" >> $GITHUB_ENV
+
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+          echo "D1_NAME=$D1_NAME" >> $GITHUB_ENV
+          echo "KV_NAME=$KV_NAME" >> $GITHUB_ENV
+          echo "D1_ID=$D1_ID" >> $GITHUB_ENV
+          echo "KV_ID=$KV_ID" >> $GITHUB_ENV
+          echo "CONFIG_ACCOUNT_ID=$CONFIG_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "CONFIG_DEPLOY_TYPE=$CONFIG_DEPLOY_TYPE" >> $GITHUB_ENV
+          # v8.9.13: 边缘实时通道配置(后续 "Resolve realtime hub config" 步骤解析默认值/门控)
+          echo "REALTIME_ENABLED_RAW=$(read_cfg realtime.enabled | xargs || true)" >> $GITHUB_ENV
+          echo "REALTIME_WORKER_CFG=$(read_cfg realtime.workerName | xargs || true)" >> $GITHUB_ENV
+          echo "REALTIME_CLASS_CFG=$(read_cfg realtime.className | xargs || true)" >> $GITHUB_ENV
+          echo "::notice::配置: project=$PROJECT_NAME, database=${RAW_DB_ORIG:-'(未配置)'}, d1=$D1_NAME, kv=$KV_NAME, accountId=$CONFIG_ACCOUNT_ID, deployType=$CONFIG_DEPLOY_TYPE, realtime=$REALTIME_ENABLED_RAW"
+
+      - name: Validate projectName
+        run: |
+          if [ -z "${{ env.PROJECT_NAME }}" ]; then
+            echo "::error::deploy.config.js 中 projectName 为空! 请设置 Cloudflare 项目名称。"
+            exit 1
+          fi
+          echo "✅ projectName: ${{ env.PROJECT_NAME }}"
+
+      - name: Resolve realtime hub config (Durable Objects)
+        run: |
+          # v8.9.13: 边缘实时通道配置解析 —— Pages 项目不能在自身内承载 DO 类(平台
+          # 限制), realtime.enabled=true 时由仓库 edge-realtime/ 配套 Worker 独立承载
+          # DO hub(本工作流部署 + 绑定注入); Nuxt+workers 形态自承载(cloudflare-durable
+          # 预设), 不需要配套 Worker。关闭时全链路跳过, 行为与 v8.9.12 一致。
+          RAW=$(echo "${{ env.REALTIME_ENABLED_RAW }}" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          REALTIME_ENABLED=false
+          case "$RAW" in
+            true|1|yes|on) REALTIME_ENABLED=true ;;
+          esac
+          if [ "$REALTIME_ENABLED" = "true" ]; then
+            REALTIME_WORKER_NAME="${{ env.REALTIME_WORKER_CFG }}"
+            if [ -z "$REALTIME_WORKER_NAME" ]; then
+              REALTIME_WORKER_NAME="${{ env.PROJECT_NAME }}-realtime"
+              echo "::notice::realtime.workerName 未配置 → 配套 Worker 名自动使用 projectName + '-realtime': $REALTIME_WORKER_NAME"
+            fi
+            REALTIME_DO_CLASS="${{ env.REALTIME_CLASS_CFG }}"
+            [ -z "$REALTIME_DO_CLASS" ] && REALTIME_DO_CLASS="EdgeRealtimeDO"
+            REALTIME_BINDING="REALTIME_DO"
+            # 配套 Worker 源码必须随仓库携带(缺失即终止 —— 部署一个空 DO hub 毫无意义)
+            if [ ! -f edge-realtime/index.js ]; then
+              echo "::error::realtime.enabled=true 但未找到 edge-realtime/index.js(配套实时 Worker 源码)。请携带 edge-realtime/ 目录或将 realtime.enabled 设为 false。"
+              exit 1
+            fi
+            echo "✅ 实时通道已启用: 配套 Worker=$REALTIME_WORKER_NAME, DO 类=$REALTIME_DO_CLASS, 站点绑定=$REALTIME_BINDING"
+          else
+            REALTIME_WORKER_NAME=""
+            REALTIME_DO_CLASS=""
+            REALTIME_BINDING=""
+            echo "✅ 实时通道未启用(realtime.enabled=false/未配置) → 不部署 DO hub, 实时走 SSE"
+          fi
+          echo "REALTIME_ENABLED=$REALTIME_ENABLED" >> $GITHUB_ENV
+          echo "REALTIME_WORKER_NAME=$REALTIME_WORKER_NAME" >> $GITHUB_ENV
+          echo "REALTIME_DO_CLASS=$REALTIME_DO_CLASS" >> $GITHUB_ENV
+          echo "REALTIME_BINDING=$REALTIME_BINDING" >> $GITHUB_ENV
+
+      - name: Resolve deploy type (pages | workers)
+        run: |
+          # v8.9.2 需求2: 部署类型解析。v8.9.11: Nuxt/Next 同等生效(原 Nuxt 恒为
+          # Pages, 现两框架均支持 pages/workers 两种部署类型)。
+          # 优先级: repo Variable DEPLOYTYPE > deploy.config.js deployType > 默认 pages。
+          # 配置了非法值时直接报错退出(部署目标是关键路径, 绝不静默回落到错误目标)。
+          RAW="${{ vars.DEPLOYTYPE }}"
+          # 容错: 去空白 + 大小写归一(WORKERS/Pages 等写法等价生效)
+          RAW=$(echo "$RAW" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          if [ -z "$RAW" ]; then
+            RAW=$(echo "${{ env.CONFIG_DEPLOY_TYPE }}" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          fi
+          if [ -z "$RAW" ]; then
+            RAW="pages"
+            echo "::notice::DEPLOYTYPE 未配置且 deploy.config.js 无 deployType → 默认 pages"
+          fi
+          case "$RAW" in
+            pages)
+              echo "DEPLOY_TYPE=pages" >> $GITHUB_ENV
+              echo "::notice::部署类型 = pages → (Next: OpenNext+适配层 | Nuxt: cloudflare-pages preset) → Cloudflare Pages"
+              ;;
+            workers)
+              echo "DEPLOY_TYPE=workers" >> $GITHUB_ENV
+              echo "::notice::部署类型 = workers → (Next: OpenNext | Nuxt: cloudflare_module preset) → Cloudflare Workers(wrangler deploy)"
+              ;;
+            *)
+              echo "::error::非法部署类型 '$RAW'(合法值: pages | workers)。来源: vars.DEPLOYTYPE 或 deploy.config.js deployType。"
+              exit 1
+              ;;
+          esac
+          echo "✅ 部署类型: $RAW"
+
+      - name: Resolve Cloudflare account ID
+        env:
+          SECRET_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          ACCOUNT_ID="${SECRET_ACCOUNT_ID}"
+
+          # 优先级: CLOUDFLARE_ACCOUNT_ID secret -> deploy.config.js accountId -> 自动探测
+          if [ -z "$ACCOUNT_ID" ] && [ -n "$CONFIG_ACCOUNT_ID" ]; then
+            ACCOUNT_ID="$CONFIG_ACCOUNT_ID"
+            echo "::notice::使用 deploy.config.js 的 accountId: $ACCOUNT_ID"
+          fi
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::notice::未配置账号 ID, 开始自动探测..."
+
+            # 1) 先检测 TOKEN 是否有效
+            VERIFY_OK=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify" | grep -o '"success":true' || echo "")
+            if [ -z "$VERIFY_OK" ]; then
+              echo "::error::CLOUDFLARE_API_TOKEN 无效或校验失败, 请检查 token 是否正确且未过期。"
+              exit 1
+            fi
+            echo "::notice::Token 校验通过"
+
+            # 2) 检测 Token 是否有列账号权限, 并获取第一个账号 ID
+            ACCOUNTS=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts")
+            ACCOUNTS_OK=$(echo "$ACCOUNTS" | grep -o '"success":true' || echo "")
+            if [ -z "$ACCOUNTS_OK" ]; then
+              echo "::error::Token 无法列出账号(可能缺少 'Account Settings: Read' 权限)。"
+              echo "::error::接口返回: $ACCOUNTS"
+              exit 1
+            fi
+            ACCOUNT_ID=$(echo "$ACCOUNTS" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1 || echo "")
+
+            if [ -z "$ACCOUNT_ID" ]; then
+              echo "::error::未能从账号列表解析出账号 ID。"
+              echo "::error::接口返回: $ACCOUNTS"
+              exit 1
+            fi
+            echo "::notice::自动探测到账号 ID: $ACCOUNT_ID(建议填入 deploy.config.js 的 accountId 或设置 secret 以加快后续部署)"
+          fi
+
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+          echo "::notice::最终使用账号 ID: $ACCOUNT_ID"
+
+      - name: Install dependencies (npm ci)
+        run: |
+          # package-lock.json 已提交 → npm ci 保证 CI 与本地一致(可复现安装);
+          # .npmrc legacy-peer-deps=true 已随仓库提交, 兼容既有 peer 依赖关系
+          npm ci
+        env:
+          # v8.9.12: postinstall(prisma generate 等)需要非空 DATABASE_URL 占位
+          # (不连接数据库), 值引用 .env 解析结果(数据库文件路径唯一真源统一)
+          DATABASE_URL: "${{ env.DATABASE_URL_VALUE }}"
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+        env:
+          # generate 阶段只需占位值(不连接数据库); SQLite 在 Cloudflare 运行时
+          # 不可用, 线上走"无数据库降级路径", 此处仅为满足构建期模块加载;
+          # v8.9.12: 值引用 .env 解析结果, 不再硬编码数据库文件名
+          DATABASE_URL: "${{ env.DATABASE_URL_VALUE }}"
+
+      - name: Prune server-side artifacts (proxy passthrough)
+        # v8.9.8: 门控只跟配置相关(PROXY_PASSTHROUGH), 与框架无关; 目录语义差异
+        # 在步骤内消化: Next.js 的 server/ 是存储引擎独立部署副本(构建不需要),
+        # 可整体移除; Nuxt 的 server/ 是 Nitro 服务端源码(nuxt build 依赖), 仅移除 db/。
+        if: env.PROXY_PASSTHROUGH == 'true'
+        run: |
+          if [ "$FRAMEWORK" = "next" ]; then
+            rm -rf server db
+            echo "::notice::代理透传模式: 已移除 server/ 与 db/ —— 构建产物 = 前台页面 + Functions 代理透传(无本地数据库)"
+          else
+            rm -rf db
+            echo "::notice::代理透传模式: 已移除 db/ 本地数据库(server/ 为 Nuxt 服务端源码, 保留参与构建)"
+          fi
+
+      # ---- Next.js 专用: OpenNext 适配 + 自研 Pages 高级模式适配层 ----
+
+      - name: Ensure OpenNext toolchain (Next.js)
+        if: env.FRAMEWORK == 'next'
+        run: |
+          # v8.9.1: @opennextjs/cloudflare 与 wrangler 已进入 devDependencies
+          # (wrangler>=4.59.2: workerd PR#5869 修复 Next.js 16.1+ setImmediate 补丁
+          #  与 workerd 只读 node: 模块命名空间的兼容问题, 见 opennextjs issue #1049)。
+          # 此处仅为护栏: 若依赖缺失(旧 lockfile), 临时补装(--no-save, 不改 lock)。
+          # ⚠️ 两个包必须在同一条 npm install 命令里一次装入(v8.8.8 实测事故:
+          #    拆两条时第二条会把第一条 --no-save 装入的包当多余包删除)。
+          MISSING=()
+          command -v node_modules/.bin/opennextjs-cloudflare >/dev/null 2>&1 || grep -q '"@opennextjs/cloudflare"' package.json || MISSING+=("@opennextjs/cloudflare")
+          command -v node_modules/.bin/wrangler >/dev/null 2>&1 || grep -q '"wrangler"' package.json || MISSING+=("wrangler")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            npm install --no-save "${MISSING[@]}"
+          else
+            echo "@opennextjs/cloudflare 与 wrangler 均已就绪, 跳过"
+          fi
+
+      - name: Ensure open-next.config.ts
+        if: env.FRAMEWORK == 'next'
+        run: |
+          # @opennextjs/cloudflare 需要 open-next.config.ts; 若仓库没有则生成最小默认配置。
+          if [ ! -f open-next.config.ts ]; then
+            printf '%s\n' \
+              'import { defineCloudflareConfig } from "@opennextjs/cloudflare";' \
+              '' \
+              'export default defineCloudflareConfig({});' \
+              > open-next.config.ts
+            echo "::notice::已生成默认 open-next.config.ts"
+          else
+            echo "使用仓库中已有的 open-next.config.ts"
+          fi
+
+      - name: Build with OpenNext (Next.js, Pages/Workers 共用)
+        if: env.FRAMEWORK == 'next'
+        run: |
+          # opennextjs-cloudflare build:
+          #   1) 执行 next build
+          #   2) 产出 $OPENNEXT_OUTPUT_DIR/worker.js + $OPENNEXT_OUTPUT_DIR/assets/
+          # 两种部署类型(pages/workers)都以此为共同构建起点 —— v8.9.2 综合:
+          #   - pages   → 后续步骤再叠加自研适配层(dist-pages/_worker.js)
+          #   - workers → 直接以 .open-next/worker.js 为入口(wrangler deploy)
+          # 快速失败护栏: 本地 bin 必须存在 —— npx 在本地缺 bin 时会静默回落拉取
+          # npm 上同名安全占位包(无 bin), 报出误导性的
+          # "could not determine executable to run"(详见上方安装步骤注释)。
+          if [ ! -x node_modules/.bin/opennextjs-cloudflare ]; then
+            echo "::error::opennextjs-cloudflare 本地 bin 缺失(适配器安装未生效), 终止构建以避免 npx 回落拉取安全占位包。"
+            exit 1
+          fi
+          npx opennextjs-cloudflare build
+          if [ ! -f "$OPENNEXT_OUTPUT_DIR/worker.js" ]; then
+            echo "::error::OpenNext 构建产物缺失: $OPENNEXT_OUTPUT_DIR/worker.js"
+            exit 1
+          fi
+          echo "::notice::OpenNext 构建完成: $OPENNEXT_OUTPUT_DIR/worker.js + $OPENNEXT_OUTPUT_DIR/assets/"
+        env:
+          # 构建期占位环境变量(仅构建机器使用, 不会进入运行时):
+          # - DATABASE_URL: Prisma 客户端模块加载需要非空 URL
+          # - ADMIN_SECRET / JWT_SECRET: 防止构建期读取到空值
+          # v8.9.12: DATABASE_URL 引用 .env 解析结果, 不再硬编码数据库文件名
+          DATABASE_URL: "${{ env.DATABASE_URL_VALUE }}"
+          ADMIN_SECRET: "build-placeholder"
+          JWT_SECRET: "build-placeholder"
+          # NEXT_PUBLIC_* 是构建期内联: 浏览器直连 WS 地址在这里注入(可选)
+          NEXT_PUBLIC_WS_URL: "${{ vars.NEXT_PUBLIC_WS_URL }}"
+          REMOTE_WS_URL: "${{ env.REMOTE_WS_URL }}"
+          # v8.3.1 需求6/7: 代理透传开关(rewrites 在配置求值期读取) + 存储平台开关
+          #   PLATFORM=server 时服务端运行时自动检测 Node / Cloudflare edge 环境
+          # v8.8.7 需求2: LANGUAGE 站点语言模式(repo Variable 覆盖 .env, 空回落 auto)
+          # v8.9.1 需求4: PROXY_MODE / LANGUAGE 同时在运行期注入(Pages API / wrangler secret)
+          PROXY_MODE: "${{ env.PROXY_MODE_RAW }}"
+          LANGUAGE: "${{ env.LANGUAGE_RAW }}"
+          PLATFORM: "${{ vars.PLATFORM }}"
+          NEXT_PUBLIC_PLATFORM: "${{ vars.PLATFORM }}"
+
+      - name: Assemble Pages bundle (Next.js + 自研适配层, 仅 deployType=pages)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          # 仅 pages 部署类型: 自研适配层 → dist-pages/(_worker.js + 静态资源 + _headers
+          # + _routes.json)。v8.9.4: _routes.json 将纯静态路径排除出 worker(CDN 直出,
+          # 规避 Pages 高级模式全量请求进 _worker.js 且 OpenNext resolver 闸门关闭导致的
+          # 生产静态资源 404); worker 内另有适配层 ASSETS 兜底(见 pages-adapter/worker.ts)。
+          # Pages 高级模式: wrangler pages deploy 以 dist-pages 为部署目录发布。
+          # workers 部署类型跳过此步(直接部署 .open-next/, 不需要适配层)。
+          node scripts/build-pages-adapter.mjs
+          echo "::notice::dist-pages 产物清单(前 12 项):"
+          ls dist-pages | head -12
+          if [ ! -f dist-pages/_worker.js ]; then
+            echo "::error::dist-pages/_worker.js 缺失(适配层组装失败)"
+            exit 1
+          fi
+
+      # ---- D1 / KV 资源创建(幂等; v8.9.10 起 fail hard, proxy 模式跳过) ----
+
+      - name: Create D1 database (if needed)
+        # v8.3.1: 代理透传模式跳过(远端库由代理站维护)
+        # v8.9.10: 移除 continue-on-error(fail hard) —— database 配置了路径即承诺
+        # D1 就绪, 创建失败却继续 = D1_ID 为空 → schema/seed 全部跳过 → 线上空库
+        # 照常发布, 违背"发布成功 = 数据就绪"; 与 schema/seed 步骤口径一致。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID == ''
+        run: |
+          # 先查是否已存在, 避免 "already exists" 报错(--json 输出兼容顶层数组与 {result:[...]} 两种格式)
+          EXISTING_D1_ID=$(npx wrangler d1 list --json 2>/dev/null \
+            | jq -r --arg n "$D1_NAME" '(if type == "array" then . else (.result // []) end)[] | select(.name == $n) | (.uuid // .id // empty)' \
+            || true)
+
+          if [ -n "$EXISTING_D1_ID" ]; then
+            echo "D1_ID=$EXISTING_D1_ID" >> $GITHUB_ENV
+            echo "::notice::D1 数据库已存在: $D1_NAME (ID: $EXISTING_D1_ID)"
+          else
+            RESULT=$(npx wrangler d1 create "$D1_NAME" 2>&1 || true)
+            echo "$RESULT"
+            D1_ID_NEW=$(echo "$RESULT" | grep -oP 'database_id\s*=\s*"\K[^"]+' || echo "")
+            if [ -n "$D1_ID_NEW" ]; then
+              echo "D1_ID=$D1_ID_NEW" >> $GITHUB_ENV
+              echo "::notice::创建 D1 数据库成功: $D1_NAME (ID: $D1_ID_NEW)"
+              echo "::notice::请将此 ID 填入 deploy.config.js 的 d1Id 字段"
+            else
+              echo "::error::D1 数据库创建失败, 请检查 CLOUDFLARE_API_TOKEN 是否有 D1 写权限"
+              exit 1
+            fi
+          fi
+
+      - name: Create KV namespace (if needed)
+        # v8.3.1: 代理透传模式跳过
+        # v8.9.10: 移除 continue-on-error(fail hard) —— 配置了 kvName 却创建失败
+        # 照常发布 = 绑定静默缺失, 运行时降级无告警; 与 D1/schema/seed 口径一致。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.KV_NAME != '' && env.KV_ID == ''
+        run: |
+          # 用 Cloudflare REST API 查询(标准响应: { success, result: [{ id, title }] })
+          KVLIST=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
+
+          EXISTING_KV_ID=$(echo "$KVLIST" | jq -r --arg n "$KV_NAME" '(.result // [])[]? | select(.title == $n) | .id // empty' || true)
+
+          if [ -n "$EXISTING_KV_ID" ]; then
+            echo "KV_ID=$EXISTING_KV_ID" >> $GITHUB_ENV
+            echo "::notice::KV 命名空间已存在: $KV_NAME (ID: $EXISTING_KV_ID)"
+          else
+            RESULT=$(npx wrangler kv namespace create "$KV_NAME" 2>&1 || true)
+            echo "$RESULT"
+            KV_ID_NEW=$(echo "$RESULT" | grep -oP 'id\s*=\s*"\K[^"]+' | head -1 || echo "")
+            if [ -n "$KV_ID_NEW" ]; then
+              echo "KV_ID=$KV_ID_NEW" >> $GITHUB_ENV
+              echo "::notice::创建 KV 命名空间成功: $KV_NAME (ID: $KV_ID_NEW)"
+            else
+              echo "::error::KV 命名空间创建失败, 请检查 CLOUDFLARE_API_TOKEN 是否有 KV 写权限"
+              exit 1
+            fi
+          fi
+
+      - name: Apply D1 schema (idempotent, config-driven, framework-agnostic)
+        # v8.9.8 修复: 移除 FRAMEWORK=='next' 门控(原门控导致 Nuxt 项目 D1 永远空表),
+        # 门控只跟配置相关(D1_NAME/D1_ID + 非 proxy 模式), Nuxt/Next 一视同仁。
+        # v8.9.8: 移除 continue-on-error —— D1 运行时不会自建表, schema 推送失败
+        # 却照常发布 = 线上空库(管理后台全空), 必须 fail hard(发布成功 = 数据就绪)。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != ''
+        run: |
+          # schema 文件自动探测(顺序与框架无关, 只看项目携带的文件):
+          #   prisma/d1-schema.sql(Nuxt 布局) | server/schema.sql(Next 布局)
+          # 全部 CREATE TABLE/INDEX IF NOT EXISTS, 可安全重复执行。
+          SCHEMA_FILE=""
+          for f in prisma/d1-schema.sql server/schema.sql; do
+            if [ -f "$f" ]; then SCHEMA_FILE="$f"; break; fi
+          done
+          if [ -z "$SCHEMA_FILE" ]; then
+            echo "::error::配置了 D1($D1_NAME) 但未找到 schema 文件(已探测: prisma/d1-schema.sql, server/schema.sql)。运行时不会自建表, 缺失将导致线上空库, 终止部署。"
+            exit 1
+          fi
+          echo "使用 schema: $SCHEMA_FILE"
+          npx wrangler d1 execute "$D1_NAME" --remote --file="$SCHEMA_FILE"
+          echo "✓ D1 schema 已应用: $SCHEMA_FILE"
+
+      - name: Seed D1 database (idempotent, config-driven, framework-agnostic)
+        # v8.9.8 修复: 同上移除框架门控与 continue-on-error —— seed 失败必须终止,
+        # 否则发布"成功"但管理后台空数据。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != ''
+        run: |
+          # seed 文件自动探测(顺序与框架无关, 只看项目携带的文件):
+          #   prisma/seed.sql(Nuxt 布局) | server/seed.sql(Next 布局)
+          # 全部 INSERT OR IGNORE, 可重复执行且不会因主键/唯一键冲突失败。
+          SEED_FILE=""
+          for f in prisma/seed.sql server/seed.sql; do
+            if [ -f "$f" ]; then SEED_FILE="$f"; break; fi
+          done
+          if [ -z "$SEED_FILE" ]; then
+            echo "::error::配置了 D1($D1_NAME) 但未找到 seed 文件(已探测: prisma/seed.sql, server/seed.sql)。缺失将导致管理后台空数据, 终止部署。"
+            exit 1
+          fi
+          echo "使用 seed: $SEED_FILE"
+          npx wrangler d1 execute "$D1_NAME" --remote --file="$SEED_FILE"
+          echo "✓ D1 seed 数据已推送: $SEED_FILE"
+
+      - name: Deploy realtime hub Worker (Durable Objects)
+        # v8.9.13: 配套实时 Worker 独立部署 DO hub —— Pages 项目不能在自身内承载
+        # DO 类(平台限制), 站点经 REALTIME_DO 绑定(script_name)直呼本 Worker 的 DO。
+        # 门控: realtime.enabled=true 且非 "Nuxt+workers"(该形态自承载 $DurableObject)。
+        # 时序: 必须先于站点部署(绑定引用的 Worker 不存在时 pages deploy 会失败);
+        # migrations 幂等(tag v1 已应用自动跳过), secret put 要求 Worker 已存在。
+        if: env.REALTIME_ENABLED == 'true' && !(env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'workers')
+        run: |
+          cat > edge-realtime/wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${REALTIME_WORKER_NAME}"
+          main = "index.js"
+          compatibility_date = "2026-08-01"
+          compatibility_flags = ["nodejs_compat"]
+          account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+          # 自引用绑定: Worker 通过它访问自己导出的 DO 类
+          [[durable_objects.bindings]]
+          name = "REALTIME_HUB"
+          class_name = "${REALTIME_DO_CLASS}"
+
+          # 免费计划要求 DO 类使用 SQLite 存储(new_sqlite_classes); 首次部署自动应用
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["${REALTIME_DO_CLASS}"]
+          EOF
+
+          echo "=== edge-realtime/wrangler.toml ==="
+          cat edge-realtime/wrangler.toml
+          npx wrangler deploy -c edge-realtime/wrangler.toml
+
+          # DO 鉴权密钥: 与站点同一 JWT_SECRET(以 XY_JWT_SECRET 注入, 与应用侧约定一致)
+          if [ -z "$JWT_SECRET" ]; then
+            echo "::error::缺少 JWT_SECRET(配套实时 Worker 鉴权依赖, 应与本地 .env 的 JWT_SECRET 一致)。"
+            exit 1
+          fi
+          printf '%s' "$JWT_SECRET" | npx wrangler secret put XY_JWT_SECRET --config edge-realtime/wrangler.toml
+          SECRET_LIST=$(npx wrangler secret list --config edge-realtime/wrangler.toml 2>&1)
+          echo "$SECRET_LIST"
+          if ! echo "$SECRET_LIST" | grep -q "XY_JWT_SECRET"; then
+            echo "::error::XY_JWT_SECRET 未能写入实时 Worker, 请检查 wrangler secret 输出。"
+            exit 1
+          fi
+          echo "✓ 实时 hub Worker 已部署: $REALTIME_WORKER_NAME (DO=$REALTIME_DO_CLASS, XY_JWT_SECRET 已注入)"
+
+      - name: Generate wrangler.toml (Next.js → Pages)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          # v8.9.1/v8.9.10: CI 实际部署使用的 Pages 配置, 完全按 deploy.config.js
+          # 动态生成(项目名/D1/KV/vars) —— 仓库无需携带静态 wrangler.toml。
+          # pages_build_output_dir 与 [main]/[assets] 互斥 —— Pages 部署以 dist-pages
+          # 为部署目录(高级模式 _worker.js 由 OpenNext 产物 + 自研适配层生成)。
+          # v8.9.6: PROXY_MODE 按用户要求写入 [vars](值来自 Detect 步骤的
+          # vars/secrets/.env 三级解析, 未开启时显式 'false')。
+          # v8.9.7 事实修正(wrangler 4.133.0 源码级核验): `wrangler pages deploy` 对
+          # 已存在项目**不做任何项目配置同步**(upload/deploy 模块全程 0 PATCH/
+          # 0 env_vars 处理) —— 本 toml 的 [vars] 不会同步到项目运行时, 仅为配置
+          # 语义声明; 运行时环境变量的唯一有效注入通道 = 下方 "Configure Pages
+          # project env vars" API PATCH(先 PATCH 后部署, env_vars 在部署创建时
+          # 快照, 时序已保证本次部署生效; deploy 不触碰 vars, 无需 --keep-vars)。
+          cat > wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${PROJECT_NAME}"
+          pages_build_output_dir = "dist-pages"
+          compatibility_date = "2025-05-01"  # >=2025-04-01: workerd 开放 node:sqlite(v3.1.0 数据层依赖)
+          compatibility_flags = ["nodejs_compat"]
+          EOF
+
+          if [ -n "$D1_NAME" ] && [ -n "$D1_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "$D1_NAME"
+          database_id = "$D1_ID"
+          EOF
+            echo "✅ 添加 D1 配置"
+          fi
+
+          if [ -n "$KV_NAME" ] && [ -n "$KV_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$KV_ID"
+          EOF
+            echo "✅ 添加 KV 配置"
+          fi
+
+          # v8.9.13: DO hub 绑定(配套 edge-realtime Worker, 跨脚本 script_name;
+          # Pages 绑定官方配置通道 = wrangler 配置文件, 随 pages deploy 生效)
+          if [ "$REALTIME_ENABLED" = "true" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[durable_objects.bindings]]
+          name = "${REALTIME_BINDING}"
+          class_name = "${REALTIME_DO_CLASS}"
+          script_name = "${REALTIME_WORKER_NAME}"
+          EOF
+            echo "✅ 添加 DO hub 绑定($REALTIME_BINDING → $REALTIME_WORKER_NAME/$REALTIME_DO_CLASS)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          NODE_ENV = "production"
+          # v8.8.7 需求2: 站点语言模式(auto/cn/en/zh; 构建期内联为主, 此处供 SSR 运行时参考)
+          LANGUAGE = "${LANGUAGE_RAW:-auto}"
+          # v8.9.6: 代理透传配置(vars/secrets/.env 三级解析值; 未开启时显式 false 关闭)
+          PROXY_MODE = "${PROXY_MODE_RAW:-false}"
+          # 服务端远程 WS 地址(可选; 留空走默认)。注意 NEXT_PUBLIC_WS_URL 已在
+          # 构建期内联进浏览器包, 此处仅供 SSR 侧参考。
+          REMOTE_WS_URL = "${REMOTE_WS_URL}"
+          EOF
+
+          # 不整文件 cat(避免把可能的敏感值打进日志), 只展示结构:
+          echo "=== wrangler.toml(结构) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml || true
+
+      - name: Generate wrangler.toml (Next.js → Workers)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'workers'
+        run: |
+          # v8.9.2 需求2: workers 部署类型的 CI 配置(v8.9.0 原有链路 + v8.9.2 统一入口)。
+          # main = pages-adapter/worker.ts(与 Pages 形态同一适配层入口):
+          #   ① D1/KV 绑定必须经入口 fetch(request, env, ctx) 同步注入
+          #     (globalThis.__GEMTD_D1/__GEMTD_KV 约定通道) —— OpenNext 产物直出时
+          #     instrumentation 的 getCloudflareContext 拿不到 ALS 上下文, D1 永远选不上
+          #     (v8.9.2 实测: worker.js 直出时 driver 降级 memory, 非 proxy + D1 不可用);
+          #   ② wrangler 以同一 esbuild+unenv 管线打包该 TS(相对导入 .open-next/worker.js
+          #     全树进 bundle), DO 导出原样保留 —— 行为与 OpenNext 直出一致, 仅多出绑定注入。
+          # OpenNext 产物: .open-next/worker.js(适配层转发目标) + assets/(静态资源托管)。
+          # PROXY_MODE 不写入 [vars](含 apiKey, 部署后经 `wrangler secret put PROXY_MODE` 注入)。
+          cat > wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${PROJECT_NAME}"
+          main = "pages-adapter/worker.ts"
+          compatibility_date = "2025-05-01"  # >=2025-04-01: workerd 开放 node:sqlite(v3.1.0 数据层依赖)
+          compatibility_flags = ["nodejs_compat"]
+          account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+          [assets]
+          directory = "${OPENNEXT_OUTPUT_DIR}/assets"
+          binding = "ASSETS"
+          EOF
+
+          if [ -n "$D1_NAME" ] && [ -n "$D1_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "$D1_NAME"
+          database_id = "$D1_ID"
+          EOF
+            echo "✅ 添加 D1 配置"
+          fi
+
+          if [ -n "$KV_NAME" ] && [ -n "$KV_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$KV_ID"
+          EOF
+            echo "✅ 添加 KV 配置"
+          fi
+
+          # v8.9.13: DO hub 绑定(配套 edge-realtime Worker, 跨脚本 script_name;
+          # Workers 形态站点入口可直接 env.$REALTIME_DO 访问外部 DO)
+          if [ "$REALTIME_ENABLED" = "true" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[durable_objects.bindings]]
+          name = "${REALTIME_BINDING}"
+          class_name = "${REALTIME_DO_CLASS}"
+          script_name = "${REALTIME_WORKER_NAME}"
+          EOF
+            echo "✅ 添加 DO hub 绑定($REALTIME_BINDING → $REALTIME_WORKER_NAME/$REALTIME_DO_CLASS)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          NODE_ENV = "production"
+          # v8.8.7 需求2: 站点语言模式(auto/cn/en/zh; 构建期内联为主, 此处供 SSR 运行时参考)
+          LANGUAGE = "$LANGUAGE_RAW"
+          # 服务端远程 WS 地址(可选; 留空走默认)。注意 NEXT_PUBLIC_WS_URL 已在
+          # 构建期内联进浏览器包, 此处仅供 SSR 侧参考。
+          REMOTE_WS_URL = "$REMOTE_WS_URL"
+          # v4.3.7 需求6: D1 REST 直连兜底所需(绑定注入不可用时, 存储引擎 d1-driver
+          # 以 REST API 访问 D1; CLOUDFLARE_API_TOKEN 由 secrets 步骤按需写入)
+          CLOUDFLARE_ACCOUNT_ID = "$CLOUDFLARE_ACCOUNT_ID"
+          EOF
+
+          if [ -n "$D1_ID" ]; then
+            cat >> wrangler.toml << EOF
+          CLOUDFLARE_D1_DATABASE_ID = "$D1_ID"
+          EOF
+          fi
+
+          # v8.9.5: 构建期 PROXY_MODE define(与 Pages 适配层烧录同源同语义) ——
+          # wrangler 打包 pages-adapter/worker.ts 时注入 __GEMTD_BUILD_PROXY_MODE__,
+          # 首次部署(secrets 尚未写入窗口期)与 secrets 缺失时适配层 /api 透传仍可用;
+          # 运行时 secret 写入后以其为准(env 优先)。值形态 apiKey@url, TOML 基础字符串无需转义。
+          if [ -n "$PROXY_MODE_RAW" ]; then
+            cat >> wrangler.toml << EOF
+
+          [define]
+          __GEMTD_BUILD_PROXY_MODE__ = "$PROXY_MODE_RAW"
+          EOF
+            echo "✅ 添加 PROXY_MODE 构建期 define"
+          fi
+
+          # 不整文件 cat(避免把可能的敏感值打进日志), 只展示结构:
+          echo "=== wrangler.toml(结构) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml || true
+
+      - name: Ensure Pages project (idempotent, production branch = main)
+        # v8.9.8: 合并原 Next.js 专用与 Nuxt 专用两个几乎相同的步骤 —— Pages 项目
+        # 存在性与生产分支配置跟框架无关, 门控只跟部署类型(pages)相关。
+        # (用 REST API 判断项目是否已存在; create 返回 already exists(code 8000002)
+        #  都按"已存在"处理, 保证幂等重跑)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          GET_RESULT=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${{ env.PROJECT_NAME }}")
+          HTTP_CODE=$(echo "$GET_RESULT" | tail -1)
+          GET_BODY=$(echo "$GET_RESULT" | sed '$d')
+          echo "GET /pages/projects/${{ env.PROJECT_NAME }} → HTTP $HTTP_CODE"
+          echo "$GET_BODY" | head -c 500; echo
+
+          PROJECT_EXISTS=false
+          if [ "$HTTP_CODE" = "200" ] && echo "$GET_BODY" | grep -q '"success":true'; then
+            PROJECT_EXISTS=true
+            echo "Pages project '${{ env.PROJECT_NAME }}' already exists"
+          fi
+
+          if [ "$PROJECT_EXISTS" != "true" ]; then
+            CREATE_RESULT=$(npx wrangler pages project create "${{ env.PROJECT_NAME }}" --production-branch main 2>&1 || true)
+            echo "$CREATE_RESULT"
+            if echo "$CREATE_RESULT" | grep -qiE 'already exists|8000002'; then
+              echo "create 返回 already exists —— 视为项目已存在, 继续部署"
+            elif echo "$CREATE_RESULT" | grep -q '\[ERROR\]'; then
+              echo "::error::Pages 项目创建失败(非 already exists 原因), 请查看上方 wrangler 输出。"
+              exit 1
+            fi
+          fi
+
+          # 无论新建还是已存在: 强制把 production 分支设为 main, 否则部署会显示为 Preview,
+          # Dashboard 显示 "No production deployment yet"
+          PATCH_RESULT=$(curl -s -X PATCH \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${{ env.PROJECT_NAME }}" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"production_branch":"main"}')
+          echo "$PATCH_RESULT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(j.success){console.log("✓ production_branch 已设为 main")}else{console.error("⚠ 更新 production_branch 失败:",JSON.stringify(j.errors||[]));process.exit(1)}}catch(e){console.error("⚠ 解析 PATCH 响应失败:",s.slice(0,300));process.exit(1)}})'
+
+      - name: Configure Pages project env vars (framework-agnostic)
+        # v8.9.8: 移除 FRAMEWORK=='next' 门控 —— env_vars 注入(env.Secrets/PROXY_MODE/
+        # LANGUAGE)与 D1/KV 绑定 PATCH 是 Pages 项目级配置, 与框架无关; 此前 Nuxt
+        # 路径完全没有这一步, 线上缺 vars/绑定(Nuxt 只靠 wrangler.toml, 而 pages
+        # deploy 对已存在项目不做配置同步)。
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # v8.9.1 需求4: PROXY_MODE / LANGUAGE 注入 Pages 项目 vars 环境变量(production)。
+          # 适配层(env.PROXY_MODE)与 SSR 运行时(process.env)读取。
+          # ADMIN_SECRET / JWT_SECRET 以 secret_text 写入(等价 wrangler pages secret put);
+          # REMOTE_WS_URL 为 secret(可选); NEXT_PUBLIC_WS_URL 已构建期内联, 不在此配置。
+          #
+          # 注: 此步骤在 deploy 之前执行 —— Pages 的 env_vars 在"部署创建时"快照,
+          # 先注入再部署保证本次部署即生效。
+          # v8.9.7 事实修正(替代 v8.9.5 的错误归因): `wrangler pages deploy` 本身
+          # 不会删除/覆盖项目 env_vars(wrangler 4.133.0 源码级核验: upload/deploy
+          # 模块全程 0 PATCH/0 env_vars 处理; "--keep-vars" 属 Workers 的
+          # `wrangler deploy`, v8.9.6 因误加该参数在 CI 报 Unknown arguments)。
+          # 2026-09 /api 404 事故真因 = 旧版 workflow 根本没注入 vars.PROXY_MODE
+          # (仅读 secrets 而用户配在 vars)+ 本 PATCH 步骤当时尚未存在 —— 注入链路
+          # 从未生效, 与 deploy 行为无关。下一步新增 env_vars 回读校验作双保险。
+          node - <<'NODE_SCRIPT'
+          const fs = require('node:fs');
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const projectName = process.env.PROJECT_NAME;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !projectName || !token) {
+            console.error('::error::缺少 CLOUDFLARE_ACCOUNT_ID / PROJECT_NAME / CLOUDFLARE_API_TOKEN');
+            process.exit(1);
+          }
+          const plain = (v) => ({ type: 'plain_text', value: v ?? '' });
+          const secret = (v) => ({ type: 'secret_text', value: v ?? '' });
+          const envVars = {
+            NODE_ENV: plain('production'),
+            LANGUAGE: plain(process.env.LANGUAGE_RAW || 'auto'),
+          };
+          // PROXY_MODE: 含 apiKey 的完整透传配置(未开启时注入 'false' 显式关闭)
+          envVars.PROXY_MODE = plain(process.env.PROXY_MODE_RAW || 'false');
+          // 必填 secrets(上方 Verify 步骤已保证非空)
+          envVars.ADMIN_SECRET = secret(process.env.ADMIN_SECRET || '');
+          envVars.JWT_SECRET = secret(process.env.JWT_SECRET || '');
+          if (process.env.REMOTE_WS_URL) envVars.REMOTE_WS_URL = secret(process.env.REMOTE_WS_URL);
+
+          // v8.9.5: preview 环境同步注入同一组 env_vars —— 预览部署(<hash>.<project>.
+          // pages.dev 形态)只读 preview 配置, 此前仅注入 production 导致预览 /api 全量
+          // 404(与生产缺 env 同症状)。preview 刻意不带 D1/KV 绑定: 预览写入不得污染
+          // 生产数据(非 proxy 预览按存储降级链路运行; proxy 模式预览全功能)。
+          const production = { env_vars: envVars };
+          const preview = { env_vars: envVars };
+          // 非 proxy 模式: 将 D1/KV 绑定写入项目配置(Pages 高级模式与 Workers 绑定语义一致;
+          // 仅 production —— 见上)
+          if ((process.env.PROXY_PASSTHROUGH || 'false') !== 'true') {
+            if (process.env.D1_ID) {
+              production.d1_databases = { DB: { id: process.env.D1_ID } };
+            }
+            if (process.env.KV_ID) {
+              production.kv_namespaces = { KV: { namespace_id: process.env.KV_ID } };
+            }
+          }
+
+          const body = JSON.stringify({ deployment_configs: { production, preview } });
+          fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/pages/projects/${projectName}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body,
+          }).then(async (r) => {
+            const j = await r.json().catch(() => ({}));
+            const names = Object.keys(envVars).join(', ');
+            if (r.ok && j.success) {
+              console.log(`✓ Pages 项目 env_vars 已注入(production+preview): ${names}`);
+              if (production.d1_databases) console.log('✓ D1 绑定(DB) 已写入项目配置');
+              if (production.kv_namespaces) console.log('✓ KV 绑定(KV) 已写入项目配置');
+            } else {
+              console.error('::error::Pages 项目 env_vars 注入失败: HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j));
+              process.exit(1);
+            }
+          }).catch((e) => { console.error('::error::请求异常: ' + (e && e.message)); process.exit(1); });
+          NODE_SCRIPT
+
+      - name: Verify Pages project env vars (post-PATCH, pre-deploy)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # v8.9.7: 注入结果回读校验 —— "vars 确实进了项目配置"的用户可见证据
+          # (此前只有 PATCH 自报成功, 无项目侧回读; 2026-09 事故形态即
+          # "Actions 全绿但 vars 实际没进去", 无回读就无从发现)。GET 项目
+          # deployment_configs 逐键核对 production+preview; 透传模式下关键键
+          # 缺失 → 部署前 fail(不等 Smoke check 事后拦截)。值一律脱敏展示。
+          node - <<'NODE_SCRIPT'
+          (async () => {
+            const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+            const projectName = process.env.PROJECT_NAME;
+            const token = process.env.CLOUDFLARE_API_TOKEN;
+            if (!accountId || !projectName || !token) {
+              console.error('::error::缺少 CLOUDFLARE_ACCOUNT_ID / PROJECT_NAME / CLOUDFLARE_API_TOKEN');
+              process.exit(1);
+            }
+            const NEED = ['NODE_ENV', 'LANGUAGE', 'PROXY_MODE', 'ADMIN_SECRET', 'JWT_SECRET'];
+            const mask = (v) => {
+              const s = String(v == null ? '' : v);
+              const at = s.indexOf('@');
+              if (at > 0) return s.slice(0, Math.min(12, at)) + '***' + s.slice(at);
+              return s ? s.slice(0, 4) + '***' : '(空)';
+            };
+            const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/pages/projects/${projectName}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok || !j.success) {
+              console.error('::error::读取 Pages 项目配置失败: HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j).slice(0, 300));
+              process.exit(1);
+            }
+            const dc = (j.result && j.result.deployment_configs) || {};
+            let failed = false;
+            for (const envName of ['production', 'preview']) {
+              const vars = (dc[envName] && dc[envName].env_vars) || {};
+              const keys = Object.keys(vars).sort();
+              console.log(`[${envName}] env_vars 键(${keys.length}): ${keys.join(', ') || '(无)'}`);
+              for (const k of NEED) {
+                if (!vars[k]) {
+                  console.error(`::error::[${envName}] 缺少 env_vars.${k}`);
+                  failed = true;
+                }
+              }
+              if (vars.PROXY_MODE) console.log(`[${envName}] PROXY_MODE = ${mask(vars.PROXY_MODE.value)}`);
+              if (vars.LANGUAGE) console.log(`[${envName}] LANGUAGE = ${vars.LANGUAGE.value}`);
+            }
+            const prod = dc.production || {};
+            const d1 = prod.d1_databases && prod.d1_databases.DB && prod.d1_databases.DB.id;
+            const kv = prod.kv_namespaces && prod.kv_namespaces.KV && prod.kv_namespaces.KV.namespace_id;
+            console.log(`[production] 绑定: D1(DB) ${d1 ? '已配置(' + String(d1).slice(0, 8) + '…)' : '未配置'} | KV(KV) ${kv ? '已配置' : '未配置'}`);
+            if (failed) {
+              console.error('::error::Pages 项目 env_vars 校验未通过 —— 请检查上方 Configure 步骤输出与 CLOUDFLARE_API_TOKEN 的 Pages:Edit 权限。');
+              process.exit(1);
+            }
+            console.log('✓ Pages 项目 env_vars 校验通过(production+preview 关键键位齐全)');
+          })().catch((e) => { console.error('::error::校验异常: ' + (e && e.message)); process.exit(1); });
+          NODE_SCRIPT
+
+      # ---- Nuxt 专用: Nitro preset 按 deployType 分支 ----
+
+      - name: Build for Cloudflare (Nuxt)
+        if: env.FRAMEWORK == 'nuxt'
+        run: |
+          # v8.9.11: preset 按 deployType 分支 ——
+          #   pages   → cloudflare-pages: 产物 dist/(含 _worker.js/_routes.json/静态资源)
+          #   workers → cloudflare_module: 产物 .output/(server/index.mjs worker 入口
+          #             + public/ 静态资源; Nitro 生成 wrangler 配置(main/assets/ASSETS 绑定))
+          if [ "$DEPLOY_TYPE" = "workers" ]; then
+            # v8.9.13: realtime.enabled=true → cloudflare-durable 预设(cloudflare_module
+            # 超集: 入口额外自动导出 $DurableObject, crossws 走 DO Hibernation API);
+            # 关闭时保持 cloudflare_module 不变。
+            if [ "$REALTIME_ENABLED" = "true" ]; then
+              NITRO_PRESET=cloudflare-durable npx nuxt build
+            else
+              NITRO_PRESET=cloudflare_module npx nuxt build
+            fi
+            if [ ! -f .output/server/index.mjs ]; then
+              echo "::error::Nuxt workers 构建产物缺失: .output/server/index.mjs(cloudflare_module preset)"
+              exit 1
+            fi
+            echo "::notice::Nuxt workers 构建完成(preset=$([ "$REALTIME_ENABLED" = "true" ] && echo cloudflare-durable || echo cloudflare_module)): .output/server/index.mjs + .output/public/($(find .output/public -type f 2>/dev/null | wc -l) 个静态文件)"
+          else
+            NITRO_PRESET=cloudflare-pages npx nuxt build
+            echo "::notice::Nuxt pages 构建完成: dist/(cloudflare-pages preset)"
+          fi
+        env:
+          # v8.9.12: 构建期占位 DATABASE_URL 引用 .env 解析结果, 不再硬编码
+          DATABASE_URL: "${{ env.DATABASE_URL_VALUE }}"
+
+      # 注意: 无需 Prepare dist output——cloudflare-pages preset 构建已自动输出 dist/(含 _worker.js/、_routes.json、静态资源)
+
+      - name: Generate wrangler.toml (Nuxt → Pages)
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          # Nuxt: cloudflare-pages preset 产物 dist/(含 _worker.js/_routes.json/静态资源)
+          # v8.9.10: wrangler.toml 按 deploy.config.js 动态生成(项目名/D1/KV),
+          # 仓库无需携带静态 wrangler.toml(本地手动部署参考见 deploy.config.js 尾注)。
+          cat > wrangler.toml << EOF
+          name = "${{ env.PROJECT_NAME }}"
+          compatibility_date = "2026-08-01"
+          pages_build_output_dir = "dist"
+          compatibility_flags = ["nodejs_compat"]
+          EOF
+
+          if [ -n "${{ env.D1_NAME }}" ] && [ -n "${{ env.D1_ID }}" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "${{ env.D1_NAME }}"
+          database_id = "${{ env.D1_ID }}"
+          EOF
+            echo "✅ 添加 D1 配置"
+          fi
+
+          if [ -n "${{ env.KV_NAME }}" ] && [ -n "${{ env.KV_ID }}" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${{ env.KV_ID }}"
+          EOF
+            echo "✅ 添加 KV 配置"
+          fi
+
+          # v8.9.13: DO hub 绑定(配套 edge-realtime Worker, 跨脚本 script_name;
+          # 站点服务端 /api/realtime/ws 鉴权后把 WS 升级直呼转发进该 DO)
+          if [ "$REALTIME_ENABLED" = "true" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[durable_objects.bindings]]
+          name = "${REALTIME_BINDING}"
+          class_name = "${REALTIME_DO_CLASS}"
+          script_name = "${REALTIME_WORKER_NAME}"
+          EOF
+            echo "✅ 添加 DO hub 绑定($REALTIME_BINDING → $REALTIME_WORKER_NAME/$REALTIME_DO_CLASS)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          BASE_URL = "/"
+          NODE_ENV = "production"
+          EOF
+
+          echo "=== wrangler.toml ==="
+          cat wrangler.toml
+
+      - name: Generate wrangler.toml (Nuxt → Workers)
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'workers'
+        run: |
+          # v8.9.11: Nuxt Workers 形态 —— Nitro cloudflare_module 产物
+          # .output/(server/index.mjs + public/, ASSETS 绑定语义与 Next→Workers 同构)。
+          # wrangler.toml 按 deploy.config.js 动态生成(项目名/D1/KV/vars),
+          # main/assets 指向 .output/ 产物; 仓库无需携带静态 wrangler.toml。
+          cat > wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${{ env.PROJECT_NAME }}"
+          main = ".output/server/index.mjs"
+          compatibility_date = "2026-08-01"  # ≥2025-04-01: workerd 开放 node:sqlite(数据层依赖)
+          compatibility_flags = ["nodejs_compat"]
+          account_id = "${{ env.CLOUDFLARE_ACCOUNT_ID }}"
+
+          [assets]
+          binding = "ASSETS"
+          directory = ".output/public"
+          EOF
+
+          if [ -n "${{ env.D1_NAME }}" ] && [ -n "${{ env.D1_ID }}" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "${{ env.D1_NAME }}"
+          database_id = "${{ env.D1_ID }}"
+          EOF
+            echo "✅ 添加 D1 配置"
+          fi
+
+          if [ -n "${{ env.KV_NAME }}" ] && [ -n "${{ env.KV_ID }}" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${{ env.KV_ID }}"
+          EOF
+            echo "✅ 添加 KV 配置"
+          fi
+
+          # v8.9.13: DO hub 自承载 —— realtime.enabled=true 时构建用 cloudflare-durable
+          # 预设(入口自动导出 $DurableObject 类), 绑定/类/实例名均为预设硬约定不可改名
+          if [ "$REALTIME_ENABLED" = "true" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[durable_objects.bindings]]
+          name = "\$DurableObject"
+          class_name = "\$DurableObject"
+
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["\$DurableObject"]
+          EOF
+            echo "✅ 添加 DO 自承载绑定(\$DurableObject, 含 migrations)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          BASE_URL = "/"
+          NODE_ENV = "production"
+          EOF
+
+          # 不整文件 cat(避免把敏感值打进日志), 只展示结构:
+          echo "=== wrangler.toml(结构) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml || true
+
+      - name: Configure secrets on Pages project (Nuxt)
+        # v8.9.8: 保留为 Nuxt 路径的显式 secrets 兜底(与上方 env_vars PATCH 幂等;
+        # 项目创建已由统一步骤 "Ensure Pages project" 完成)。
+        # v8.9.11: 补 DEPLOY_TYPE=='pages' 门控 —— Nuxt→Workers 时 Pages 项目
+        # 不存在, secrets 由通用 "Configure secrets on Worker" 步骤写入。
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "::error::缺少 ADMIN_SECRET! 请在 GitHub 仓库 Settings → Secrets and variables → Actions 添加 ADMIN_SECRET secret(值同本地 .env 的 ADMIN_SECRET)。"
+            exit 1
+          fi
+          printf '%s' "$ADMIN_SECRET" | npx wrangler pages secret put ADMIN_SECRET --project-name "${{ env.PROJECT_NAME }}"
+
+          if [ -z "$JWT_SECRET" ]; then
+            echo "::error::缺少 JWT_SECRET! 请在 GitHub 仓库 Settings → Secrets and variables → Actions 添加 JWT_SECRET secret(值同本地 .env 的 JWT_SECRET)。"
+            exit 1
+          fi
+          printf '%s' "$JWT_SECRET" | npx wrangler pages secret put JWT_SECRET --project-name "${{ env.PROJECT_NAME }}"
+
+          SECRET_LIST=$(npx wrangler pages secret list --project-name "${{ env.PROJECT_NAME }}" 2>&1)
+          echo "$SECRET_LIST"
+          for name in ADMIN_SECRET JWT_SECRET; do
+            if ! echo "$SECRET_LIST" | grep -q "$name"; then
+              echo "::error::$name 未能写入 Pages 项目, 请检查 wrangler pages secret 输出。"
+              exit 1
+            fi
+          done
+          echo "✓ Secrets configured (ADMIN_SECRET, JWT_SECRET confirmed)"
+
+      # ---- 部署(按 deployType 分支; Nuxt 恒为 Pages) ----
+      # Next.js+pages / Nuxt: production 分支 = main, main 分支 push 等价于生产发布。
+      # Next.js+workers: wrangler deploy 按 wrangler.toml(main/assets) 发布 Worker。
+
+      - name: Deploy to Cloudflare Pages (Next.js 自研适配产物)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          # dist-pages = Pages 高级模式部署目录(_worker.js + 静态资源 + _headers)
+          # wrangler.toml(pages_build_output_dir=dist-pages) 已含项目名与兼容性配置
+          # v8.9.7 修正(源码级核验, wrangler 4.133.0): 移除 v8.9.5/v8.9.6 误加的
+          # --keep-vars —— 该参数只存在于 Workers 的 `wrangler deploy`, pages deploy
+          # 的参数表(project-name/branch/commit-*/skip-caching/no-bundle/
+          # upload-source-maps)根本没有它, yargs 参数校验直接报
+          # "Unknown arguments: keep-vars, keepVars" 拦死整个部署(v8.9.6 CI 实测)。
+          # 且 pages deploy 对已存在项目零配置同步(upload/deploy 模块 0 PATCH/
+          # 0 env_vars 处理), 上方 API PATCH 注入的 vars 不需要任何 flag 保护。
+          echo "wrangler 版本: $(npx wrangler --version 2>/dev/null | tail -1)"
+          npx wrangler pages deploy dist-pages \
+            --project-name "${{ env.PROJECT_NAME }}" \
+            --branch main \
+            --commit-dirty | tee /tmp/pages-deploy-out.txt
+          # 抓取本次部署 URL(哈希子域, 即刻可访问)供下一步冒烟验证
+          DEPLOY_URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.pages\.dev' /tmp/pages-deploy-out.txt | tail -1 || true)
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::error::未能从 wrangler 输出解析部署 URL, 无法执行 /api 冒烟验证。"
+            exit 1
+          fi
+          echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_ENV
+          echo "✓ 本次部署 URL: $DEPLOY_URL"
+
+      - name: Smoke check /api passthrough (Next.js pages)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          # v8.9.5: 部署后 /api 冒烟验证 —— 拦截"部署快照缺 env vars / 透传链路断裂"类
+          # 事故(2026-09 线上 /api 全量 404 即此类; 此前无部署后校验, Actions 全绿但
+          # 线上 /api 404)。判定口径:
+          #   200                     → 透传链路健康(proxy 模式应为上游 JSON)
+          #   404                     → 配置/链路断裂(::error 终止) —— 典型: 部署快照无
+          #                             PROXY_MODE, api-forward 运行时回落 404
+          #   502 + proxy_upstream_*  → 本站透传链路 OK, 上游不可达(::warning 不阻塞,
+          #                             上游可用性不属本仓库部署职责)
+          # 新部署哈希子域即刻生效, 边缘传播允许秒级抖动 → 重试 6 次间隔 5s。
+          BODY=/tmp/smoke-body; CODE=000
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -m 20 -o "$BODY" -w '%{http_code}' "$DEPLOY_URL/api/app-version" 2>/dev/null || echo 000)
+            echo "attempt $i: HTTP $CODE $(awk '{print substr($0,1,140)}' "$BODY" 2>/dev/null)"
+            if [ "$CODE" = "200" ]; then
+              echo "✓ /api/app-version → 200(/api 透传链路健康)"
+              exit 0
+            fi
+            if [ "$CODE" = "502" ] && grep -q 'proxy_upstream_unreachable' "$BODY" 2>/dev/null; then
+              echo "::warning::/api 透传链路 OK 但上游不可达(502 proxy_upstream_unreachable) —— 请检查 PROXY_MODE 上游服务可用性(不阻塞部署)。"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::部署后 /api/app-version 持续非 200(HTTP $CODE) —— /api 透传链路断裂。"
+          echo "  排查: ① Pages 项目 env_vars(production+preview)是否含 PROXY_MODE ② build-pages-adapter 装配日志是否出现构建期配置烧录 ③ 上游可达性。"
+          exit 1
+
+      - name: Deploy to Cloudflare Workers (Next.js OpenNext 产物)
+        if: env.FRAMEWORK == 'next' && env.DEPLOY_TYPE == 'workers'
+        run: |
+          # v8.9.2 需求2: workers 部署类型(v8.9.0 原有链路 + v8.9.2 统一适配层入口)。
+          # wrangler.toml 已由上方步骤生成: main = pages-adapter/worker.ts
+          # (转发 .open-next/worker.js + 入口层 D1/KV 绑定注入),
+          # [assets] directory = .open-next/assets(静态资源托管 + ASSETS 绑定)。
+          # 首次部署即创建 Worker(名称 = PROJECT_NAME); secrets 顺序见下一步骤注释。
+          npx wrangler deploy
+
+      - name: Deploy to Cloudflare Workers (Nuxt 产物)
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'workers'
+        run: |
+          # v8.9.11: Nuxt workers 部署 —— wrangler.toml 已由上方步骤生成
+          # (main = .output/server/index.mjs + [assets] + D1/KV 绑定)。
+          # 首次部署即创建 Worker(名称 = PROJECT_NAME); secrets 在部署后由
+          # 通用 "Configure secrets on Worker" 写入(两条 workers 链路共用;
+          # secret put 要求 Worker 已存在, 故本步骤必须在该步骤之前执行)。
+          npx wrangler deploy
+
+      - name: Configure secrets on Worker (deployType=workers)
+        # v8.9.11: 通用化为 workers 部署类型共用(原 Next 专属) —— secrets 注入是
+        # 配置类操作, 与框架无关: Next(OpenNext worker.js)与 Nuxt(Nitro
+        # cloudflare_module 产物)的 Worker 运行期 secrets 同一套写入链路。
+        if: env.DEPLOY_TYPE == 'workers'
+        run: |
+          # v8.9.2 需求2: Workers 运行期 secrets(v8.9.0 原有链路 + PROXY_MODE 运行时注入)。
+          # 顺序说明: `wrangler secret put` 要求 Worker 已存在,
+          # 因此先 deploy(首次 run 创建 Worker; Next/Nuxt 两条 workers 链路的
+          # deploy 步骤均在本步骤之前), 再写 secrets(secrets 写入后立即生效)。
+          # 必需 secret: ADMIN_SECRET(管理后台密码) 和 JWT_SECRET(JWT 签名密钥)。
+          # 两者缺失时前置校验步骤已报错; 此处再次防御并在写入后验证。
+          printf '%s' "$ADMIN_SECRET" | npx wrangler secret put ADMIN_SECRET --name "$PROJECT_NAME"
+          printf '%s' "$JWT_SECRET" | npx wrangler secret put JWT_SECRET --name "$PROJECT_NAME"
+
+          # PROXY_MODE 运行时注入: /api-forward 运行时读取 process.env.PROXY_MODE
+          # (含 apiKey → 以 secret 写入, 不进 wrangler.toml [vars]/部署日志)。
+          # 未开启时清理历史残留 secret(幂等; 残留不影响行为 —— 非 proxy 构建
+          # 的 rewrites 不含 /api-forward 转发规则 —— 但清理更整洁, 失败不阻塞)。
+          if [ -n "$PROXY_MODE_RAW" ]; then
+            printf '%s' "$PROXY_MODE_RAW" | npx wrangler secret put PROXY_MODE --name "$PROJECT_NAME"
+            echo "✓ PROXY_MODE 已注入 Worker secrets(运行期可改: wrangler secret put PROXY_MODE)"
+          else
+            npx wrangler secret delete PROXY_MODE --name "$PROJECT_NAME" 2>/dev/null \
+              && echo "✓ 已清理历史 PROXY_MODE secret" \
+              || echo "✓ 无历史 PROXY_MODE secret(跳过清理)"
+          fi
+
+          # v4.3.7 需求6: 配置了 D1 时, 写入 REST 直连兜底所需的数据库 ID secret
+          # (CLOUDFLARE_ACCOUNT_ID 已在 [vars]; token 默认不写入 Worker ——
+          #  绑定注入(src/instrumentation.ts)为主路径, REST 路径仅当用户手动
+          #  `npx wrangler secret put CLOUDFLARE_API_TOKEN` 时启用)
+          if [ -n "$D1_ID" ]; then
+            printf '%s' "$D1_ID" | npx wrangler secret put CLOUDFLARE_D1_DATABASE_ID --name "$PROJECT_NAME" || true
+          fi
+
+          # 验证两个必需 secret 均已写入
+          SECRET_LIST=$(npx wrangler secret list --name "$PROJECT_NAME" 2>&1)
+          echo "$SECRET_LIST"
+          for name in ADMIN_SECRET JWT_SECRET; do
+            if ! echo "$SECRET_LIST" | grep -q "$name"; then
+              echo "::error::$name 未能写入 Worker, 请检查 wrangler secret 输出。"
+              exit 1
+            fi
+          done
+          echo "✓ Secrets configured (ADMIN_SECRET, JWT_SECRET confirmed)"
+
+      - name: Deploy to Cloudflare Pages (Nuxt 产物)
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'pages'
+        run: |
+          npx wrangler pages deploy dist --project-name "${{ env.PROJECT_NAME }}" --branch main --commit-dirty
+
+      - name: Smoke check realtime channel (Nuxt pages + DO)
+        # v8.9.13: 发布成功 = DO 就绪 —— /api/system/status 公开探针的 realtime 字段
+        # 由站点运行时按 DO 绑定存在性判定: 'ws' = REALTIME_DO 绑定已随部署生效;
+        # 持续 'sse' = 绑定丢失(配套 Worker 未部署/script_name 不一致), 照常终止。
+        if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'pages' && env.REALTIME_ENABLED == 'true'
+        run: |
+          REALTIME_OK=""
+          for i in 1 2 3 4 5 6; do
+            BODY=$(curl -sS -m 20 "https://${{ env.PROJECT_NAME }}.pages.dev/api/system/status" 2>/dev/null || echo "")
+            REALTIME_VAL=$(echo "$BODY" | grep -oE '"realtime"[[:space:]]*:[[:space:]]*"[a-z]+"' | head -1 | grep -oE '[a-z]+"' | tr -d '"' || true)
+            echo "attempt $i: realtime=${REALTIME_VAL:-'(探测失败)'}"
+            if [ "$REALTIME_VAL" = "ws" ]; then
+              REALTIME_OK=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$REALTIME_OK" ]; then
+            echo "::error::部署后 /api/system/status realtime 未变为 'ws'(DO 绑定未生效)。"
+            echo "  排查: ① 配套 Worker 是否已部署($REALTIME_WORKER_NAME) ② wrangler.toml 的 durable_objects.bindings script_name 是否一致 ③ Pages Dashboard → Settings → Bindings 是否出现 $REALTIME_BINDING。"
+            exit 1
+          fi
+          echo "✓ 实时通道就绪: status.realtime='ws'(DO hub 绑定生效)"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          if [ "${{ env.FRAMEWORK }}" = "nuxt" ] && [ "${{ env.DEPLOY_TYPE }}" = "workers" ]; then
+            TARGET_DESC="Nuxt → Workers(Nitro cloudflare_module)"
+          elif [ "${{ env.FRAMEWORK }}" = "nuxt" ]; then
+            TARGET_DESC="Nuxt → Pages"
+          elif [ "${{ env.DEPLOY_TYPE }}" = "workers" ]; then
+            TARGET_DESC="Next.js → Workers(OpenNext)"
+          else
+            TARGET_DESC="Next.js → Pages(OpenNext + 自研适配层)"
+          fi
+          echo "## Cloudflare 部署 ${{ job.status == 'success' && '✅' || '❌' }}($TARGET_DESC)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 配置项 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 框架 | ${{ env.FRAMEWORK }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 部署类型 | ${{ env.DEPLOY_TYPE }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ env.DEPLOY_TYPE }}" = "pages" ]; then
+            echo "| Pages 项目 | ${{ env.PROJECT_NAME }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 默认域名 | https://${{ env.PROJECT_NAME }}.pages.dev |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ env.DEPLOY_TYPE }}" = "workers" ]; then
+            echo "| Worker 名称 | ${{ env.PROJECT_NAME }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 默认域名 | https://${{ env.PROJECT_NAME }}.${{ env.CLOUDFLARE_ACCOUNT_ID }}.workers.dev |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ env.FRAMEWORK }}" != "nuxt" ] && [ "${{ env.DEPLOY_TYPE }}" = "pages" ]; then
+            echo "| 适配层 | dist-pages/_worker.js(Pages 高级模式; /api Functions 代理透传 + OpenNext SSR) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| 数据库(D1) | ${{ env.DATABASE_ENABLED == 'true' && format('启用(database={0})', env.DATABASE_RAW) || '关闭(database=false/未配置, 仅站点代码)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 本地数据库文件 | ${{ env.DATABASE_URL_VALUE }}(文件: prisma/${{ env.DATABASE_FILENAME }}, 真源=.env DATABASE_URL) |" >> $GITHUB_STEP_SUMMARY
+          echo "| D1 数据库 | ${{ env.PROXY_PASSTHROUGH == 'true' && '(proxy 模式: 由代理站维护)' || (env.D1_NAME || '(未配置)') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KV 命名空间 | ${{ env.PROXY_PASSTHROUGH == 'true' && '(proxy 模式: 由代理站维护)' || (env.KV_NAME || '(未配置)') }} |" >> $GITHUB_STEP_SUMMARY
+          # v8.9.13: 实时通道摘要(自承载 vs 配套 Worker; 注意单引号防 $DurableObject 被展开)
+          if [ "${{ env.REALTIME_ENABLED }}" = "true" ]; then
+            if [ "${{ env.FRAMEWORK }}" = "nuxt" ] && [ "${{ env.DEPLOY_TYPE }}" = "workers" ]; then
+              echo '| 实时通道(DO) | 自承载 $DurableObject(cloudflare-durable 预设, Hibernation WebSocket) |' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| 实时通道(DO) | 配套 Worker ${{ env.REALTIME_WORKER_NAME }}(${{ env.REALTIME_BINDING }} → ${{ env.REALTIME_DO_CLASS }}) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| 实时通道(DO) | 关闭(实时走 SSE) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| 触发分支 | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 模式 | ${{ env.PROXY_PASSTHROUGH == 'true' && format('代理透传(PROXY_MODE 注入 vars, /api/* 全量 Functions 透传)') || '本地数据库(D1/KV)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 语言模式 | ${{ env.LANGUAGE_RAW || 'auto' }} |" >> $GITHUB_STEP_SUMMARY
+          # v8.9.6: 摘要同时镜像到步骤日志 —— $GITHUB_STEP_SUMMARY 只渲染在运行首页的
+          # "Summary" 标签, 步骤日志本身看起来是空的(易误判为"步骤没执行/没有输出")
+          echo "--- Deployment summary(日志镜像; 完整表格见运行首页 Summary 标签) ---"
+          cat "${GITHUB_STEP_SUMMARY}" || true

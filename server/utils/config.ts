@@ -12,6 +12,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { DATABASE_URL } from './db-config'
 
 interface RuntimeState {
   adminSecret: string
@@ -40,7 +41,7 @@ function loadState(): RuntimeState {
     adminSecret: process.env.XY_ADMIN_SECRET || process.env.ADMIN_SECRET || '',
     jwtSecret: process.env.XY_JWT_SECRET || process.env.JWT_SECRET || '',
     dbDriver: process.env.XY_DB_DRIVER || process.env.DB_DRIVER || 'sqlite',
-    dbUrl: process.env.XY_DATABASE_URL || 'data/xianyu_admin.db',
+    dbUrl: DATABASE_URL,
     dbHost: process.env.XY_DB_HOST || process.env.DB_HOST || '',
     dbPort: process.env.XY_DB_PORT || process.env.DB_PORT || '',
     dbUser: process.env.XY_DB_USER || process.env.DB_USER || '',

@@ -1,23 +1,24 @@
 {
   "name": "xianyu-admin",
-  "version": "2.4.0",
+  "version": "2.0.4",
   "private": true,
   "type": "module",
-  "description": "闲鱼超级管家 - 现代化的闲鱼自动回复与管理平台，基于 Nuxt 4 + Tailwind CSS 3 构建，支持 SQLite/MySQL/Cloudflare D1 多数据库无缝切换。Fork 自 https://github.com/Mxucc/xianyu-super-butler ，感谢原作者的贡献。⭐ 如果对你有帮助，欢迎 Star 支持！",
+  "description": "闲鱼超级管家 - 现代化的闲鱼自动回复与管理平台，基于 Nuxt 4 + Tailwind CSS 3 构建，支持闲鱼多账号管理、二维码扫码登录、返佣分销系统，支持 SQLite/MySQL/Cloudflare D1 多数据库无缝切换。",
   "author": "Kentpan <ayue530@gmail.com>",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "scripts": {
-    "dev": "nuxt dev --port 3001 --host 0.0.0.0",
+    "dev": "nuxt dev",
     "build": "nuxt build",
-    "start": "nuxt start --port 3001 --host 0.0.0.0",
+    "start": "nuxt start",
     "generate": "nuxt generate",
     "lint": "eslint ."
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.8.1",
+    "decimal.js": "^10.6.0",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.14.0",
+    "nodemailer": "^10.0.14",
     "nuxt": "4.4.8",
     "vue": "^3.5.13",
     "vue-router": "^4.5.0"
@@ -25,11 +26,14 @@
   "devDependencies": {
     "@nuxtjs/tailwindcss": "^6.13.1",
     "@types/bcryptjs": "^2.4.6",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/jsonwebtoken": "^9.0.9",
+    "@types/nodemailer": "^8.0.2",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.5.3",
     "tailwindcss": "3.4.19",
     "typescript": "^5.7.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }

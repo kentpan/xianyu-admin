@@ -61,8 +61,6 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
-
 definePageMeta({ layout: 'default' })
 
 const toast = useToast()

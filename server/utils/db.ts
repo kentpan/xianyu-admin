@@ -2,15 +2,26 @@
  * Unified Database Adapter Layer
  *
  * Supports seamless switching between:
- *  - sqlite  : better-sqlite3 (local Node)
+ *  - sqlite  : node:sqlite (built-in, zero native deps, local Node)
  *  - mysql   : mysql2 (self-hosted / cloud)
  *  - d1      : Cloudflare D1 binding (serverless)
  *  - memory  : in-memory fallback (zero-config demo)
  *
  * Driver is selected by DB_DRIVER env, configurable from the install wizard.
  * All adapters implement the same interface, so repositories stay identical.
+ *
+ * Auto-adaptation (detectRuntime):
+ *  - Cloudflare Pages/Workers: 'sqlite' and 'd1' both resolve to the D1
+ *    binding ("DB") — there is no filesystem on Pages, so the built-in
+ *    node:sqlite driver cannot be used there.
+ *  - Node.js: 'd1' is rejected with a clear hint (D1 bindings only exist
+ *    inside Workers/Pages); 'sqlite' uses the built-in node:sqlite module.
  */
+import { DatabaseSync } from 'node:sqlite'
+import fs from 'node:fs'
+import path from 'node:path'
 import type { H3Event } from 'h3'
+import { DATABASE_URL } from './db-config'
 
 export interface DatabaseAdapter {
   driver: 'sqlite' | 'mysql' | 'd1' | 'memory'
@@ -28,7 +39,12 @@ let _initPromise: Promise<DatabaseAdapter> | null = null
 export async function getDb(event?: H3Event): Promise<DatabaseAdapter> {
   if (_adapter) return _adapter
   if (_initPromise) return _initPromise
-  _initPromise = createAdapter(event)
+  _initPromise = createAdapter(event).catch((e) => {
+    // 初始化失败后清除缓存 Promise, 允许后续请求重试
+    // (例如 Cloudflare 启动阶段 D1 绑定尚未就绪)
+    _initPromise = null
+    throw e
+  })
   _adapter = await _initPromise
   _initPromise = null
   return _adapter
@@ -42,12 +58,27 @@ export async function resetDb() {
 
 async function createAdapter(event?: H3Event): Promise<DatabaseAdapter> {
   const state = getRuntimeState()
-  const driver = (state.dbDriver || 'sqlite') as DatabaseAdapter['driver']
+  let driver = (state.dbDriver || 'sqlite') as DatabaseAdapter['driver']
+  const runtime = detectRuntime()
+
+  // ---- Runtime auto-adaptation -------------------------------------------
+  if (runtime === 'cloudflare' && driver === 'sqlite') {
+    // No filesystem on Cloudflare Pages: transparently fall back to D1.
+    console.log('[db] cloudflare runtime + sqlite driver → auto-adapt to D1 binding')
+    driver = 'd1'
+  }
+  if (runtime === 'node' && driver === 'd1') {
+    throw new Error(
+      'D1 绑定仅在 Cloudflare Pages/Workers 运行时可用。本地 Node 环境请使用 XY_DB_DRIVER=sqlite 或 mysql。',
+    )
+  }
 
   if (driver === 'd1') {
-    // Cloudflare D1 binding via Nitro cloudflare context
+    // Cloudflare D1 binding: 优先取请求上下文(nitro 注入 event.context.cloudflare),
+    // 回退到 globalThis.__env__(cloudflare-pages/module 入口在每次请求时设置),
+    // 这样所有无参 getDb() 调用(146 处)在 Cloudflare 运行时都能拿到绑定。
     const cloudflare = (event?.context as any)?.cloudflare
-    const d1 = cloudflare?.env?.DB
+    const d1 = cloudflare?.env?.DB ?? (globalThis as any).__env__?.DB
     if (!d1) throw new Error('D1 binding "DB" not found in Cloudflare env')
     return new D1Adapter(d1)
   }
@@ -69,35 +100,34 @@ async function createAdapter(event?: H3Event): Promise<DatabaseAdapter> {
     return new MemoryAdapter()
   }
 
-  // default: sqlite
-  const Database = (await import('better-sqlite3')).default
-  const fs = await import('node:fs')
-  const path = await import('node:path')
-  let dbPath = state.dbUrl || 'data/xianyu_admin.db'
+  // default: sqlite via the built-in node:sqlite module (Node ≥ 22.5, no native deps)
+  let dbPath = state.dbUrl || DATABASE_URL
   dbPath = dbPath.replace(/^file:/, '')
-  if (dbPath.startsWith('data/') || !path.isAbsolute(dbPath)) {
+  if (!path.isAbsolute(dbPath)) {
     const dir = path.dirname(dbPath)
-    fs.mkdirSync(dir, { recursive: true })
+    if (dir !== '.' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    dbPath = path.resolve(dbPath)
   }
-  const conn = new Database(dbPath)
-  conn.pragma('journal_mode = WAL')
+  const conn = new DatabaseSync(dbPath)
+  conn.exec('PRAGMA journal_mode = WAL')
   return new SQLiteAdapter(conn)
 }
 
 /* ------------------------------- SQLite ---------------------------------- */
+/** Adapter over the built-in node:sqlite DatabaseSync (same engine as better-sqlite3). */
 class SQLiteAdapter implements DatabaseAdapter {
   driver = 'sqlite' as const
-  constructor(private conn: any) {}
+  constructor(private conn: DatabaseSync) {}
 
   all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-    return Promise.resolve(this.conn.prepare(sql).all(...params))
+    return Promise.resolve(this.conn.prepare(sql).all(...params) as T[])
   }
   get<T = any>(sql: string, params: any[] = []): Promise<T | null> {
-    return Promise.resolve(this.conn.prepare(sql).get(...params) ?? null)
+    return Promise.resolve((this.conn.prepare(sql).get(...params) as T | undefined) ?? null)
   }
   run(sql: string, params: any[] = []): Promise<{ changes: number; lastInsertId: number | string }> {
     const r = this.conn.prepare(sql).run(...params)
-    return Promise.resolve({ changes: r.changes, lastInsertId: r.lastInsertRowid as number })
+    return Promise.resolve({ changes: Number(r.changes), lastInsertId: Number(r.lastInsertRowid) })
   }
   async exec(sql: string): Promise<void> {
     this.conn.exec(sql)

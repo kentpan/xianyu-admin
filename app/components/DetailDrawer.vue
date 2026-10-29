@@ -1,8 +1,8 @@
 <template>
   <Teleport to="body">
     <Transition name="drawer">
-      <div v-if="modelValue" class="fixed inset-0 z-[90]" @click.self="onBackdrop">
-        <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm" />
+      <div v-if="modelValue" class="fixed inset-0 z-[90]">
+        <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm" @click="onBackdrop" />
         <div
           class="drawer-panel absolute top-0 right-0 h-full w-full max-w-md bg-white dark:bg-slate-800 shadow-2xl flex flex-col border-l border-slate-200 dark:border-slate-700"
         >

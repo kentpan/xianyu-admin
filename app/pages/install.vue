@@ -4,7 +4,7 @@
       <!-- Brand header -->
       <div class="text-center mb-6">
         <div class="w-14 h-14 mx-auto rounded-2xl bg-brand-500 flex items-center justify-center shadow-lg shadow-brand-500/30">
-          <Icon name="message" class="text-white text-2xl" />
+          <Icon name="fish" class="text-white text-2xl" />
         </div>
         <h1 class="mt-4 text-2xl font-bold text-slate-900 dark:text-white">闲鱼超级管家 · 系统安装</h1>
         <p class="mt-1.5 text-sm text-slate-500 dark:text-slate-400">首次使用请完成初始化配置，仅此一次</p>
@@ -66,8 +66,8 @@
             <div v-if="form.dbDriver === 'sqlite'" class="space-y-3">
               <div>
                 <label class="label">数据库文件路径</label>
-                <input v-model="form.dbUrl" class="input" placeholder="data/xianyu_admin.db" />
-                <p class="text-xs text-slate-400 mt-1">留空使用默认路径 data/xianyu_admin.db</p>
+                <input v-model="form.dbUrl" class="input" placeholder="prisma/xianyu_admin.db" />
+                <p class="text-xs text-slate-400 mt-1">留空使用默认路径 prisma/xianyu_admin.db</p>
               </div>
             </div>
 
@@ -226,13 +226,13 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { installSystem } from '~/api/install'
+import { getSystemStatus } from '~/api/system'
 import { useToast } from '~/composables/useToast'
 
 definePageMeta({ layout: false })
 
 const toast = useToast()
-const api = useApi()
 const router = useRouter()
 
 const steps = [
@@ -249,7 +249,7 @@ const runtime = ref<'node' | 'cloudflare'>('node')
 // Detect runtime on mount
 onMounted(async () => {
   try {
-    const data = await api.get<{ runtime: 'node' | 'cloudflare' }>('/api/system/status')
+    const data = await getSystemStatus()
     runtime.value = data.runtime || 'node'
   } catch {
     // default node
@@ -265,7 +265,7 @@ const dbOptions = [
 
 const form = reactive({
   dbDriver: 'sqlite',
-  dbUrl: 'data/xianyu_admin.db',
+  dbUrl: 'prisma/xianyu_admin.db',
   dbHost: '127.0.0.1',
   dbPort: '3306',
   dbUser: 'root',
@@ -343,7 +343,7 @@ function next() {
 async function doInstall() {
   installing.value = true
   try {
-    const r = await api.post<{ runtime: string; message?: string }>('/api/install', form)
+    const r = await installSystem(form)
     toast.success(r.message || '安装完成，正在跳转登录...')
     const installed = useState<boolean | null>('sys_installed', () => null)
     installed.value = true

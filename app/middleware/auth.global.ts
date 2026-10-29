@@ -1,13 +1,18 @@
 /**
- * Client-side route guard.
- * - If not installed → force /install (server also enforces this).
- * - If installed but not authenticated → redirect to /login (except public pages).
- * - If authenticated but visits /login → redirect to /dashboard.
+ * SSR 服务端登录态检测与鉴权 (server-side route guard)。
+ *
+ * 初始导航在服务端执行本中间件:
+ *   - useApi 内部通过 useRequestHeaders(['cookie']) 透传浏览器 Cookie,
+ *     /api/auth/verify 与 /api/system/status 均在服务端完成 JWT 校验;
+ *   - 未登录访问受保护页面 → 服务端直接 302 /login (响应到达浏览器前);
+ *   - 已登录的鉴权结果经 useState payload 水合到客户端, 客户端导航复用同一状态;
+ *   - /admin/* 页面在服务端校验 is_admin。
  *
  * Routes use relative app paths (e.g. '/install'); Nuxt's router resolves them
- * against app.baseURL ('/admin/'), so the browser URL becomes '/admin/install'.
+ * against app.baseURL ('/'), so the browser URL becomes '/install'.
  */
 import { useAuth } from '~/composables/useAuth'
+import { getSystemStatus } from '~/api/system'
 
 export default defineNuxtRouteMiddleware(async (to) => {
   const publicPaths = ['/login', '/register', '/install', '/disclaimer', '/about']
@@ -19,8 +24,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
   const installed = useState<boolean | null>('sys_installed', () => null)
   if (installed.value === null) {
     try {
-      const api = useApi()
-      const data = await api.get<{ installed: boolean }>('/api/system/status')
+      const data = await getSystemStatus()
       installed.value = data.installed
     } catch {
       installed.value = false

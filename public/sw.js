@@ -4,8 +4,8 @@
  */
 const CACHE_NAME = 'xianyu-admin-v2.1.0'
 const STATIC_ASSETS = [
-  '/xianyu/favicon.svg',
-  '/xianyu/manifest.json',
+  '/favicon.svg',
+  '/manifest.json',
 ]
 
 self.addEventListener('install', (event) => {
@@ -61,7 +61,7 @@ self.addEventListener('fetch', (event) => {
           caches.open(CACHE_NAME).then((cache) => cache.put(req, clone))
         }
         return res
-      }).catch(() => caches.match(req).then((cached) => cached || caches.match('/xianyu/'))),
+      }).catch(() => caches.match(req).then((cached) => cached || caches.match('/'))),
     )
     return
   }

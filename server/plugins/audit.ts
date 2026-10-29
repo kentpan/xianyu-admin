@@ -31,9 +31,9 @@ export default defineNitroPlugin((nitroApp) => {
 
       const url = getRequestURL(event)
       const path = url.pathname
-      if (!path.startsWith('/api/') && !path.startsWith('/xianyu/api/')) return
+      if (!path.startsWith('/api/')) return
 
-      const apiPath = path.replace(/^\/xianyu/, '')
+      const apiPath = path
       if (SKIP_PATHS.some((p) => apiPath.startsWith(p))) return
 
       // Only audit successful (2xx) responses (response may be undefined for some requests)

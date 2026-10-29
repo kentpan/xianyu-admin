@@ -2,12 +2,37 @@
 
 > 现代化的闲鱼自动回复与管理平台，基于 Nuxt 4.4.8 + Tailwind CSS 3.4.19 构建
 
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
 [![Nuxt](https://img.shields.io/badge/Nuxt-4.4.8-00DC82.svg)](https://nuxt.com)
 [![Tailwind](https://img.shields.io/badge/Tailwind-3.4.19-38BDF8.svg)](https://tailwindcss.com)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6.svg)](https://www.typescriptlang.org)
 
-基于 [xianyu-super-butler](https://github.com/Mxucc/xianyu-super-butler) 项目用 Nuxt 4 + Tailwind 3 技术栈完整复刻重构。感谢原作者 [@Mxucc](https://github.com/Mxucc) 的开源贡献！⭐ **如果对你有帮助，欢迎 Star 支持！**
+基于 Nuxt 4 + Tailwind 3 技术栈独立构建的闲鱼账号管理与自动回复平台。
+
+**v2.0.3 新增**: 擦亮宝贝(真实生效) · 发布模板(规避风控) · 联盟选品→卡券→闲鱼自动回复闭环 · 15 国内外主流佣金联盟
+
+---
+
+## 🔁 闭环流程: 联盟选品 → 闲鱼自动回复 → 赚取佣金
+
+闲鱼超级管家提供完整的返佣闭环, 将联盟选品与闲鱼自动回复打通:
+
+```
+联盟选品 (货源广场)
+    ↓ 一键转卡券
+卡券管理 (含联盟推广链接)
+    ↓ 绑定闲鱼商品 ID
+闲鱼商品 (扫码登录后同步)
+    ↓ 关键词自动回复
+买家咨询 → 自动回复发送联盟链接 → 买家购买 → 赚取佣金
+```
+
+### 使用步骤
+1. **配置联盟账号**: 货源广场 → 联盟账号 → 新增 (选 15 个联盟之一, 填凭据)
+2. **选品搜索**: 货源广场 → 选品搜索 → 关键词搜索 → 收藏商品
+3. **转卡券**: 我的选品 → 选品商品 → 点「转卡券」→ 填闲鱼商品 ID + 关键词
+4. **自动回复**: 买家在闲鱼咨询该关键词 → 自动回复发送联盟链接
+5. **赚佣金**: 买家点击链接购买 → 你获得联盟佣金
 
 ---
 
@@ -54,7 +79,7 @@ bun install  # 或 npm install / pnpm install
 
 ```bash
 bun run dev
-# 访问 http://localhost:3001/xianyu/
+# 访问 http://localhost:3001/
 ```
 
 首次访问会自动跳转到安装向导，按步骤完成配置即可。
@@ -84,13 +109,13 @@ bun run build
 
 #### 2. 配置环境变量
 
-构建后，首次启动访问 `/xianyu/install` 完成安装向导，或手动创建 `.env`：
+构建后，首次启动访问 `/install` 完成安装向导，或手动创建 `.env`：
 
 ```env
 XY_ADMIN_SECRET=your-admin-secret-at-least-6-chars
 XY_JWT_SECRET=your-jwt-secret-at-least-16-chars
 XY_DB_DRIVER=sqlite
-XY_DATABASE_URL=data/xianyu_admin.db
+XY_DATABASE_URL=prisma/xianyu_admin.db
 XY_INSTALLED=true
 ```
 
@@ -204,7 +229,7 @@ wrangler pages deploy .output/public --project-name=xianyu-admin
 
 #### 5. 完成安装向导
 
-部署后访问 `https://你的项目.pages.dev/xianyu/install`：
+部署后访问 `https://你的项目.pages.dev/install`：
 
 - 安装向导会**自动检测到 Cloudflare 环境**
 - 选择 **D1** 数据库
@@ -371,17 +396,17 @@ xianyu-admin/
 ├── tailwind.config.js      # Tailwind 配置
 ├── wrangler.toml.example   # Cloudflare 配置模板
 ├── supervisor.sh           # 生产环境守护脚本
-└── LICENSE                 # MIT 许可证
+└── LICENSE                 # GNU AGPL v3.0 许可证
 ```
 
 ---
 
-## 🔄 从源项目迁移
+## 🔄 功能模块
 
-本项目基于 [xianyu-super-butler](https://github.com/Mxucc/xianyu-super-butler)（FastAPI + React）用 Nuxt 4 + Tailwind 3 完整复刻：
+本项目采用 Nuxt 4 + Tailwind 3 技术栈构建：
 
-- ✅ 14 个功能模块全部复刻
-- ✅ 20 个数据库表结构兼容
+- ✅ 18 个功能模块（含闲鱼多账号管理、返佣分销系统、联盟选品闭环）
+- ✅ 27+ 个数据库表结构
 - ✅ 统一 API 响应格式
 - ✅ 数据驱动 + 单一数据源（无硬编码）
 - ✅ 多数据库适配层（SQLite/MySQL/D1/Memory）
@@ -390,11 +415,6 @@ xianyu-admin/
 
 ## 📜 License
 
-[MIT](./LICENSE) © Kentpan
+[GNU AGPL v3.0](./LICENSE) © Kentpan
 
-## 🙏 致谢
-
-- 原项目：[xianyu-super-butler](https://github.com/Mxucc/xianyu-super-butler) by [@Mxucc](https://github.com/Mxucc)
-- 基于 [xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 二次开发
-
-⭐ **如果对你有帮助，欢迎 Star 支持！**
+本仓库采用 GNU Affero General Public License v3.0 开源。若您通过网络提供服务, 必须公开修改后的源代码。

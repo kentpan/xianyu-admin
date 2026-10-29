@@ -1,6 +1,6 @@
 <template>
   <div class="space-y-5 animate-fade-in">
-    <PageHeader title="系统设置" description="通用 / AI / SMTP / 商品同步 等全局配置">
+    <PageHeader title="系统设置" description="通用 / SMTP / 商品同步 等全局配置">
       <template #actions>
         <button class="btn-secondary" @click="exportConfig" :disabled="exporting">
           <Icon v-if="exporting" name="refresh" class="animate-spin" />
@@ -52,42 +52,47 @@
           <SettingRow label="登录验证码" desc="开启后登录需输入图形验证码">
             <Toggle v-model="form.login_captcha_enabled" />
           </SettingRow>
-        </div>
-
-        <!-- AI -->
-        <div v-if="activeTab === 'ai'" class="space-y-4">
-          <h3 class="font-semibold text-slate-900 dark:text-white">AI 回复</h3>
-          <SettingRow label="默认 AI 模型" desc="如 qwen-plus / gpt-4o-mini / glm-4">
-            <input v-model="form.ai_model" class="input" placeholder="qwen-plus" />
-          </SettingRow>
-          <SettingRow label="AI API 地址" desc="OpenAI 兼容 API 端点">
-            <input v-model="form.ai_api_url" class="input" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
-          </SettingRow>
-          <SettingRow label="默认回复内容" desc="AI 不可用时的兜底回复">
+          <SettingRow label="全局默认回复内容" desc="无关键词/AI 命中时的兜底回复 (AI 模型接入请在管理员「AI配置」页维护)">
             <textarea v-model="form.default_reply" rows="3" class="input" />
           </SettingRow>
         </div>
 
-        <!-- SMTP -->
+        <!-- 邮件服务 -->
         <div v-if="activeTab === 'smtp'" class="space-y-4">
-          <h3 class="font-semibold text-slate-900 dark:text-white">SMTP 邮件</h3>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <SettingRow label="SMTP 服务器">
-              <input v-model="form.smtp_server" class="input" placeholder="smtp.qq.com" />
+          <h3 class="font-semibold text-slate-900 dark:text-white">邮件服务</h3>
+          <SettingRow label="邮件服务商" desc="统一发信出口按此分流：SMTP 或 Resend">
+            <select v-model="form.mail_provider" class="input">
+              <option value="smtp">SMTP 邮件服务器</option>
+              <option value="resend">Resend 邮件服务</option>
+            </select>
+          </SettingRow>
+          <template v-if="form.mail_provider === 'smtp'">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <SettingRow label="SMTP 服务器">
+                <input v-model="form.smtp_server" class="input" placeholder="smtp.qq.com" />
+              </SettingRow>
+              <SettingRow label="端口">
+                <input v-model.number="form.smtp_port" class="input" placeholder="587" />
+              </SettingRow>
+            </div>
+            <SettingRow label="用户名">
+              <input v-model="form.smtp_user" class="input" />
             </SettingRow>
-            <SettingRow label="端口">
-              <input v-model.number="form.smtp_port" class="input" placeholder="587" />
+            <SettingRow label="密码">
+              <input v-model="form.smtp_password" type="password" class="input" />
             </SettingRow>
-          </div>
-          <SettingRow label="用户名">
-            <input v-model="form.smtp_user" class="input" />
-          </SettingRow>
-          <SettingRow label="密码">
-            <input v-model="form.smtp_password" type="password" class="input" />
-          </SettingRow>
-          <SettingRow label="发件人地址">
-            <input v-model="form.smtp_from" class="input" placeholder="noreply@example.com" />
-          </SettingRow>
+            <SettingRow label="发件人地址">
+              <input v-model="form.smtp_from" class="input" placeholder="noreply@example.com" />
+            </SettingRow>
+          </template>
+          <template v-else>
+            <SettingRow label="Resend API Key" desc="在 resend.com/api-keys 创建，需包含发送权限">
+              <input v-model="form.resend_api_key" type="password" class="input" placeholder="re_..." />
+            </SettingRow>
+            <SettingRow label="发件人地址" desc="必须是已在 Resend 验证域名下的地址">
+              <input v-model="form.resend_from" class="input" placeholder="noreply@yourdomain.com" />
+            </SettingRow>
+          </template>
         </div>
 
         <!-- Item sync -->
@@ -120,7 +125,7 @@
       <div class="space-y-3">
         <p class="text-sm text-slate-500">粘贴之前导出的配置 JSON，或上传 .json 文件。导入会覆盖同名配置项。</p>
         <input ref="fileInput" type="file" accept=".json" class="input" @change="onFileChange" />
-        <textarea v-model="importText" rows="10" class="input font-mono text-xs" placeholder='{ "settings": { "ai_model": { "value": "qwen-plus", "description": "默认AI模型" } } }' />
+        <textarea v-model="importText" rows="10" class="input font-mono text-xs" placeholder='{ "settings": { "app_name": { "value": "闲鱼超级管家", "description": "应用名称" } } }' />
       </div>
       <template #footer>
         <button class="btn-secondary" @click="importOpen = false">取消</button>
@@ -174,13 +179,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAllSettings, exportSettings, importSettings, updateSetting } from '~/api/settings'
 import { useThemeColor } from '~/composables/useThemeColor'
 import { defineComponent, h } from 'vue'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
 
 // Theme color
@@ -188,8 +192,7 @@ const { current: currentTheme, themes, apply: applyTheme } = useThemeColor()
 
 const TABS = [
   { key: 'general', label: '通用', icon: 'settings' },
-  { key: 'ai', label: 'AI 回复', icon: 'message' },
-  { key: 'smtp', label: 'SMTP 邮件', icon: 'bell' },
+  { key: 'smtp', label: '邮件服务', icon: 'bell' },
   { key: 'item_sync', label: '商品同步', icon: 'refresh' },
 ] as const
 
@@ -209,7 +212,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 async function exportConfig() {
   exporting.value = true
   try {
-    const r = await api.get<{ settings: Record<string, any>; exportedAt: string; version: string }>('/api/settings/export')
+    const r = await exportSettings()
     const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -237,7 +240,7 @@ async function doImport() {
   try {
     const parsed = JSON.parse(importText.value)
     const settings = parsed.settings || parsed
-    const r = await api.post<{ imported: number; skipped: number }>('/api/settings/import', { settings })
+    const r = await importSettings(settings)
     toast.success(r.imported ? `已导入 ${r.imported} 项配置` : '未导入任何配置')
     importOpen.value = false
     importText.value = ''
@@ -251,9 +254,9 @@ async function doImport() {
 }
 
 const FIELDS = [
-  'app_name', 'registration_enabled', 'show_default_login_info', 'login_captcha_enabled',
-  'ai_model', 'ai_api_url', 'default_reply',
-  'smtp_server', 'smtp_port', 'smtp_user', 'smtp_password', 'smtp_from',
+  'app_name', 'registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'default_reply',
+  'mail_provider', 'smtp_server', 'smtp_port', 'smtp_user', 'smtp_password', 'smtp_from',
+  'resend_api_key', 'resend_from',
   'item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages',
 ] as const
 
@@ -262,14 +265,15 @@ const form = reactive<Record<string, any>>({
   registration_enabled: false,
   show_default_login_info: false,
   login_captcha_enabled: false,
-  ai_model: 'qwen-plus',
-  ai_api_url: '',
   default_reply: '',
+  mail_provider: 'smtp',
   smtp_server: '',
   smtp_port: 587,
   smtp_user: '',
   smtp_password: '',
   smtp_from: '',
+  resend_api_key: '',
+  resend_from: '',
   item_sync_enabled: true,
   item_sync_interval: 600,
   item_sync_max_pages: 5,
@@ -280,8 +284,10 @@ let snapshot: Record<string, any> = {}
 async function reload() {
   loading.value = true
   try {
-    const r = await api.get<{ settings: Record<string, any> }>('/api/settings/public')
-    const s = r.settings || {}
+    // 管理页走鉴权端点读取全部设置 (含密钥字段)；公共端点已收敛为仅非敏感键
+    const rows = await getAllSettings()
+    const s: Record<string, any> = {}
+    for (const r of rows || []) s[r.key_name] = r.value
     for (const k of FIELDS) {
       if (s[k] !== undefined) form[k] = s[k]
     }
@@ -289,6 +295,10 @@ async function reload() {
     form.smtp_port = Number(form.smtp_port) || 587
     form.item_sync_interval = Number(form.item_sync_interval) || 600
     form.item_sync_max_pages = Number(form.item_sync_max_pages) || 5
+    for (const bk of ['registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled']) {
+      form[bk] = form[bk] === true || form[bk] === 'true'
+    }
+    if (form.mail_provider !== 'resend') form.mail_provider = 'smtp'
     snapshot = { ...form }
     loaded.value = true
   } catch (e: any) {
@@ -327,7 +337,7 @@ async function save() {
   saving.value = true
   try {
     for (const c of changes) {
-      await api.put(`/api/settings/${encodeURIComponent(c.key)}`, { value: c.value })
+      await updateSetting(c.key, c.value)
     }
     snapshot = { ...form }
     toast.success(`已保存 ${changes.length} 项设置`)

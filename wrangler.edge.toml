@@ -1,0 +1,47 @@
+# wrangler.edge.toml — xianyu-admin 边缘部署参考配置 (Cloudflare Workers + Durable Objects)
+#
+# ⚠ 与根目录 wrangler.toml(Pages CI 参考)二选一:
+#   · 本文件 = Workers 部署形态, 带 $DurableObject 绑定 → 实时推送走 WebSocket (DO hub)
+#   · wrangler.toml = Pages 部署形态 (GitHub Actions CI 自动重建), 无 DO → 实时推送走 SSE
+#
+# 构建与部署(Workers + 静态资产, 由 nitro cloudflare-durable 预设产出):
+#   NITRO_PRESET=cloudflare-durable npx nuxt build
+#   npx wrangler deploy -c wrangler.edge.toml
+#
+# DO 类/绑定名是 nitro cloudflare-durable 预设的硬约定, 不可改名:
+#   worker 入口自动导出 $DurableObject 类, binding name 必须同为 "$DurableObject",
+#   WebSocket 升级请求被转发到 idFromName("server") 的单一实例广播。
+#
+# 首次部署前: npx wrangler d1 create xianyu-admin → 把返回的 database_id 填到下面。
+
+name = "xianyu-admin"
+main = ".output/server/index.mjs"
+compatibility_date = "2026-08-01" # ≥2025-04-01: workerd 开放 node:sqlite(数据层依赖)
+compatibility_flags = ["nodejs_compat"]
+
+# 静态资产(nitro cloudflare-module 系预设产物: .output/public/)
+[assets]
+binding = "ASSETS"
+directory = ".output/public"
+
+# ==== Durable Objects(实时推送 hub; 首次部署自动应用 migrations) ====
+[[durable_objects.bindings]]
+name = "$DurableObject"
+class_name = "$DurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["$DurableObject"]
+
+# ==== D1 绑定(运行时数据层, server/utils/db.ts 自动检测) ====
+[[d1_databases]]
+binding = "DB"
+database_name = "xianyu-admin"
+database_id = "<由 wrangler d1 create 返回>"
+
+[vars]
+NODE_ENV = "production"
+# XY_INSTALLED / XY_ADMIN_SECRET / XY_JWT_SECRET 建议用 `npx wrangler secret put` 注入:
+#   npx wrangler secret put XY_ADMIN_SECRET -c wrangler.edge.toml
+#   npx wrangler secret put XY_JWT_SECRET -c wrangler.edge.toml
+#   npx wrangler secret put XY_INSTALLED -c wrangler.edge.toml   # 值: true

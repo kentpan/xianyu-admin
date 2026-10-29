@@ -2,7 +2,7 @@
   <div class="w-full">
     <div class="text-center mb-6">
       <div class="w-14 h-14 mx-auto rounded-2xl bg-brand-500 flex items-center justify-center shadow-lg shadow-brand-500/30">
-        <Icon name="message" class="text-white text-2xl" />
+        <Icon name="fish" class="text-white text-2xl" />
       </div>
       <h1 class="mt-4 text-xl font-bold text-slate-900 dark:text-white">欢迎回来</h1>
       <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">登录闲鱼超级管家管理后台</p>
@@ -52,6 +52,7 @@
 <script setup lang="ts">
 import { useAuth } from '~/composables/useAuth'
 import { useToast } from '~/composables/useToast'
+import { getPublicSettings } from '~/api/settings'
 
 definePageMeta({ layout: 'auth' })
 
@@ -68,8 +69,7 @@ const loading = ref(false)
 const registrationEnabled = ref(false)
 onMounted(async () => {
   try {
-    const api = useApi()
-    const data = await api.get<{ settings: Record<string, any> }>('/api/settings/public')
+    const data = await getPublicSettings()
     registrationEnabled.value = !!data?.settings?.registration_enabled
   } catch {}
 })

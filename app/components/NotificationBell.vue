@@ -65,22 +65,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getNotifications, markAllNotificationsRead, markNotificationRead, seedNotifications } from '~/api/notifications'
+import type { NotifItem } from '~/api/notifications'
 import { useToast } from '~/composables/useToast'
 
-const api = useApi()
 const toast = useToast()
 const router = useRouter()
-
-interface NotifItem {
-  id: number
-  type: string
-  title: string
-  message: string
-  read: number
-  link: string | null
-  created_at: string
-}
 
 const open = ref(false)
 const items = ref<NotifItem[]>([])
@@ -90,7 +80,7 @@ const loading = ref(false)
 async function load() {
   loading.value = true
   try {
-    const data = await api.get<{ items: NotifItem[]; unread: number }>('/api/notifications/center')
+    const data = await getNotifications()
     items.value = data.items || []
     unread.value = data.unread || 0
   } catch {
@@ -102,7 +92,7 @@ async function load() {
 
 async function markAllRead() {
   try {
-    await api.post('/api/notifications/center/read', { all: true })
+    await markAllNotificationsRead()
     items.value = items.value.map((i) => ({ ...i, read: 1 }))
     unread.value = 0
     toast.success('已全部标记为已读')
@@ -113,7 +103,7 @@ async function markAllRead() {
 
 async function seed() {
   try {
-    await api.post('/api/notifications/center/seed')
+    await seedNotifications()
     toast.success('已生成演示通知')
     await load()
   } catch (e: any) {
@@ -123,7 +113,7 @@ async function seed() {
 
 function handleClick(n: NotifItem) {
   if (!n.read) {
-    api.post('/api/notifications/center/read', { id: n.id }).catch(() => {})
+    markNotificationRead(n.id).catch(() => {})
     n.read = 1
     unread.value = Math.max(0, unread.value - 1)
   }

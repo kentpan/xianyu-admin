@@ -1,0 +1,34 @@
+# edge-realtime/wrangler.toml — xianyu-admin 配套实时 Worker(独立部署的 DO hub)
+#
+# ⚠ 本文件可手动编辑直接部署; GitHub Actions CI(.github/workflows/pages-deploy.yml)
+#   会按 deploy.config.js 的 realtime 块重新生成本文件再部署, 直接修改不影响 CI。
+#
+# 架构: Pages 项目不能在自身内承载 DO 类(平台限制), 本 Worker 独立部署 DO hub;
+#   站点(Pages/Workers 形态)经 REALTIME_DO 绑定(script_name 指向本 Worker)直呼本 DO
+#   —— WS 升级转发 + 事件广播全走绑定, 浏览器始终只连站点域名(同源, 无跨域)。
+#
+# 手动部署:
+#   npx wrangler deploy -c edge-realtime/wrangler.toml
+#   printf '%s' "$JWT_SECRET" | npx wrangler secret put XY_JWT_SECRET -c edge-realtime/wrangler.toml
+#
+# 站点侧配套( Pages 形态 wrangler.toml):
+#   [[durable_objects.bindings]]
+#   name = "REALTIME_DO"
+#   class_name = "EdgeRealtimeDO"
+#   script_name = "xianyu-admin-realtime"   # = 本文件 name
+
+name = "xianyu-admin-realtime"
+main = "index.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+account_id = "<由 wrangler 自动探测, 或填入账号 ID>"
+
+# 自引用绑定: Worker 通过它访问自己导出的 DO 类
+[[durable_objects.bindings]]
+name = "REALTIME_HUB"
+class_name = "EdgeRealtimeDO"
+
+# 免费计划要求 DO 类使用 SQLite 存储(new_sqlite_classes); 首次部署自动应用
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EdgeRealtimeDO"]

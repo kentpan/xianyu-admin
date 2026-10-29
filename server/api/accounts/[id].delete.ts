@@ -1,12 +1,15 @@
 /** DELETE /api/accounts/:id — delete cookie and cascade-clean related rows. */
 export default defineEventHandler(
   withApi(async (event) => {
-    requireUser(event)
+    const payload = requireUser(event)
     const id = getRouterParam(event, 'id') || ''
     const db = await getDb()
 
-    const existing = await db.get('SELECT id FROM cookies WHERE id = ?', [id])
+    const existing = await db.get('SELECT id, user_id FROM cookies WHERE id = ?', [id])
     if (!existing) throw new ApiError(404, '账号不存在')
+    if (!payload.isAdmin && existing.user_id !== payload.userId) {
+      throw new ApiError(403, '无权操作此账号')
+    }
 
     await db.transaction(async () => {
       await db.run('DELETE FROM cookie_status WHERE cookie_id = ?', [id])

@@ -85,18 +85,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAuditLogs } from '~/api/audit'
+import type { AuditLog } from '~/api/audit'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface AuditLog {
-  id: number; user_id: number | null; username: string | null; action: string
-  module: string | null; target_type: string | null; target_id: string | null
-  description: string | null; ip_address: string | null; created_at: string
-}
 
 const loading = ref(false)
 const logs = ref<AuditLog[]>([])
@@ -112,12 +106,13 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.v
 async function reload() {
   loading.value = true
   try {
-    const params: any = { page: page.value, pageSize: pageSize.value }
-    if (filters.action) params.action = filters.action
-    if (filters.module) params.module = filters.module
-    if (filters.keyword.trim()) params.keyword = filters.keyword.trim()
-    const qs = new URLSearchParams(params).toString()
-    const r = await api.get<{ data: AuditLog[]; total: number; actions: string[]; modules: string[] }>(`/api/audit/logs?${qs}`)
+    const r = await getAuditLogs({
+      page: page.value,
+      pageSize: pageSize.value,
+      action: filters.action || undefined,
+      module: filters.module || undefined,
+      keyword: filters.keyword.trim() || undefined,
+    })
     logs.value = r.data || []
     total.value = r.total || 0
     actions.value = r.actions || []

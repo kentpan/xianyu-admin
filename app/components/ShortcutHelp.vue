@@ -1,8 +1,8 @@
 <template>
   <Teleport to="body">
     <Transition name="modal">
-      <div v-if="open" class="fixed inset-0 z-[98] flex items-center justify-center p-4" @click.self="close">
-        <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm" />
+      <div v-if="open" class="fixed inset-0 z-[98] flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm" @click="close" />
         <div class="modal-panel relative w-full max-w-lg bg-white dark:bg-slate-800 rounded-xl shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden">
           <!-- Header -->
           <div class="flex items-center justify-between px-5 py-4 border-b border-slate-100 dark:border-slate-700">

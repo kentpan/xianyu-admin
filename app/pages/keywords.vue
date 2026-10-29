@@ -1,6 +1,6 @@
 <template>
   <div class="space-y-5 animate-fade-in">
-    <PageHeader title="自动回复" description="管理账号的关键词自动回复规则">
+    <PageHeader title="自动回复" description="关键词自动回复规则：买家消息命中关键词时触发；优先级高于 AI 回复与默认回复">
       <template #actions>
         <button class="btn-secondary" @click="reload" :disabled="!currentCookieId">
           <Icon name="refresh" :class="loading ? 'animate-spin' : ''" /> 刷新
@@ -10,6 +10,9 @@
         </button>
         <button class="btn-secondary" :disabled="!currentCookieId" @click="exportKeywords">
           <Icon name="download" /> 导出
+        </button>
+        <button class="btn-secondary" :disabled="!currentCookieId" @click="openAiSettings">
+          <Icon name="sparkles" /> AI 配置
         </button>
         <button class="btn-primary" :disabled="!currentCookieId" @click="openCreate">
           <Icon name="plus" /> 新增关键词
@@ -165,6 +168,7 @@
         <div v-if="form.type === 'text'">
           <label class="label">回复内容 <span class="text-red-500">*</span></label>
           <textarea v-model="form.reply" rows="4" class="input" placeholder="自动回复的文本内容"></textarea>
+          <p class="text-xs text-slate-400 mt-1">可用变量: {send_user_name} 买家昵称、{send_user_id} 买家ID、{send_message} 消息内容</p>
         </div>
         <div v-else>
           <label class="label">图片 URL <span class="text-red-500">*</span></label>
@@ -174,14 +178,77 @@
           <textarea v-model="form.reply" rows="2" class="input" placeholder="图片说明文字"></textarea>
         </div>
         <div>
-          <label class="label">关联商品 ID (可选)</label>
-          <input v-model="form.item_id" class="input" placeholder="留空表示对所有商品生效" />
+          <label class="label">关联商品 (可选)</label>
+          <select v-model="form.item_id" class="input">
+            <option value="">通用 (对所有商品生效)</option>
+            <option v-for="i in itemsForAccount" :key="i.item_id" :value="i.item_id">
+              {{ i.item_id }} · {{ i.item_title || '无标题' }}
+            </option>
+          </select>
+          <p class="text-xs text-slate-400 mt-1">从商品管理列表选择; 留空表示对所有商品生效</p>
         </div>
       </div>
       <template #footer>
         <button class="btn-secondary" @click="modalOpen = false">取消</button>
         <button class="btn-primary" :disabled="saving" @click="save">
           <Icon name="save" v-if="!saving" />
+          <Icon name="refresh" v-else class="animate-spin" />
+          保存
+        </button>
+      </template>
+    </ModalBase>
+
+    <!-- AI settings modal -->
+    <ModalBase v-model="aiModalOpen" title="AI 智能回复配置" size="md">
+      <div v-if="aiForm" class="space-y-4">
+        <div class="rounded-lg bg-brand-50 dark:bg-brand-900/20 p-3 text-xs text-brand-700 dark:text-brand-300">
+          为当前账号接入大模型, 买家咨询时由 AI 自动回复与智能议价 (需消息监听引擎同步该配置后生效)。引擎实际优先级: API 回复 > 关键词回复 > AI 回复 > 指定商品回复 > 默认回复 —— 仅当关键词未命中时 AI 才接管。
+        </div>
+        <label class="flex items-start gap-2 cursor-pointer">
+          <input v-model="aiForm.ai_enabled" type="checkbox" class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500" />
+          <span class="text-sm text-slate-700 dark:text-slate-200">
+            启用 AI 智能回复
+            <span class="block text-xs text-slate-400 mt-0.5">关闭后该账号仅使用关键词/默认回复</span>
+          </span>
+        </label>
+        <div>
+          <label class="label">AI 接入配置</label>
+          <AiConfigSelect v-model="aiForm.ai_config_id" placeholder="请选择 AI 配置 (在「AI配置」页管理)" />
+          <p class="mt-1 text-slate-400">模型 / API Key / 地址统一在管理员「AI配置」页维护, 此处直接引用; 配置一处修改全局生效</p>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label class="label">最大折扣 (%)</label>
+            <input v-model.number="aiForm.max_discount_percent" type="number" min="0" max="100" class="input" />
+          </div>
+          <div>
+            <label class="label">最大优惠 (元)</label>
+            <input v-model.number="aiForm.max_discount_amount" type="number" min="0" class="input" />
+          </div>
+          <div>
+            <label class="label">最大议价轮次</label>
+            <input v-model.number="aiForm.max_bargain_rounds" type="number" min="0" class="input" />
+          </div>
+        </div>
+        <div>
+          <label class="label">自定义提示词 (可选)</label>
+          <textarea v-model="aiForm.custom_prompts" rows="4" class="input" placeholder="补充给 AI 的商品说明 / 回复风格 / 禁语等"></textarea>
+        </div>
+        <div class="pt-2 border-t border-slate-100 dark:border-slate-700">
+          <label class="label">连通性测试</label>
+          <div class="flex gap-2">
+            <input v-model="aiTestMessage" class="input" placeholder="模拟买家消息, 例如: 能便宜点吗" />
+            <button class="btn-secondary shrink-0" :disabled="aiTesting" @click="runAiTest">
+              <Icon name="sparkles" /> {{ aiTesting ? '测试中...' : '发送测试' }}
+            </button>
+          </div>
+          <p v-if="aiTestReply" class="mt-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 p-3 text-sm text-emerald-700 dark:text-emerald-300 whitespace-pre-wrap">AI 回复: {{ aiTestReply }}</p>
+        </div>
+      </div>
+      <template #footer>
+        <button class="btn-secondary" @click="aiModalOpen = false">取消</button>
+        <button class="btn-primary" :disabled="aiSaving" @click="saveAiSettings">
+          <Icon name="save" v-if="!aiSaving" />
           <Icon name="refresh" v-else class="animate-spin" />
           保存
         </button>
@@ -278,33 +345,137 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getKeywords, createKeyword, updateKeyword, deleteKeyword, testKeywordMatch, importKeywords, exportKeywords as exportKeywordsApi } from '~/api/keywords'
+import type { Keyword } from '~/api/keywords'
+import { getAccounts } from '~/api/accounts'
+import type { AccountLite } from '~/api/accounts'
+import { getItems } from '~/api/items'
+import type { Item } from '~/api/items'
+import { getAiSettings, saveAiSettings as saveAiSettingsApi, testAiSettings } from '~/api/ai-settings'
+import type { AiReplySettings } from '~/api/ai-settings'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface Keyword {
-  id: number
-  cookie_id: string
-  keyword: string
-  reply: string
-  item_id: string
-  type: string
-  image_url: string | null
-  created_at: string
-  item_title?: string | null
-}
-
-interface AccountLite { id: string; remark: string }
 
 const loading = ref(false)
 const saving = ref(false)
 const importing = ref(false)
 const keywords = ref<Keyword[]>([])
 const accounts = ref<AccountLite[]>([])
+const items = ref<Item[]>([])
 const currentCookieId = ref('')
+
+/** 弹窗内关联商品下拉数据源 (当前账号下的商品, 显示商品 ID + 标题) */
+const itemsForAccount = computed(() =>
+  items.value.filter((i) => i.cookie_id === currentCookieId.value),
+)
+
+async function loadItems() {
+  try {
+    items.value = await getItems()
+  } catch {
+    items.value = []
+  }
+}
+
+// ===== AI 智能回复配置 =====
+const aiModalOpen = ref(false)
+const aiSaving = ref(false)
+const aiForm = ref<AiReplySettings | null>(null)
+
+function openAiSettings() {
+  if (!currentCookieId.value) return
+  aiForm.value = {
+    cookie_id: currentCookieId.value,
+    ai_enabled: 0,
+    ai_config_id: 0,
+    model_name: 'qwen-plus',
+    api_key: '',
+    api_key_masked: false,
+    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    max_discount_percent: 10,
+    max_discount_amount: 100,
+    max_bargain_rounds: 3,
+    custom_prompts: '',
+  }
+  aiModalOpen.value = true
+  getAiSettings(currentCookieId.value)
+    .then((r) => {
+      if (aiModalOpen.value) aiForm.value = { ...r, ai_enabled: Number(r.ai_enabled) ? 1 : 0, ai_config_id: Number(r.ai_config_id) || 0 }
+    })
+    .catch((e: any) => toast.error(e.message || 'AI 配置加载失败'))
+}
+
+async function saveAiSettings() {
+  if (!currentCookieId.value || !aiForm.value) return
+  const f = aiForm.value
+  if (f.ai_enabled && !Number(f.ai_config_id)) {
+    toast.error('开启 AI 回复前请选择 AI 配置 (可先到管理员「AI配置」页新建)')
+    return
+  }
+  aiSaving.value = true
+  try {
+    await saveAiSettingsApi(currentCookieId.value, {
+      ai_enabled: !!Number(f.ai_enabled),
+      ai_config_id: Number(f.ai_config_id) || 0,
+      model_name: f.model_name || 'qwen-plus',
+      api_key: f.api_key || '',
+      base_url: f.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      max_discount_percent: Number(f.max_discount_percent) || 0,
+      max_discount_amount: Number(f.max_discount_amount) || 0,
+      max_bargain_rounds: Number(f.max_bargain_rounds) || 0,
+      custom_prompts: f.custom_prompts || '',
+    })
+    toast.success('AI 配置已保存')
+    aiModalOpen.value = false
+  } catch (e: any) {
+    toast.error(e.message || 'AI 配置保存失败')
+  } finally {
+    aiSaving.value = false
+  }
+}
+
+// ===== AI 连通性测试 (先落当前表单再测试, 保证测试反映用户所见配置) =====
+const aiTestMessage = ref('')
+const aiTesting = ref(false)
+const aiTestReply = ref('')
+
+async function runAiTest() {
+  if (!currentCookieId.value || !aiForm.value) return
+  if (!aiTestMessage.value.trim()) {
+    toast.error('请输入模拟买家消息')
+    return
+  }
+  aiTesting.value = true
+  aiTestReply.value = ''
+  try {
+    const f = aiForm.value
+    // 先保存当前表单 (不关弹窗), 测试端点读取的是已保存配置
+    await saveAiSettingsApi(currentCookieId.value, {
+      ai_enabled: !!Number(f.ai_enabled),
+      ai_config_id: Number(f.ai_config_id) || 0,
+      model_name: f.model_name || 'qwen-plus',
+      api_key: f.api_key || '',
+      base_url: f.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      max_discount_percent: Number(f.max_discount_percent) || 0,
+      max_discount_amount: Number(f.max_discount_amount) || 0,
+      max_bargain_rounds: Number(f.max_bargain_rounds) || 0,
+      custom_prompts: f.custom_prompts || '',
+    })
+    const r = await testAiSettings({
+      cookie_id: currentCookieId.value,
+      message: aiTestMessage.value.trim(),
+    })
+    aiTestReply.value = r.reply || '(空回复)'
+    toast.success('AI 测试成功')
+  } catch (e: any) {
+    aiTestReply.value = ''
+    toast.error(e.message || 'AI 测试失败')
+  } finally {
+    aiTesting.value = false
+  }
+}
 
 // Keyword match tester
 const testMessage = ref('')
@@ -314,10 +485,7 @@ async function runTest() {
   if (!currentCookieId.value || !testMessage.value.trim()) return
   testing.value = true
   try {
-    const r = await api.post<{ matched: any[]; total: number; hasDefaultReply: boolean; defaultReply: string }>(
-      '/api/keywords/test',
-      { cookie_id: currentCookieId.value, message: testMessage.value },
-    )
+    const r = await testKeywordMatch({ cookie_id: currentCookieId.value, message: testMessage.value })
     testResult.value = r
   } catch (e: any) {
     toast.error(e.message || '测试失败')
@@ -464,7 +632,7 @@ const form = ref<any>({
 
 async function loadAccounts() {
   try {
-    accounts.value = await api.get<AccountLite[]>('/api/accounts')
+    accounts.value = await getAccounts()
   } catch (e: any) {
     toast.error(e.message || '加载账号失败')
   }
@@ -474,7 +642,7 @@ async function reload() {
   if (!currentCookieId.value) return
   loading.value = true
   try {
-    keywords.value = await api.get<Keyword[]>(`/api/keywords/${encodeURIComponent(currentCookieId.value)}`)
+    keywords.value = await getKeywords(currentCookieId.value)
   } catch (e: any) {
     toast.error(e.message || '加载关键词失败')
   } finally {
@@ -522,10 +690,10 @@ async function save() {
       image_url: form.value.image_url,
     }
     if (editing.value) {
-      await api.put(`/api/keywords/${encodeURIComponent(currentCookieId.value)}/${form.value.id}`, payload)
+      await updateKeyword(currentCookieId.value, form.value.id, payload)
       toast.success('关键词已更新')
     } else {
-      await api.post(`/api/keywords/${encodeURIComponent(currentCookieId.value)}`, payload)
+      await createKeyword(currentCookieId.value, payload)
       toast.success('关键词已添加')
     }
     modalOpen.value = false
@@ -540,7 +708,7 @@ async function save() {
 async function deleteOne(k: Keyword) {
   if (!confirm(`确认删除关键词「${k.keyword}」？`)) return
   try {
-    await api.del(`/api/keywords/${encodeURIComponent(currentCookieId.value)}/${k.id}`)
+    await deleteKeyword(currentCookieId.value, k.id)
     toast.success('关键词已删除')
     reload()
   } catch (e: any) {
@@ -560,7 +728,7 @@ function openImport() {
 async function doImport() {
   importing.value = true
   try {
-    const r = await api.post<{ inserted: number }>(`/api/keywords-import/${encodeURIComponent(currentCookieId.value)}`, { keywords: importPreview.value })
+    const r = await importKeywords(currentCookieId.value, importPreview.value)
     toast.success(`已导入 ${r.inserted} 条关键词`)
     closeImport()
     reload()
@@ -573,7 +741,7 @@ async function doImport() {
 
 async function exportKeywords() {
   try {
-    const r = await api.get<{ keywords: Keyword[]; count: number }>(`/api/keywords-export/${encodeURIComponent(currentCookieId.value)}`)
+    const r = await exportKeywordsApi(currentCookieId.value)
     const blob = new Blob([JSON.stringify(r.keywords, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -597,6 +765,7 @@ function formatTime(t?: string) {
 const route = useRoute()
 onMounted(async () => {
   await loadAccounts()
+  loadItems()
   const cid = (route.query.cookie_id as string) || ''
   if (cid && accounts.value.some((a) => a.id === cid)) {
     currentCookieId.value = cid

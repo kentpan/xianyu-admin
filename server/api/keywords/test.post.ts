@@ -3,7 +3,7 @@
  * Body: { cookie_id, message }
  * Returns matched keywords with their reply text.
  *
- * Matching rules (mirrors the source xianyu-super-butler logic):
+ * Matching rules:
  *  - Exact match: message === keyword
  *  - Contains match: message includes keyword (case-insensitive)
  *  - If keyword starts with '*', treat as suffix match (message ends with keyword[1:])

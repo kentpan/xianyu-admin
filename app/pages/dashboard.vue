@@ -275,25 +275,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getDashboardStats, getDashboardTrend, getDashboardHealth, getDashboardOnline, getDashboardComparison, getDashboardActivity, getDashboardReportUrl } from '~/api/dashboard'
+import type { DashboardStats, TrendDay, ActivityItem, OnlineAccount } from '~/api/dashboard'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const loading = ref(false)
-
-interface DashboardStats {
-  totalAccounts: number
-  activeAccounts: number
-  totalKeywords: number
-  totalOrders: number
-  totalItems: number
-  totalCards: number
-  totalChannels: number
-  orderStatusDist: Record<string, number>
-  recentOrders: any[]
-  recentLogs: any[]
-}
 
 const stats = ref<DashboardStats>({
   totalAccounts: 0, activeAccounts: 0, totalKeywords: 0, totalOrders: 0,
@@ -301,21 +288,13 @@ const stats = ref<DashboardStats>({
   orderStatusDist: {}, recentOrders: [], recentLogs: [],
 })
 
-interface TrendDay { date: string; label: string; count: number; revenue: number }
 const trend = ref<{ days: TrendDay[]; totalOrders: number; totalRevenue: number }>({
   days: [], totalOrders: 0, totalRevenue: 0,
 })
 
-interface ActivityItem {
-  id: string; type: string; icon: string; color: string; title: string; desc: string; time: string; ts: number
-}
 const activities = ref<ActivityItem[]>([])
 const activityLoading = ref(false)
 
-interface OnlineAccount {
-  id: string; remark: string; enabled: boolean; autoConfirm: boolean
-  keywordCount: number; orderCount: number; lastOrderAt: string | null; ageHours: number; isOnline: boolean
-}
 const onlineStatus = ref<{ items: OnlineAccount[]; summary: { total: number; online: number; offline: number; disabled: number } }>({
   items: [],
   summary: { total: 0, online: 0, offline: 0, disabled: 0 },
@@ -323,7 +302,7 @@ const onlineStatus = ref<{ items: OnlineAccount[]; summary: { total: number; onl
 
 async function loadOnlineStatus() {
   try {
-    const data = await api.get<{ items: OnlineAccount[]; summary: { total: number; online: number; offline: number; disabled: number } }>('/api/dashboard/online')
+    const data = await getDashboardOnline()
     onlineStatus.value = data
   } catch {
     // silent
@@ -337,7 +316,7 @@ const health = ref<any>({
 })
 async function loadHealth() {
   try {
-    health.value = await api.get<any>('/api/dashboard/health')
+    health.value = await getDashboardHealth()
   } catch {
     // silent
   }
@@ -360,7 +339,7 @@ async function exportTrendChart() {
 const comparisonData = ref<any>(null)
 async function loadComparison() {
   try {
-    comparisonData.value = await api.get<any>('/api/dashboard/comparison')
+    comparisonData.value = await getDashboardComparison()
   } catch {
     // silent
   }
@@ -368,8 +347,7 @@ async function loadComparison() {
 
 // PDF report
 function openReport() {
-  const basePath = useRuntimeConfig().public.basePath || ''
-  window.open(`${basePath}/api/dashboard/report`, '_blank')
+  window.open(getDashboardReportUrl(), '_blank')
 }
 
 // Donut chart export
@@ -387,7 +365,7 @@ async function exportDonutChart() {
 async function loadActivity() {
   activityLoading.value = true
   try {
-    const data = await api.get<{ activities: ActivityItem[] }>('/api/dashboard/activity')
+    const data = await getDashboardActivity()
     activities.value = data.activities || []
   } catch {
     // silent
@@ -445,8 +423,8 @@ async function reload() {
   loading.value = true
   try {
     const [data, trendData] = await Promise.all([
-      api.get<DashboardStats>('/api/dashboard/stats'),
-      api.get<{ days: TrendDay[]; totalOrders: number; totalRevenue: number }>('/api/dashboard/trend'),
+      getDashboardStats(),
+      getDashboardTrend(),
     ])
     stats.value = data
     trend.value = trendData

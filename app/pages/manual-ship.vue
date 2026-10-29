@@ -111,28 +111,13 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getOrder, manualShip as manualShipApi } from '~/api/orders'
+import type { Order } from '~/api/orders'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
 
-interface Order {
-  order_id: string
-  item_id: string | null
-  buyer_id: string | null
-  spec_name: string | null
-  spec_value: string | null
-  quantity: string | null
-  amount: string | null
-  order_status: string
-  receiver_name: string
-  receiver_phone: string
-  receiver_address: string
-  receiver_city: string
-  item_title?: string | null
-}
 
 const orderId = ref('')
 const order = ref<Order | null>(null)
@@ -149,7 +134,7 @@ async function search() {
   searching.value = true
   searched.value = true
   try {
-    order.value = await api.get<Order>(`/api/orders/${encodeURIComponent(id)}`)
+    order.value = await getOrder(id)
   } catch (e: any) {
     order.value = null
     if (e.code !== 404) toast.error(e.message || '查询失败')
@@ -162,7 +147,7 @@ async function ship(mode: 'status_only' | 'full') {
   if (!order.value) return
   shipping.value = true
   try {
-    await api.post('/api/orders/manual-ship', { order_id: order.value.order_id, mode })
+    await manualShipApi({ order_id: order.value.order_id, mode })
     toast.success(`订单 ${order.value.order_id} 已${mode === 'full' ? '完整发货' : '标记发货'}`)
     order.value.order_status = 'shipped'
   } catch (e: any) {

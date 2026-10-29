@@ -19,7 +19,7 @@
     >
       <div class="flex items-center gap-2.5 min-w-0">
         <div class="w-8 h-8 rounded-lg bg-brand-500 flex items-center justify-center shrink-0">
-          <Icon name="message" class="text-white text-base" />
+          <Icon name="fish" class="text-white text-base" />
         </div>
         <span v-if="showLabel" class="font-semibold text-sm text-slate-900 dark:text-white truncate">闲鱼超级管家</span>
       </div>

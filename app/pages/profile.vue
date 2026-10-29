@@ -116,16 +116,36 @@
           </div>
         </div>
       </div>
+
+      <!-- 分销与钱包 -->
+      <NuxtLink to="/wallet" class="card p-6 group hover:shadow-card-hover transition-all duration-200 block">
+        <div class="flex items-center gap-4">
+          <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-brand-400 to-brand-600 flex items-center justify-center text-white shadow-lg shadow-brand-500/30 shrink-0">
+            <Icon name="wallet" class="text-xl" />
+          </div>
+          <div class="min-w-0 flex-1">
+            <h3 class="font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+              分销与钱包
+              <Icon name="arrowRight" class="text-slate-400 group-hover:text-brand-500 transition-colors" />
+            </h3>
+            <p class="text-sm text-slate-500 dark:text-slate-400 mt-0.5">查看余额、申请提现、维护收款码 / 对接码 / 提货秘钥，浏览资金流水与提现记录</p>
+          </div>
+          <div class="hidden sm:flex items-center gap-3 text-xs text-slate-400">
+            <span class="badge bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300"><Icon name="coins" /> 流水</span>
+            <span class="badge bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300"><Icon name="link" /> 对接</span>
+          </div>
+        </div>
+      </NuxtLink>
     </template>
   </div>
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getUserProfile, updateUserProfile } from '~/api/user'
+import { changePassword } from '~/api/auth'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
 
 const loading = ref(true)
@@ -148,7 +168,7 @@ const savingPrefs = ref(false)
 async function loadProfile() {
   loading.value = true
   try {
-    const r = await api.get<{ user: any; preferences: any }>('/api/user/profile')
+    const r = await getUserProfile()
     profile.value = r
     Object.assign(prefs, r.preferences)
   } catch (e: any) {
@@ -164,7 +184,7 @@ async function changePassword() {
   if (pwdForm.next.length < 6) return toast.warning('新密码至少 6 位')
   changingPwd.value = true
   try {
-    await api.post('/api/auth/change-password', { currentPassword: pwdForm.current, newPassword: pwdForm.next })
+    await changePassword(pwdForm.current, pwdForm.next)
     toast.success('密码修改成功')
     pwdForm.current = ''
     pwdForm.next = ''
@@ -179,7 +199,7 @@ async function changePassword() {
 async function savePrefs() {
   savingPrefs.value = true
   try {
-    await api.put('/api/user/profile', { preferences: prefs })
+    await updateUserProfile(prefs)
     toast.success('偏好设置已保存')
     // Apply theme immediately
     if (import.meta.client) {

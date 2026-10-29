@@ -93,22 +93,12 @@
 </template>
 
 <script setup lang="ts">
-import { useApi } from '~/composables/useApi'
+import { getAdminLogs, getAdminLogStats, clearAdminLogs } from '~/api/admin'
+import type { AdminLog } from '~/api/admin'
 
 definePageMeta({ layout: 'default' })
 
-const api = useApi()
 const toast = useToast()
-
-interface Log {
-  id: number
-  level: string
-  module: string | null
-  message: string
-  meta: string | null
-  user_id: number | null
-  created_at: string
-}
 
 const LEVEL_META: Record<string, { cls: string; dot: string; icon: string }> = {
   INFO: { cls: 'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-300', dot: 'bg-sky-500', icon: 'info' },
@@ -120,7 +110,7 @@ function levelMeta(l: string) { return LEVEL_META[l] || LEVEL_META.INFO }
 
 const loading = ref(false)
 const clearing = ref(false)
-const logs = ref<Log[]>([])
+const logs = ref<AdminLog[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
@@ -142,15 +132,15 @@ const statsCards = computed(() => [
 async function reload() {
   loading.value = true
   try {
-    const params: any = { page: page.value, pageSize: pageSize.value }
-    if (filters.level && filters.level !== 'ALL') params.level = filters.level
-    if (filters.module.trim()) params.module = filters.module.trim()
-    if (filters.keyword.trim()) params.keyword = filters.keyword.trim()
-    const qs = new URLSearchParams(params).toString()
-
     const [logsData, statsData] = await Promise.all([
-      api.get<{ data: Log[]; total: number; page: number; pageSize: number }>(`/api/admin/logs?${qs}`),
-      api.get<{ stats: Record<string, number>; total: number }>('/api/admin/logs/stats'),
+      getAdminLogs({
+        page: page.value,
+        pageSize: pageSize.value,
+        level: filters.level !== 'ALL' ? filters.level : undefined,
+        module: filters.module.trim() || undefined,
+        keyword: filters.keyword.trim() || undefined,
+      }),
+      getAdminLogStats(),
     ])
     logs.value = logsData.data
     total.value = logsData.total
@@ -179,7 +169,7 @@ async function clearAll() {
   clearing.value = true
   try {
     const level = filters.level !== 'ALL' ? filters.level : ''
-    await api.post('/api/admin/logs/clear', level ? { level } : {})
+    await clearAdminLogs(level || undefined)
     toast.success('日志已清空')
     page.value = 1
     reload()

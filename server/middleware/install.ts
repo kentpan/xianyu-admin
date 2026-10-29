@@ -5,18 +5,13 @@
  * blocked (redirect to /dashboard).
  */
 const ALLOWED_PREFIXES = [
-  '/xianyu/install',
-  '/xianyu/api/install',
-  '/xianyu/api/system/status',
-  '/xianyu/api/health',
+  '/install',
   '/api/install',
   '/api/system/status',
   '/api/health',
-  '/xianyu/_nuxt',
-  '/xianyu/assets',
-  '/xianyu/favicon',
-  '/favicon',
+  '/_nuxt',
   '/assets',
+  '/favicon',
 ]
 
 export default defineEventHandler((event) => {
@@ -33,13 +28,13 @@ export default defineEventHandler((event) => {
         setResponseStatus(event, 503)
         return { success: false, code: 503, message: '系统未安装，请先完成安装向导' }
       }
-      // baseURL is /xianyu/, so the install page lives at /xianyu/install
-      return sendRedirect(event, '/xianyu/install', 302)
+      // baseURL is '/', so the install page lives at /install
+      return sendRedirect(event, '/install', 302)
     }
     return
   }
 
-  if (pathname === '/xianyu/install' || pathname.startsWith('/xianyu/install/')) {
-    return sendRedirect(event, '/xianyu/dashboard', 302)
+  if (pathname === '/install' || pathname.startsWith('/install/')) {
+    return sendRedirect(event, '/dashboard', 302)
   }
 })
