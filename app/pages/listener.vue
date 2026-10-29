@@ -53,6 +53,9 @@
                   <template v-else>未登记（代理主动外呼，无需公网入站）</template>
                   <div v-if="e.remark" class="text-slate-400 mt-0.5">{{ e.remark }}</div>
                 </template>
+                <template v-else-if="e.runtime_supported === false">
+                  <span class="text-amber-600 dark:text-amber-400">本机无常驻进程 · 请部署远程代理（自有设备 Node 版 / Cloudflare Edge 版）</span>
+                </template>
                 <template v-else>本进程内运行 · 自动随服务启停</template>
               </td>
               <td>
@@ -65,8 +68,13 @@
               </td>
               <td>
                 <span class="inline-flex items-center gap-1.5">
-                  <span class="inline-block w-2 h-2 rounded-full" :class="e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'" />
-                  <span class="text-slate-500 dark:text-slate-400">{{ e.online ? '在线' : '离线' }}</span>
+                  <template v-if="e.type === 'builtin' && e.runtime_supported === false">
+                    <span class="text-amber-600 dark:text-amber-400">不可用</span>
+                  </template>
+                  <template v-else>
+                    <span class="inline-block w-2 h-2 rounded-full" :class="e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'" />
+                    <span class="text-slate-500 dark:text-slate-400">{{ e.online ? '在线' : '离线' }}</span>
+                  </template>
                 </span>
               </td>
               <td>
@@ -77,7 +85,7 @@
               </td>
               <td class="text-right">
                 <div class="inline-flex items-center gap-1.5 flex-wrap justify-end">
-                  <button v-if="!e.is_active" class="btn-secondary" :disabled="switching === e.id" @click="switchTo(e)">
+                  <button v-if="!e.is_active && !(e.type === 'builtin' && e.runtime_supported === false)" class="btn-secondary" :disabled="switching === e.id" @click="switchTo(e)">
                     {{ switching === e.id ? '切换中...' : '设为使用' }}
                   </button>
                   <button v-if="e.type === 'remote'" class="btn-secondary" @click="openDeploy(e)">部署</button>
@@ -166,10 +174,10 @@
           <Icon name="server" />
           <span>引擎状态</span>
         </div>
-        <p class="mt-2 text-xl font-semibold" :class="status?.engine_online ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'">
-          {{ status?.engine_online ? '运行中' : '未运行' }}
+        <p class="mt-2 text-xl font-semibold" :class="status?.engine_online ? 'text-emerald-600 dark:text-emerald-400' : enginesRuntime === 'cloudflare' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'">
+          {{ status?.engine_online ? '运行中' : enginesRuntime === 'cloudflare' ? '待接入代理' : '未运行' }}
         </p>
-        <p class="text-slate-400 mt-1">按内置引擎进程心跳判定，与账号状态无关</p>
+        <p class="text-slate-400 mt-1">{{ enginesRuntime === 'cloudflare' ? 'Cloudflare 无常驻进程，内置引擎不可用；部署独立代理后「设为使用」' : '按内置引擎进程心跳判定，与账号状态无关' }}</p>
       </div>
       <div class="card p-4">
         <div class="flex items-center gap-2 text-slate-500 dark:text-slate-400">
@@ -210,11 +218,12 @@
       <div class="flex items-start gap-3">
         <Icon name="info" class="text-sky-500 mt-0.5 shrink-0" />
         <div class="text-slate-600 dark:text-slate-300 space-y-1">
-          <p>内置引擎已内置在本服务进程内，随服务自动启停，无需任何额外进程；在「账号管理」启用/停用账号、更新 Cookie 后 5 秒内自动对齐。</p>
+          <p v-if="enginesRuntime === 'node'">内置引擎已内置在本服务进程内，随服务自动启停，无需任何额外进程；在「账号管理」启用/停用账号、更新 Cookie 后 5 秒内自动对齐。</p>
+          <p v-else class="text-amber-600 dark:text-amber-400">当前部署在 Cloudflare Pages（workerd 无常驻进程），内置监听引擎不可用 —— 两种远程形态任选：<b>① 自有设备 Node 版</b>（推荐，住宅 IP 风控友好）：在任意能出网的机器（你的电脑/服务器）部署单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>；<b>② Cloudflare Edge 版</b>（无常驻设备时）：<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">cloudflare/xianyu-edge-listener</code> Durable Object 监听器，wrangler 部署一次跑在边缘（需 Workers Paid，出口 IP 为数据中心段，风控面不同，详见包内 README）。代理上线后在其行内点「设为使用」即可接管监听。</p>
           <p>风控自愈：token 接口命中风控挑战时计入连败并按阶梯静默（30min → 2h，高频重试只会加深风控）；连败 ≥ 2 次后通过 SSE 实时推送全局弹窗（前端零轮询），弹窗内直接 iframe 嵌入闲鱼官方验证页（真实 h5api.m.goofish.com 页面，无代理无截图无后端浏览器），你在页面上人工拖动滑块，通过后官方页面按 addCookieToHeader 契约把 x5sec 凭证 postMessage 回本弹窗，自动合并进账号 Cookie 并重试 Token 恢复监听；弹窗打开期间引擎对该账号完全静默（不重试 token），避免并发调用作废你正在验证的挑战。</p>
           <p>引擎能力：收发闲鱼消息（关键词/AI/指定商品/默认回复四级链）、付款消息触发自动发货（卡券延时在卡券管理配置）、回复决策日志与消息过滤。</p>
-          <p>远程代理：单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>（零 npm 依赖，Node ≥ 22），只做消息监听与转发，所有规则/卡券/订单等业务状态都保留在本后台；代理主动外呼本后台（无需公网入站端口），部署说明点引擎行的「部署」按钮查看。</p>
-          <p>独立代理枢纽（推荐多项目共用时使用）：完整 Node 项目 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">download/xianyu-proxy-v1.0.1.zip</code>，自带管理面板（多代理 CRUD + 多用户发布订阅 + Dashboard），每个下游用户独立 API Token（Bearer 鉴权）；填好 .env 的 XY_ADMIN_URL/XY_ENGINE_TOKEN 后可与本后台自动对接（后台扫码 → 代理托管同步 → 事件回流 → 动作执行）。</p>
+          <p>远程代理：单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>（零 npm 依赖，Node ≥ 20；Node 20 无内置 WebSocket 时同目录 npm i ws），只做消息监听与转发，所有规则/卡券/订单等业务状态都保留在本后台；代理主动外呼本后台（无需公网入站端口），部署说明点引擎行的「部署」按钮查看。</p>
+          <p class="text-slate-400">部署位置任选：能出网即入 —— 本地电脑（与浏览器同源环境风控最友好）、家里的闲置主机、任意 VPS；代理崩溃/断网自动重连与退避，Cookie 在后台重新扫码后 30s 内自动同步到代理。</p>
           <p class="text-slate-400">风控保护：设备指纹持久化、心跳/重连随机抖动、指数退避、发送人化队列（随机间隔 + 限速 12 条/分钟）、风控挑战自动冷却阶梯；后台对代理回连请求按 Bearer 令牌限速。</p>
         </div>
       </div>
@@ -356,8 +365,8 @@
     <ModalBase v-model="deployOpen" title="远程代理部署说明（单文件 · 零依赖）" size="md">
       <div class="space-y-4">
         <div class="text-slate-600 dark:text-slate-300 space-y-2">
-          <p>1. 将项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code> 单个文件上传到任意能出网的服务器（仅需 Node ≥ 22，零 npm 依赖；Node 20 可在同目录 npm i ws）。</p>
-          <p>2. 配置环境变量（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌）：</p>
+          <p>1. 将项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code> 单个文件上传到任意能出网的服务器（仅需 Node ≥ 20，零 npm 依赖；Node 20 可在同目录 npm i ws）。</p>
+          <p>2. 配置 XY_ADMIN_URL / XY_ENGINE_TOKEN（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌），三种方式任选其一：① 启动命令内联环境变量；② 在脚本同目录放 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">.env</code> 文件（每行 KEY=VALUE），脚本启动时自动加载（真实环境变量优先）；③ Wispbyte 等面板的「Environment/环境变量」编辑页写入的正是这个 .env 文件，同样会被自动读取（面板 Startup/启动页的变量才是真环境变量，两处是分开的）。</p>
         </div>
         <div class="relative">
           <pre class="p-3 rounded-lg bg-slate-900 text-slate-100 overflow-x-auto leading-relaxed"><code>{{ deploySnippet }}</code></pre>
@@ -368,8 +377,13 @@
         <div class="text-slate-600 dark:text-slate-300 space-y-2">
           <p>3. 启动：<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">node xianyu-proxy.mjs</code>。代理主动拉取账号配置 → 连闲鱼长连接 → 事件上报本后台，后台决策的回复/发货动作由代理人化执行；无需公网入站端口。</p>
           <p>4. 回到本页，确认该代理显示「在线」后，点「设为使用」即可切换；原内置引擎会在 5 秒内自动停止监听，不会重复回复。令牌泄露点「重置」即时作废。</p>
-          <p class="text-slate-400">提示：需要一个带管理面板、可管理多代理并把事件发布给多个下游项目的完整版？使用独立代理枢纽 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">download/xianyu-proxy-v1.0.1.zip</code>（解压后改 .env 即可运行，XY_ADMIN_URL/XY_ENGINE_TOKEN 填本页令牌即可自动对接）。</p>
+          <p class="text-slate-400">提示：代理与后台共用一套风控约束（设备指纹持久化/随机抖动/冷却阶梯/人化发送队列）；本地电脑运行代理时若装有 Playwright Chromium 会自动探测真实浏览器 UA（风控更友好），无则回退内置静态 UA。</p>
           <p class="text-slate-400">说明：XY_ADMIN_URL 必须是代理所在机器能访问到的本后台地址；XY_PROXY_PORT 为代理本地健康检查端口（选填，Bearer 鉴权）。</p>
+          <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3 space-y-1.5">
+            <p class="font-medium text-slate-700 dark:text-slate-200">没有常驻设备？Cloudflare Edge 版</p>
+            <p>项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">cloudflare/xianyu-edge-listener/</code> 是跑在 Cloudflare Durable Object 上的监听器（与 Edgechat 同形态：出站 WebSocket + alarm 保活），对接协议与 Node 版完全一致。<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">wrangler deploy</code> 一次即可，无需任何自有设备在线。</p>
+            <p class="text-slate-400">如实提示：需 Workers Paid（$5/月起，DO 常驻连接计 duration 费）；出口 IP 为数据中心段，闲鱼风控面与住宅 IP 不同，如遇风控会自动冷却退避并在本页显示。详见该目录 README。</p>
+          </div>
         </div>
       </div>
       <template #footer>
@@ -421,6 +435,7 @@ function openManualVerify(a: ListenerAccount) {
 // ---- 引擎管理 ----
 const engines = ref<EngineRow[]>([])
 const origin = ref('')
+const enginesRuntime = ref<'node' | 'cloudflare'>('node')
 const enginesLoading = ref(true)
 const switching = ref(0)
 
@@ -454,6 +469,7 @@ async function loadEngines() {
     const r = await getEngines()
     engines.value = r.engines || []
     origin.value = r.origin || ''
+    enginesRuntime.value = r.runtime || 'node'
   } catch (e: any) {
     toast.error(e?.message || '获取引擎列表失败')
   } finally {

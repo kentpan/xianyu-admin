@@ -16,6 +16,7 @@
 import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
+import { fetchApiCardContent } from '../card-api'
 import { fetchItemDetail, confirmOrderShipped, freeshippingOrder } from './mtop'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
@@ -1112,23 +1113,12 @@ async function extractCardContent(
       parts.push({ kind: 'text', value: taken })
     }
   } else if (card.type === 'api') {
+    // API 卡券拉取逻辑唯一实现在 server/utils/card-api.ts (与 /api/cards/test-api 共用)
     try {
       const conf = JSON.parse(String(card.api_config || '{}'))
-      const res = await fetch(String(conf.url || ''), {
-        method: String(conf.method || 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET',
-        headers: conf.headers && typeof conf.headers === 'object' ? conf.headers : { 'content-type': 'application/json' },
-        body: conf.method === 'POST' && conf.body != null ? JSON.stringify(conf.body) : undefined,
-        signal: AbortSignal.timeout(15_000),
-      })
-      const json: any = await res.json().catch(() => null)
-      const path = String(conf.data_path || 'data')
-      let value: any = json
-      for (const seg of path.split('.')) {
-        if (value == null) break
-        value = value[seg]
-      }
-      const text = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value)
-      if (text) parts.push({ kind: 'text', value: text })
+      const r = await fetchApiCardContent(conf)
+      if (r.text) parts.push({ kind: 'text', value: r.text })
+      else logWarn(`[${cookieId}] API 卡券拉取失败: ${r.message}`)
     } catch (e: any) {
       logWarn(`[${cookieId}] API 卡券拉取失败: ${e?.message}`)
     }

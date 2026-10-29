@@ -1,0 +1,22 @@
+name = "xianyu-edge-listener"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# 必填: 与 xianyu-proxy.mjs 相同的两个配置
+# XY_ADMIN_URL    = "https://你的后台域名.pages.dev"
+# XY_ENGINE_TOKEN = "后台-监听服务页-复制该代理行的接入令牌"
+XY_TICK_MS = "1000"
+
+[[durable_objects.bindings]]
+name = "XIANYU_LISTENER"
+class_name = "XianyuEdgeDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["XianyuEdgeDO"]
+
+[triggers]
+# 兜底唤醒: 正常情况下 DO alarm 自续, cron 仅在部署/异常停摆后拉起
+crons = ["*/5 * * * *"]

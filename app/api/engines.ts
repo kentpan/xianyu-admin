@@ -12,6 +12,8 @@ export interface EngineRow {
   enabled: boolean
   is_active: boolean
   online: boolean
+  /** 内置引擎专用: 当前运行时能否真实承载 (cloudflare 无常驻进程 → false) */
+  runtime_supported?: boolean
   last_seen_at: string | null
   last_status: string
 }
@@ -20,6 +22,7 @@ export interface EnginesResponse {
   engines: EngineRow[]
   active_slug: string
   origin: string
+  runtime: 'node' | 'cloudflare'
 }
 
 export function getEngines() {

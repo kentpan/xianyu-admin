@@ -222,8 +222,17 @@
         <!-- Type-specific content -->
         <div v-if="form.type === 'api'">
           <label class="label">API 配置 (JSON)</label>
-          <textarea v-model="form.api_config" rows="4" class="input font-mono text-xs" placeholder='{"url":"https://...","method":"POST","headers":{}}'></textarea>
-          <p class="text-xs text-slate-400 mt-1">请求外部接口获取发货内容</p>
+          <textarea v-model="form.api_config" rows="6" class="input font-mono text-xs" placeholder='{"url":"https://...","method":"POST","headers":{}}'></textarea>
+          <p class="text-slate-400 mt-1">发货时请求外部接口，data_path 指定从响应 JSON 提取发货文本的字段路径（如 data.url 取加密提取页链接）</p>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <button type="button" class="btn-secondary !py-1.5 !px-3" @click="fillCardsHubTemplate">填入 cards-hub 加密 URL 发货模板</button>
+            <button type="button" class="btn-ghost !py-1.5 !px-3" @click="testApiConfig">测试请求</button>
+            <span v-if="apiTestResult" class="self-center text-slate-500 break-all">{{ apiTestResult }}</span>
+          </div>
+          <div class="mt-2 rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+            <p class="text-slate-600 dark:text-slate-300 font-medium">对接 cloudflare-cards-hub（资源交付系统）</p>
+            <p class="text-slate-500 mt-1">填入模板后改 3 处：① url 换成你的 cards-hub 域名 ② Authorization 换成「APIKEY 管理」里的 ak- 开头密钥 ③ body.script_id 换成资源管理里的资源 ID。发货时自动调 /api/issue 生成一单一密的加密提取页链接发给买家，买家打开即自动核销下载（全程看不到真实文件路径）。</p>
+          </div>
         </div>
         <div v-else-if="form.type === 'text'">
           <label class="label">文本内容</label>
@@ -459,6 +468,64 @@ const filtered = computed(() => {
     return c.name.toLowerCase().includes(k) || (c.description || '').toLowerCase().includes(k)
   })
 })
+
+const apiTesting = ref(false)
+const apiTestResult = ref('')
+
+/** 一键填入 cards-hub (资源交付系统) 加密 URL 发货模板, 用户只需改域名/密钥/资源 ID 三处 */
+function fillCardsHubTemplate() {
+  form.value.type = 'api'
+  form.value.api_config = JSON.stringify(
+    {
+      url: 'https://你的-cards-hub-域名/api/issue',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Authorization: 'Bearer ak-你的APIKEY',
+      },
+      body: {
+        title: form.value.name || '商品名称',
+        price: 9.9,
+        script_id: 1,
+      },
+      data_path: 'data.url',
+    },
+    null,
+    2,
+  )
+}
+
+/** 服务端代发一次请求并按 data_path 提取 (浏览器直连外部接口有 CORS 限制) */
+async function testApiConfig() {
+  if (apiTesting.value) return
+  let conf: any
+  try {
+    conf = JSON.parse(form.value.api_config || '{}')
+  } catch {
+    apiTestResult.value = 'API 配置不是合法 JSON'
+    toast.error('API 配置不是合法 JSON')
+    return
+  }
+  apiTesting.value = true
+  apiTestResult.value = ''
+  try {
+    const r: any = await $fetch('/api/cards/test-api', {
+      method: 'POST',
+      body: { api_config: JSON.stringify(conf) },
+    })
+    const d = r?.data || {}
+    apiTestResult.value = d.ok
+      ? `✓ HTTP ${d.status} 提取成功: ${String(d.text || '').slice(0, 120)}`
+      : `✗ ${d.message || r?.message || '测试未成功'}${d.status ? ` (HTTP ${d.status})` : ''}`
+    if (d.ok) toast.success('API 配置测试通过')
+    else toast.error(d.message || r?.message || '测试未成功')
+  } catch (e: any) {
+    apiTestResult.value = `✗ ${e?.message || '请求失败'}`
+    toast.error(e?.message || '测试请求失败')
+  } finally {
+    apiTesting.value = false
+  }
+}
 
 async function reload() {
   loading.value = true

@@ -21,6 +21,10 @@ export default defineEventHandler(
     const rows = await db.all<any>('SELECT * FROM engines ORDER BY id ASC')
     const now = Date.now()
     const FRESH_MS = 60_000
+    // 运行时承载能力: 内置引擎依赖进程内常驻调度器 + WebSocket 长连接,
+    // cloudflare(workerd) 无常驻进程 → builtin 不可用, 引导用户使用远程代理
+    const runtime = detectRuntime()
+    const builtinSupported = runtime === 'node'
     const engines = rows.map((r) => {
       const lastSeen = r.last_seen_at
         ? new Date(String(r.last_seen_at).includes('T') ? r.last_seen_at : r.last_seen_at + 'Z').getTime() ||
@@ -38,6 +42,7 @@ export default defineEventHandler(
         enabled: !!r.enabled,
         is_active: !!r.is_active,
         online: !!lastSeen && now - lastSeen < FRESH_MS,
+        runtime_supported: r.type === 'builtin' ? builtinSupported : true,
         last_seen_at: r.last_seen_at || null,
         last_status: r.last_status || '',
       }
@@ -48,6 +53,7 @@ export default defineEventHandler(
       engines,
       active_slug: active?.slug || '',
       origin: getRequestURL(event).origin,
+      runtime,
     })
   }),
 )

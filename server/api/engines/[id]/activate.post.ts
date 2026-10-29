@@ -18,6 +18,16 @@ export default defineEventHandler(
     if (!row) throw new ApiError(404, '引擎不存在')
     if (!row.enabled) throw new ApiError(400, '该引擎已停用, 请先启用再切换')
 
+    // 运行时承载拦截: cloudflare(workerd) 无常驻进程/无 WebSocket 客户端,
+    // 内置引擎物理上无法服务 —— 激活它只会得到一个永远"未运行"的死引擎。
+    // 从源头拦住, 引导用户部署独立代理 (scripts/xianyu-proxy.mjs) 后再切换。
+    if (row.type === 'builtin' && detectRuntime() === 'cloudflare') {
+      throw new ApiError(
+        400,
+        'Cloudflare Pages 运行时无常驻进程, 内置监听引擎不可用。请在任意能出网的机器上部署独立代理 (scripts/xianyu-proxy.mjs, 部署说明见引擎行「部署」按钮), 代理上线后将其「设为使用」',
+      )
+    }
+
     await db.run('UPDATE engines SET is_active = 0, updated_at = CURRENT_TIMESTAMP')
     await db.run('UPDATE engines SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [id])
 
