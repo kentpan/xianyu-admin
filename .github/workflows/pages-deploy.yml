@@ -21,6 +21,11 @@
 #     secret —— 配套 edge-realtime Worker 复用 JWT_SECRET 作为 XY_JWT_SECRET; 仓库
 #     须携带 edge-realtime/index.js(缺失报错终止)。免费计划 DO 配额:
 #     10 万请求/天 + 13,000 GB-s/天(Hibernation 空闲不计时长), 管理后台场景极富余。
+#   v8.9.14: Generate Prisma Client 步骤改为探测门控 —— 仅当 package.json 依赖
+#     含 prisma/@prisma/client 且存在 schema.prisma 时才执行; 无 Prisma 依赖的
+#     项目(node:sqlite 原生驱动)直接跳过, 杜绝 npx 本地找不到 CLI 时静默拉取
+#     npm 远程版(prisma@8.0.0-rc.28 已移除 generate 命令 →
+#     [CLI.UNKNOWN_COMMAND] No command registered for 'generate' exit 2)。
 # ============================================================================
 
 name: Deploy to Cloudflare
@@ -428,8 +433,24 @@ jobs:
           # (不连接数据库), 值引用 .env 解析结果(数据库文件路径唯一真源统一)
           DATABASE_URL: "${{ env.DATABASE_URL_VALUE }}"
 
-      - name: Generate Prisma Client
-        run: npx prisma generate
+      - name: Generate Prisma Client (only when project uses Prisma)
+        # v8.9.14 根因护栏: 原实现无条件 npx prisma generate, 仅适用于 package.json
+        # 携带 prisma/@prisma/client 的项目(npx 命中 npm ci 装好的本地 CLI)。
+        # 依赖里没有 Prisma 的项目(如 xianyu-admin: node:sqlite 原生驱动, prisma/
+        # 目录仅存放 .db 与 d1-schema.sql/seed.sql)本地无 CLI, npx 会静默改拉
+        # npm 远程版 —— 当前 latest 已是 prisma@8.0.0-rc.28, 该版本 CLI 不再注册
+        # generate 命令, 直接炸出 [CLI.UNKNOWN_COMMAND] exit 2。
+        # 故先探测: 依赖含 prisma/@prisma/client 且存在 schema.prisma 才执行。
+        run: |
+          HAS_PRISMA_DEP=$(node -e "const p=require('./package.json');const d={...p.dependencies,...p.devDependencies};console.log((d.prisma||d['@prisma/client'])?'true':'false')")
+          HAS_PRISMA_SCHEMA=false
+          for f in prisma/schema.prisma schema.prisma; do [ -f "$f" ] && HAS_PRISMA_SCHEMA=true; done
+          if [ "$HAS_PRISMA_DEP" = "true" ] && [ "$HAS_PRISMA_SCHEMA" = "true" ]; then
+            echo "✅ 检测到 Prisma 依赖 + schema → 生成 Prisma Client(使用项目本地锁定版本 CLI)"
+            npx prisma generate
+          else
+            echo "::notice::依赖中无 prisma/@prisma/client 或缺 schema.prisma → 跳过 prisma generate(本项目数据库不走 Prisma: node:sqlite 原生驱动/D1 SQL 建表)"
+          fi
         env:
           # generate 阶段只需占位值(不连接数据库); SQLite 在 Cloudflare 运行时
           # 不可用, 线上走"无数据库降级路径", 此处仅为满足构建期模块加载;

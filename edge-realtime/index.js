@@ -1,165 +1,137 @@
-/**
- * edge-realtime — xianyu-admin 配套实时 Worker(Cloudflare Durable Objects hub)。
- *
- * 为什么需要本 Worker: Pages 项目不能在自身内创建/部署 DO 类(Cloudflare 平台限制,
- * 官方文档: "You cannot create and deploy a Durable Object within a Pages project"),
- * DO 必须由独立 Worker 承载。本 Worker 独立部署后, 站点(Pages/Workers 形态均可)通过
- * REALTIME_DO 绑定(wrangler.toml durable_objects.bindings + script_name)直呼本 DO:
- *   - WS 升级: 站点 /api/realtime/ws 鉴权通过后把升级请求原样转发进 DO(idFromName('server'))
- *   - 事件广播: 站点 publishToHub POST /api/realtime/publish → DO getWebSockets() 逐连接 send
- * 本 Worker 自身亦暴露同协议路由(直连 workers.dev 调试用), 与站点共用 XY_JWT_SECRET 鉴权。
- *
- * 部署: npx wrangler deploy -c edge-realtime/wrangler.toml
- * 密钥: printf '%s' "$JWT_SECRET" | npx wrangler secret put XY_JWT_SECRET -c edge-realtime/wrangler.toml
- */
-import { DurableObject } from 'cloudflare:workers'
+// edge-realtime/index.js — 边缘实时 hub Worker(独立承载 Durable Object, 参考 kentpan/Edgechat)
+//
+// 平台限制: DO 类必须由 Worker 定义并导出, Cloudflare Pages 自身无法承载 DO 类。
+// 本 Worker 即配套载体, 由 .github/workflows/pages-deploy.yml 自动部署(wrangler
+// deploy + migrations new_sqlite_classes)并向站点注入 REALTIME_DO 绑定。
+//
+// 两条调用路径:
+//   ① 浏览器直连:  wss://<本worker域名>/ws?room=<房间>&auth=<JWT_SECRET>
+//   ② 站点服务端:  env.REALTIME_DO 绑定(script_name) → stub.fetch(...) 广播/查询
+//
+// 鉴权: auth 参数必须与服务端 XY_JWT_SECRET(CI 由 JWT_SECRET 注入)一致, 否则 401。
+// 免费计划要点: DO 使用 SQLite 存储(migrations new_sqlite_classes); Hibernation
+// API 挂起空闲连接不计 duration; ping/pong 走 setWebSocketAutoResponsePair 不唤醒。
 
-// ⚠ Worker 入口只允许导出 DO 类与 default handler —— 常量一律模块内私有,
-// 否则 workerd 启动即报 "Incorrect type for map entry 'DO_CLASS'"。
-const DO_CLASS = 'EdgeRealtimeDO'
-const DO_INSTANCE = 'server'
-const PUBLISH_PATH = '/api/realtime/publish'
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 
-/** base64url → bytes(JWT 三段解码用)。 */
-function b64urlToBytes(s) {
-  const pad = s.length % 4 ? '='.repeat(4 - (s.length % 4)) : ''
-  const raw = atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad)
-  return Uint8Array.from(raw, (c) => c.charCodeAt(0))
+const ok = (data) => new Response(JSON.stringify({ success: true, msg: 'ok', data }), { headers: JSON_HEADERS });
+const fail = (msg, status = 400) => new Response(JSON.stringify({ success: false, msg, data: null }), { status, headers: JSON_HEADERS });
+
+// 恒等时间比较, 防时序侧信道
+function safeEqual(a, b) {
+  const ab = new TextEncoder().encode(String(a));
+  const bb = new TextEncoder().encode(String(b));
+  const n = Math.max(ab.length, bb.length);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < n; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
+  return diff === 0;
 }
 
-/**
- * HS256 JWT 校验(WebCrypto, 零依赖) — 与站点侧 jsonwebtoken 签发完全兼容
- * (signToken: jwt.sign(payload, secret, { expiresIn: '7d' }) 即 HS256)。
- */
-async function verifyJwt(token, secret) {
-  if (!token || !secret) return null
-  try {
-    const parts = token.split('.')
-    if (parts.length !== 3) return null
-    const [h, p, sig] = parts
-    const header = JSON.parse(new TextDecoder().decode(b64urlToBytes(h)))
-    if (header.alg !== 'HS256') return null
-    const key = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify'],
-    )
-    const valid = await crypto.subtle.verify(
-      'HMAC',
-      key,
-      b64urlToBytes(sig),
-      new TextEncoder().encode(`${h}.${p}`),
-    )
-    if (!valid) return null
-    const payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(p)))
-    if (payload.exp && Date.now() / 1000 >= payload.exp) return null
-    return payload
-  } catch {
-    return null
-  }
+function checkAuth(url, env) {
+  const secret = env.XY_JWT_SECRET;
+  if (!secret) return { valid: false, reason: 'Worker 未配置 XY_JWT_SECRET(由 CI 从 JWT_SECRET 注入, 请检查部署流程)' };
+  const auth = url.searchParams.get('auth') ?? '';
+  if (!auth) return { valid: false, reason: '缺少 auth 参数' };
+  if (!safeEqual(auth, secret)) return { valid: false, reason: 'auth 与服务端密钥不一致' };
+  return { valid: true };
 }
 
-/** 提取令牌: Authorization: Bearer 优先, 同源握手回落 admin_token cookie(与站点 ws.get.ts 同口径)。 */
-function extractToken(request) {
-  const bearer = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
-  if (bearer.trim()) return bearer.trim()
-  const cookie = request.headers.get('cookie') || ''
-  return (cookie.match(/(?:^|;\s*)admin_token=([^;]+)/) || [])[1] || ''
-}
-
-async function authenticate(request, env) {
-  let token = extractToken(request)
-  try {
-    token = decodeURIComponent(token)
-  } catch {}
-  return verifyJwt(token, env.XY_JWT_SECRET)
-}
-
-const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  })
-const ok = (data) => ({ success: true, msg: 'ok', data })
-const fail = (msg) => ({ success: false, msg })
-
-/**
- * DO hub 单例(idFromName('server')) — WebSocket Hibernation API:
- * 空闲连接休眠不计时长, 广播/心跳唤醒才计费。协议与站点 ws.get.ts 完全同构:
- *   连接建立 → { type: 'ready' }; 上行 { t: <ms> } → 回 { type: 'pong', t }。
- */
-export class EdgeRealtimeDO extends DurableObject {
-  async fetch(request) {
-    if (request.headers.get('upgrade') === 'websocket') {
-      const user = await authenticate(request, this.env)
-      if (!user) return json(fail('未授权或登录已过期'), 401)
-      const pair = new WebSocketPair()
-      this.ctx.acceptWebSocket(pair[1])
-      try {
-        pair[1].send(JSON.stringify({ type: 'ready' }))
-      } catch {}
-      return new Response(null, { status: 101, webSocket: pair[0] })
-    }
-    const url = new URL(request.url)
-    if (request.method === 'POST' && url.pathname === PUBLISH_PATH) {
-      let body = null
-      try {
-        body = await request.json()
-      } catch {}
-      if (!body || typeof body !== 'object') return json(ok({ relayed: false }))
-      const packet = JSON.stringify(body)
-      let clients = 0
-      for (const ws of this.ctx.getWebSockets()) {
-        try {
-          ws.send(packet)
-          clients++
-        } catch {}
-      }
-      return json(ok({ relayed: true, clients }))
-    }
-    return json(fail('Not Found'), 404)
-  }
-
-  async webSocketMessage(client, message) {
-    let t = 0
-    try {
-      t = Number(JSON.parse(String(message))?.t || 0)
-    } catch {}
-    try {
-      client.send(JSON.stringify({ type: 'pong', t: t || Date.now() }))
-    } catch {}
-  }
-
-  async webSocketClose() {}
-
-  async webSocketError() {}
-}
-
-/** Worker 入口: 站点/浏览器直连面 — /ws 升级、/publish 广播(secret 保护)、/health 探针。 */
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url)
-    const namespace = env.REALTIME_HUB
-    if (!namespace) {
-      return json(fail('REALTIME_HUB binding missing(edge-realtime/wrangler.toml)'), 500)
+    const url = new URL(request.url);
+
+    if (url.pathname === '/health') {
+      return ok({ service: 'edge-realtime', room: url.searchParams.get('room') || 'default' });
     }
-    const stub = namespace.get(namespace.idFromName(DO_INSTANCE))
-    if (request.headers.get('upgrade') === 'websocket') {
-      const user = await authenticate(request, env)
-      if (!user) return json(fail('未授权或登录已过期'), 401)
-      return stub.fetch(request)
+    if (!['/ws', '/broadcast', '/status'].includes(url.pathname)) {
+      return fail('not found', 404);
     }
-    if (request.method === 'POST' && (url.pathname === '/publish' || url.pathname === PUBLISH_PATH)) {
-      if (!env.XY_JWT_SECRET || request.headers.get('x-pub-secret') !== env.XY_JWT_SECRET) {
-        return json(fail('forbidden'), 403)
-      }
-      return stub.fetch(new Request('https://realtime.hub' + PUBLISH_PATH, request))
-    }
-    if (url.pathname === '/' || url.pathname === '/health') {
-      return json(ok({ type: 'edge-realtime-hub', do: DO_CLASS, instance: DO_INSTANCE }))
-    }
-    return json(fail('Not Found'), 404)
+    const a = checkAuth(url, env);
+    if (!a.valid) return fail(a.reason, 401);
+
+    const room = url.searchParams.get('room') || 'default';
+    const id = env.REALTIME_HUB.idFromName(room);
+    const stub = env.REALTIME_HUB.get(id);
+    const forward = new URL(url);
+    if (url.pathname === '/ws') forward.pathname = '/connect';
+    return stub.fetch(forward.toString(), request);
   },
+};
+
+export class EdgeRealtimeDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    state.setWebSocketAutoResponsePair(new WebSocketRequestResponsePair('ping', 'pong'));
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === '/connect') return this.connect(request, url);
+    if (url.pathname === '/broadcast') return this.broadcast(request);
+    if (url.pathname === '/status') {
+      return ok({ online: this.state.getWebSockets().length });
+    }
+    return fail('not found', 404);
+  }
+
+  connect(request, url) {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return fail('expected websocket upgrade', 426);
+    }
+    const room = url.searchParams.get('room') || 'default';
+    const pair = new WebSocketPair();
+    this.state.acceptWebSocket(pair[1], [room]);
+
+    const online = this.state.getWebSockets().length;
+    pair[1].send(JSON.stringify({ type: 'welcome', room, online, ts: Date.now() }));
+    this._broadcastExcept(pair[1], { type: 'join', room, online, ts: Date.now() });
+
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  async broadcast(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return fail('body 必须是 JSON: {"message": ...}');
+    }
+    const online = this.state.getWebSockets().length;
+    this._broadcastExcept(null, { type: 'broadcast', message: body?.message ?? body, ts: Date.now(), online });
+    return ok({ delivered: online });
+  }
+
+  // 客户端消息: JSON 按 type 透传广播给房间内其他连接(Edgechat 式); 纯文本按 chat 处理
+  async webSocketMessage(ws, message) {
+    let payload;
+    try {
+      payload = JSON.parse(message);
+    } catch {
+      payload = { type: 'chat', text: String(message) };
+    }
+    if (payload.type === 'ping') {
+      ws.send('pong');
+      return;
+    }
+    if (payload.type === 'pong') return;
+    const online = this.state.getWebSockets().length;
+    this._broadcastExcept(ws, { ...payload, ts: Date.now(), online });
+  }
+
+  async webSocketClose() {
+    this._broadcastExcept(null, { type: 'leave', online: this.state.getWebSockets().length, ts: Date.now() });
+  }
+
+  async webSocketError(ws) {
+    try { ws.close(1011, 'internal error'); } catch { /* already closed */ }
+  }
+
+  _broadcastExcept(exceptWs, obj) {
+    const data = JSON.stringify(obj);
+    for (const s of this.state.getWebSockets()) {
+      if (s === exceptWs) continue;
+      try { s.send(data); } catch { /* ignore */ }
+    }
+  }
 }
