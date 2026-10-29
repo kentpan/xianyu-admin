@@ -14,15 +14,16 @@ const PUBLIC_KEYS = [
 ]
 
 export default defineEventHandler(
-  withApi(async () => {
+  withApi(async (event) => {
     const config = useRuntimeConfig()
-    const all = isInstalled() ? await getPublicSettings() : {}
+    const installed = await isInstalledAsync(event)
+    const all = installed ? await getPublicSettings() : {}
     const settings: Record<string, any> = {}
     for (const k of PUBLIC_KEYS) {
       if (all[k] !== undefined) settings[k] = all[k]
     }
     return ok({
-      installed: isInstalled(),
+      installed,
       appName: config.public.appName,
       appVersion: config.public.appVersion,
       brandColor: config.public.brandColor,

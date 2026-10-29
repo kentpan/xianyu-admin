@@ -9,7 +9,7 @@
  */
 export default defineEventHandler(
   withApi(async (event) => {
-    if (isInstalled()) {
+    if (await isInstalledAsync(event)) {
       throw new ApiError(400, '系统已安装，如需重新安装请清空 ADMIN_SECRET 环境变量')
     }
 

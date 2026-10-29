@@ -12,7 +12,9 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import type { H3Event } from 'h3'
 import { DATABASE_URL } from './db-config'
+import { getDb } from './db'
 
 interface RuntimeState {
   adminSecret: string
@@ -81,6 +83,52 @@ export function isInstalled(): boolean {
   const s = loadState()
   // 必须同时满足：XY_INSTALLED=true 且密钥已配置（确保安装向导完整执行）
   return s.installed && Boolean(s.adminSecret && s.jwtSecret)
+}
+
+/**
+ * 密钥兜底加载：环境变量未注入密钥时（Cloudflare Pages 无 .env、控制台未配置
+ * XY_ADMIN_SECRET/XY_JWT_SECRET），从 system_settings 读取随数据入库的密钥回填
+ * 运行时状态。数据文件即部署真源 —— CI 把本地 SQLite 全量导入 D1 时密钥随行。
+ * 首次成功加载后回填 _state 单例，后续调用零开销。
+ */
+let _secretsLoaded = false
+export async function ensureSecrets(event?: H3Event): Promise<void> {
+  const s = loadState()
+  if (_secretsLoaded || (s.jwtSecret && s.adminSecret)) return
+  try {
+    const db = await getDb(event)
+    const rows = await db.all<{ key_name: string; value: string }>(
+      "SELECT key_name, value FROM system_settings WHERE key_name IN ('xy_jwt_secret', 'xy_admin_secret')",
+    )
+    for (const r of rows) {
+      if (!r.value) continue
+      if (r.key_name === 'xy_jwt_secret' && !s.jwtSecret) s.jwtSecret = r.value
+      if (r.key_name === 'xy_admin_secret' && !s.adminSecret) s.adminSecret = r.value
+    }
+    _secretsLoaded = true
+  } catch {
+    // 库未就绪/表不存在：静默跳过（不置缓存），下次调用重试
+  }
+}
+
+/**
+ * 安装状态判定（数据真源）：环境变量快路径之外，库中存在可用管理员账号即视为
+ * 已安装。CI 把本地 SQLite（含 admin 用户）全量导入 D1 后，线上无需依赖
+ * XY_INSTALLED 注入即可直接进入登录流程 —— 安装与否由数据说话，而非人工补环境变量。
+ * 仅缓存肯定结果（管理员存在是稳态）；库未就绪时保持未安装判定，下次请求重试。
+ */
+let _dbInstalled = false
+export async function isInstalledAsync(event?: H3Event): Promise<boolean> {
+  if (isInstalled()) return true
+  if (_dbInstalled) return true
+  try {
+    const db = await getDb(event)
+    const row = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND is_active = 1')
+    if (row && Number(row.n) > 0) _dbInstalled = true
+  } catch {
+    // 库未就绪/绑定缺失：保持未安装，不缓存
+  }
+  return _dbInstalled
 }
 
 function readEnvFile(): Record<string, string> {

@@ -3,7 +3,7 @@
  */
 export default defineEventHandler(
   withApi(async (event) => {
-    if (!isInstalled()) throw new ApiError(503, '系统未安装')
+    if (!(await isInstalledAsync(event))) throw new ApiError(503, '系统未安装')
     const body = await readBody(event)
     const { username, password } = body || {}
     if (!username || !password) throw new ApiError(400, '用户名和密码不能为空')
@@ -25,6 +25,8 @@ export default defineEventHandler(
       throw new ApiError(401, '用户名或密码错误')
     }
 
+    // signToken 前保证密钥就位(env 未注入时从 system_settings 兜底加载)
+    await ensureSecrets(event)
     const token = signToken({ userId: user.id, username: user.username, isAdmin: !!user.is_admin })
     setCookie(event, 'admin_token', token, {
       httpOnly: true,

@@ -14,11 +14,17 @@ const ALLOWED_PREFIXES = [
   '/favicon',
 ]
 
-export default defineEventHandler((event) => {
+export default defineEventHandler(async (event) => {
   const url = getRequestURL(event)
   const pathname = url.pathname
 
-  const installed = isInstalled()
+  // 数据真源判定: 环境变量之外, 库中存在可用管理员即视为已安装
+  // (CI 全量导入含 admin 用户的本地库后, 线上无需 XY_INSTALLED 注入)
+  const installed = await isInstalledAsync(event)
+  if (installed) {
+    // 保证 JWT/管理密钥就位(登录签发、鉴权校验依赖; env 未注入时从库兜底加载)
+    await ensureSecrets(event)
+  }
 
   if (!installed) {
     // 精确匹配或前缀匹配（前缀需以 / 分隔或以 . 分隔，如 /favicon.ico），避免 /install 误匹配 /installation

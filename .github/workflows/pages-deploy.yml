@@ -5,6 +5,17 @@
 # → prisma/*.db 探测; wrangler.toml 由本工作流按配置动态生成(仓库无需携带)
 # —— 复制两件套(pages-deploy.yml + deploy.config.js)到任何 Nuxt/Next 项目即可直接使用。
 # ============================================================================
+# v8.9.17 需求: D1 导入核验"本地 42 张 vs D1 43 张"失败修复(实跑日志复盘):
+#   ① 孤儿表根因: 原 DROP 清单从"本地 sqlite_master"生成 —— 只能删掉本地也存在的
+#      表; D1 中历史运行(早期 seed/schema 版本)留下的、本地已不存在的孤儿表永远
+#      清不掉, 全量重建后 D1 表数仍 > 本地 → 数量等式崩。现改为: 导入前先查 D1
+#      实际对象清单(table/view/trigger, 排除 sqlite_*/_cf_* 内部表与 _sync_meta),
+#      按 D1 侧清单生成 DROP —— 无论残留什么历史对象, 全部清空后重建。
+#   ② 核验升级: 数量等式(42 = 43-1)改为表名集合双向比对, 差集直接打印, 失败即知
+#      多了哪张/少了哪张, 不再玩数字游戏。
+#   ③ 时序修正: _sync_meta 哈希回写移到核验通过之后 —— 原时序"先回写后核验"在
+#      核验失败时留下"已同步"假标记, 下次运行哈希相等直接跳过导入, 孤儿表永无
+#      清理机会(自我锁死)。现核验失败不回写, 下次运行必然重走全量导入。
 # v8.9.16 需求: D1 全链路"哑火"修复(xianyu-admin 实测: CI 全绿但 D1 关闭/
 #   数据库从未创建/线上跳 /install)。三个根因全部从源头移除, 不留任何垫片:
 #   ① 契约断裂(致命): "Read deploy.config.js" 仍读旧契约 database 布尔字段,
@@ -919,8 +930,9 @@ jobs:
         # 该文件就是 D1 的数据真源(与上方 schema/seed 两步门控互斥, 二选一):
         #   ① sha256(本地 .dump 内容) = 逻辑内容哈希(免疫 WAL 字节抖动);
         #   ② 与 D1 _sync_meta 回写的上次导入哈希比对 → 一致 = 无改动, 零写入跳过;
-        #   ③ 有改动/首次导入: 删旧对象 + .dump 全量重建 + 回写新哈希;
-        #   ④ 导入后按表数量核验, 失败 fail hard(发布成功 = 数据就绪, 与 schema/seed 口径一致)。
+        #   ③ 有改动/首次导入: 按 D1 实际对象清单清空(v8.9.17) + .dump 全量重建;
+        #   ④ 导入后按表名集合双向核验(v8.9.17), 通过才回写哈希, 失败 fail hard
+        #      (发布成功 = 数据就绪, 与 schema/seed 口径一致)。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS == 'true'
         run: |
           # ① 本地逻辑内容哈希(过滤 PRAGMA/事务包裹行, 与导入 SQL 同源)
@@ -945,33 +957,48 @@ jobs:
             echo "D1 无同步记录(首次导入) → 执行全量导入"
           fi
 
-          # ③ 组装导入 SQL: 删旧对象(视图/表/触发器) + .dump 全量重建。本库无外键
-          #    声明无依赖顺序问题; 过滤 PRAGMA/BEGIN/COMMIT —— D1 逐语句自动提交,
-          #    sqlite .dump 的事务包裹在 D1 会报 cannot start a transaction
+          # ③ 生成 DROP 清单 —— 从 D1 实际对象(v8.9.17, 关键修正): 原清单取自本地
+          #    sqlite_master, D1 中历史孤儿表(本地已不存在的旧 seed/schema 对象)永远
+          #    清不掉, 导致"本地 42 vs D1 43"核验失败。现按 D1 sqlite_master 现状
+          #    逐对象生成 DROP; 排除 sqlite_* / _cf_* 内部对象与 _sync_meta 门控表。
+          D1_OBJECTS=$(npx wrangler d1 execute "$D1_NAME" --remote --json \
+            --command "SELECT type, name FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta'" 2>/dev/null || true)
+          DROP_SQL=$(echo "$D1_OBJECTS" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[] | "DROP \(.type | ascii_upcase) IF EXISTS \"\(.name | gsub("\""; "\"\""))\";"' 2>/dev/null || true)
+          DROP_COUNT=$(echo "$DROP_SQL" | grep -c . || true)
+          echo "D1 现有用户对象: ${DROP_COUNT} 个 → 全部 DROP 后按本地库重建"
+
+          # ④ 组装导入 SQL: DROP 清单 + .dump 全量重建。本库无外键声明无依赖顺序
+          #    问题; 过滤 PRAGMA/BEGIN/COMMIT —— D1 逐语句自动提交, sqlite .dump
+          #    的事务包裹在 D1 会报 cannot start a transaction
           IMPORT_SQL=/tmp/d1-import.sql
           {
-            sqlite3 "$DB_FILE_PATH" "SELECT 'DROP VIEW IF EXISTS \"' || replace(name, '\"', '\"\"') || '\";' FROM sqlite_master WHERE type = 'view';"
-            sqlite3 "$DB_FILE_PATH" "SELECT 'DROP TABLE IF EXISTS \"' || replace(name, '\"', '\"\"') || '\";' FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';"
-            sqlite3 "$DB_FILE_PATH" "SELECT 'DROP TRIGGER IF EXISTS \"' || replace(name, '\"', '\"\"') || '\";' FROM sqlite_master WHERE type = 'trigger';"
+            echo "$DROP_SQL"
             sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;'
           } > "$IMPORT_SQL"
           echo "导入 SQL: $(wc -l < "$IMPORT_SQL") 行 / $(grep -c '^CREATE TABLE' "$IMPORT_SQL") 张表"
           npx wrangler d1 execute "$D1_NAME" --remote --file="$IMPORT_SQL"
           rm -f "$IMPORT_SQL"
 
-          # ④ 回写新哈希(下次运行据此判断"db 是否有改动")
-          npx wrangler d1 execute "$D1_NAME" --remote \
-            --command "CREATE TABLE IF NOT EXISTS _sync_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO _sync_meta (key, value) VALUES ('db_dump_sha256', '$LOCAL_SHA') ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
-
-          # ⑤ 导入核验: 表数量一致(本地表数 = D1 表数 - _sync_meta)
-          LOCAL_TABLES=$(sqlite3 "$DB_FILE_PATH" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+          # ⑤ 导入核验(v8.9.17): 本地与 D1 表名集合双向比对 —— 集合相等是比数量
+          #    相等更强的保证, 差集直接打印, 失败立知多了/少了哪张表
+          sqlite3 "$DB_FILE_PATH" "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name" > /tmp/local-tables.txt
           VERIFY_OUT=$(npx wrangler d1 execute "$D1_NAME" --remote --json \
-            --command "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != '_sync_meta'" 2>/dev/null || true)
-          D1_TABLES=$(echo "$VERIFY_OUT" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[0].n // empty' 2>/dev/null || true)
-          if [ "$D1_TABLES" != "$LOCAL_TABLES" ]; then
-            echo "::error::D1 导入核验失败: 本地 ${LOCAL_TABLES} 张表, D1 ${D1_TABLES:-'(查询失败)'} 张。"
+            --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta' ORDER BY name" 2>/dev/null || true)
+          echo "$VERIFY_OUT" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[].name' 2>/dev/null | sort > /tmp/d1-tables.txt
+          LOCAL_TABLES=$(wc -l < /tmp/local-tables.txt | tr -d ' ')
+          D1_TABLES=$(wc -l < /tmp/d1-tables.txt | tr -d ' ')
+          if ! diff -u /tmp/local-tables.txt /tmp/d1-tables.txt > /tmp/tables-diff.txt 2>&1; then
+            echo "::error::D1 导入核验失败: 本地 ${LOCAL_TABLES} 张表, D1 ${D1_TABLES} 张表, 表名集合不一致。差异(- 本地有/D1 缺, + D1 多出)如下:"
+            cat /tmp/tables-diff.txt
             exit 1
           fi
+          echo "✓ 导入核验通过: ${D1_TABLES} 张表名集合与本地完全一致"
+
+          # ⑥ 回写新哈希(v8.9.17 时序修正: 核验通过后才写) —— 原时序在核验失败时
+          #    留下"已同步"假标记, 下次运行哈希相等直接跳过导入, 残留永无清理机会。
+          #    现核验失败即退出不回写, 下次运行必然重走全量导入。
+          npx wrangler d1 execute "$D1_NAME" --remote \
+            --command "CREATE TABLE IF NOT EXISTS _sync_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO _sync_meta (key, value) VALUES ('db_dump_sha256', '$LOCAL_SHA') ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
           echo "✓ D1 同步完成: ${D1_TABLES} 张表全部就位(sha256=${LOCAL_SHA:0:16}… 已回写)"
 
       - name: Deploy realtime hub Worker (Durable Objects)

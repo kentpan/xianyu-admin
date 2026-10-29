@@ -18,6 +18,11 @@ export default {
   // ── 自定义环境变量注入(可选) ─────────────────────────────
   // 同仓/跨仓调用都会自动注入到 Cloudflare: Workers = [vars] + secret put; Pages = env_vars(production+preview)
   vars: {
+    // 安装完成标志(与本地 .env 语义一致) —— 运行时 isInstalled() 只认环境变量
+    // (XY_INSTALLED/ADMIN_SECRET/JWT_SECRET), 不查数据库; 缺它部署后必跳 /install。
+    // 兼容日期 >=2025-04-01 时 workerd 自动把 Pages env vars 桥接进 process.env,
+    // server/utils/config.ts 的 loadState() 即可读到。
+    XY_INSTALLED: 'true',
     // APP_NAME: 'xianyu-admin', // 普通变量(明文, 控制台可见); 数字/布尔自动转字符串, 对象/数组自动 JSON.stringify
   },
   secrets: {
