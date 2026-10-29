@@ -5,6 +5,148 @@
 # 按配置动态生成(仓库无需携带) —— 复制两件套(pages-deploy.yml +
 # deploy.config.js)到任何 Nuxt/Next 项目即可直接使用。
 # ============================================================================
+# v8.9.13 需求: 边缘实时通道(Durable Objects)部署发布流程 —— ① deploy.config.js
+#   新增 realtime 块(enabled/workerName/className); ② Pages 形态: 由仓库
+#   edge-realtime/index.js 配套 Worker 独立承载 DO hub(Pages 平台限制: 项目内不能
+#   创建/部署 DO 类, 官方文档 "You cannot create and deploy a Durable Object within
+#   a Pages project"), 本工作流自动部署该 Worker(含 [[migrations]] new_sqlite_classes
+#   免费计划要求 + XY_JWT_SECRET 注入), 并把 REALTIME_DO 绑定(script_name)写入
+#   站点 wrangler.toml 随部署生效(Pages 绑定官方配置通道 = wrangler 配置文件/
+#   Dashboard); ③ Nuxt+workers 形态: 构建切换 cloudflare-durable 预设自承载
+#   $DurableObject(绑定/迁移同步写入生成的 wrangler.toml); ④ 部署后冒烟校验
+#   /api/system/status realtime=='ws'(发布成功 = DO 就绪, 绑定丢失照常 fail);
+#   ⑤ 鉴权与站点同源: 配套 Worker 复用 JWT_SECRET(XY_JWT_SECRET), WS 升级在站点
+#   鉴权后转发, 浏览器始终只连站点域名(同源, 前端零改动)。实时关闭时全链路跳过,
+#   行为与 v8.9.12 完全一致。
+# v8.9.12 需求: 数据库文件路径统一 —— ① 本地 SQLite 数据库文件的路径/名称唯一
+#   真源 = .env 的 DATABASE_URL(file:./avatar-nuxt.db → prisma/avatar-nuxt.db,
+#   与本地运行/构建期/server/utils/db.ts 三方一致), 新增 "Resolve database file
+#   from .env" 步骤解析并导出 DATABASE_URL_VALUE, 全工作流各步骤( npm ci/
+#   prisma generate/构建期占位)统一引用该变量, 不再散落硬编码; ② deploy.config.js
+#   的 database 恢复布尔语义: true = 执行 D1 操作(建库/建表/推送 seed/绑定注入),
+#   false/缺失 = 跳过全部 D1 步骤仅部署代码 —— 不再携带数据库文件路径;
+#   ③ 本地运行库文件重命名为 prisma/avatar-nuxt.db(与项目同名, 消除 avatar.db
+#   与 avatar-nuxt.db 两套名称并存的混乱)。
+# v8.9.11 需求1: 补齐 Nuxt → Workers 部署路径(此前仅 Next 有 workers 类型) ——
+#   Nuxt 按 deployType 选择 Nitro preset: pages → cloudflare-pages(dist/);
+#   workers → cloudflare_module(.output/server/index.mjs + .output/public/)。
+#   wrangler.toml(main/assets/D1/KV) 仍由 CI 动态生成; "Configure secrets on
+#   Worker" 通用化为 workers 类型共用(配置类步骤与框架无关); Nuxt 专属步骤
+#   (Pages secrets/Deploy)补 DEPLOY_TYPE=='pages' 门控防误执行。Nuxt 不再
+#   固定部署 Pages, deployType: 'pages'|'workers' 对两种框架同等生效。
+# v8.9.10 需求1/2: ① database 语义升级为「本地 SQLite 数据库文件路径」——
+#   deploy.config.js 配置 database: 'prisma/avatar.db'(路径) → 执行全部 D1 数据库
+#   步骤(建库/schema 建表/seed 推送/绑定注入); database: '' 或字段缺失 → 跳过全部
+#   D1 步骤仅部署站点代码(兼容旧布尔 true/false 写法)。schema/seed 探测优先
+#   database 路径所在目录; d1Name 留空自动回落 projectName; KV 与此开关独立。
+#   ② wrangler.toml 全面动态生成 —— 三条部署路径(Next→Pages/Next→Workers/
+#   Nuxt→Pages)的 wrangler.toml 均由本工作流按 deploy.config.js 现场生成
+#   (项目名/D1/KV/vars), 仓库无需携带静态 wrangler.toml。
+#   ③ Read deploy.config.js 内联 data:URL ESM 解析 —— 不依赖 scripts/
+#   read-deploy-config.mjs 等任何配套脚本, 无 "type":"module" 的项目也能解析
+#   (两件套自包含)。④ Create D1/KV 移除 continue-on-error(fail hard 与
+#   schema/seed 一致 —— 资源创建失败照常发布 = 线上空库/降级)。
+# v8.9.7 修正: 移除 `wrangler pages deploy` 的 --keep-vars(该参数不存在于 pages
+#   deploy 命令, 属于 Workers 的 `wrangler deploy` —— v8.9.6 CI 实测报
+#   "Unknown arguments: keep-vars, keepVars" 拦死整个部署)。源码级核验
+#   (wrangler 4.133.0 dist/cli.js): pages deploy 的 upload/deploy 模块对已存在项目
+#   零 PATCH/零 env_vars 处理 —— 既不清除也不覆盖项目 env_vars, API PATCH 注入的
+#   vars 无需任何 flag 对抗(2026-09 事故"反向同步清除 vars"归因有误, 真因见
+#   Detect 步骤注释)。Detect/Verify 步骤输出增加脱敏(PROXY_MODE 含 apiKey,
+#   配在 Variables 时 GitHub 不自动打码)与来源标注, 新增部署前 env_vars 回读校验。
+# v8.9.2 需求2: 部署类型可配置 —— deploy.config.js 新增 deployType: 'pages'|'workers',
+# 并支持 GitHub 仓库 Variables 配置 DEPLOYTYPE=workers|pages 覆盖(优先级:
+# repo Variable DEPLOYTYPE > deploy.config.js deployType > 默认 pages)。
+# 两种部署类型综合于本工作流(Next.js 路径):
+#
+#   ┌──────────────┬────────────────────────────────────────────────────────────┐
+#   │ deployType    │ Next.js 编译部署链路                                        │
+#   ├──────────────┼────────────────────────────────────────────────────────────┤
+#   │ 'pages'       │ OpenNext → 自研适配层 pages-adapter/worker.ts               │
+#   │ (v8.9.1 起)   │ → dist-pages/(高级模式 _worker.js + 静态资源)               │
+#   │               │ → `wrangler pages deploy dist-pages`(*.pages.dev)           │
+#   │               │   PROXY_MODE/LANGUAGE/ADMIN_SECRET/JWT_SECRET 经 Pages API  │
+#   │               │   PATCH 注入项目 env_vars; D1 建表/种子: server/*.sql        │
+#   ├──────────────┼────────────────────────────────────────────────────────────┤
+#   │ 'workers'     │ OpenNext(.open-next/worker.js + assets/)                    │
+#   │ (v8.9.0 原有) │ → `wrangler deploy`(*.workers.dev)                          │
+#   │               │   ADMIN_SECRET/JWT_SECRET/PROXY_MODE 经 wrangler secret put │
+#   │               │   写入(PROXY_MODE 含 apiKey, 以 secret 注入不进 [vars]);     │
+#   │               │   D1 建表/种子: server/*.sql(共用步骤)                      │
+#   └──────────────┴────────────────────────────────────────────────────────────┘
+#
+#   自研适配层(pages-adapter/worker.ts, 仅 pages 类型)职责 —— 与 Workers 方案的本质差异:
+#     ① proxy 模式(需求5): 以 Pages Functions 身份把**所有 /api 接口**代理透传到
+#        PROXY_MODE 目标(Bearer 注入/302 透传/set-cookie 透传/结构化 502 诊断),
+#        不经过 Next 内部 rewrites; 管理面 /api/admin* 直接 404(与 middleware 同口径)。
+#     ② 其余请求(页面 SSR/静态资源/非 proxy 的本地 /api)原样转交 OpenNext handler。
+#     wrangler 对 _worker.js 的打包(esbuild + unenv hybrid-nodejs_compat)与 Workers
+#     部署完全同一管线; .open-next 位于部署目录之外 → 服务器代码不会泄漏为静态资源。
+#     workers 类型则由 OpenNext 产物 worker.js 直出(经 next.config 构建期 rewrites
+#     → /api-forward 运行时代理), 无需适配层。
+#
+# v8.9.8 修正(需求1): KV/D1 建库建表 + seed 推送与框架完全无关, 只跟配置相关 ——
+#   原 "Apply D1 schema" / "Seed D1 database" 被 FRAMEWORK=='next' 门控拦死,
+#   Nuxt 项目发布后 D1 永远是空表(管理后台空数据的直接根因)。现已移除所有
+#   资源/配置类步骤的框架门控, 仅编译/部署发布链路按框架分支:
+#
+#   ┌─────────────┬──────────────────────────────────────────────────────────┐
+#   │ 检测到文件   │ 编译部署链路                                              │
+#   ├─────────────┼──────────────────────────────────────────────────────────┤
+#   │ nuxt.config │ Nuxt + Nitro → Pages: cloudflare-pages preset → dist/       │
+#   │ .js|.ts     │   (wrangler pages deploy) | Workers: cloudflare_module      │
+#   │             │   preset → .output/(server/index.mjs + public/,           │
+#   │             │   wrangler deploy) —— 按 deployType(见 v8.9.11)           │
+#   ├─────────────┼──────────────────────────────────────────────────────────┤
+#   │ next.config │ Next.js + OpenNext(@opennextjs/cloudflare)                │
+#   │ .js|.ts     │ → Cloudflare Pages 或 Workers(按 deployType, 见上表)      │
+#   └─────────────┴──────────────────────────────────────────────────────────┘
+#   D1 建表/种子文件自动探测(顺序与框架无关, 只看项目携带的文件):
+#   schema: prisma/d1-schema.sql | server/schema.sql
+#   seed:   prisma/seed.sql       | server/seed.sql
+#   找不到即报错终止(绝不静默跳过导致空库)。
+#
+# 1. 包管理器: npm(setup-node@v4 + npm ci, package-lock.json 已提交 → 可复现安装)
+# 2. 数据库自动适配: 应用侧数据层(项目自带)按运行环境自动选择驱动 ——
+#      - Cloudflare Workers/Pages: D1 绑定(wrangler.toml/Pages 项目配置注入) →
+#        D1 REST(CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_D1_DATABASE_ID + CLOUDFLARE_API_TOKEN)
+#        → KV → 内存库(无数据库降级, 站点仍可运行);
+#      - Node.js(本地/standalone): DATABASE_URL=mysql://... → MySQL(mysql2);
+#        否则 node:sqlite(Node≥22.5, 本地 SQLite 文件) → 内存降级。
+#    D1 建表/种子: database: true(deploy.config.js 布尔开关)即执行, 与框架无关
+#    —— schema(IF NOT EXISTS) + seed(INSERT OR IGNORE) 幂等可重复执行, 失败即
+#    终止部署(发布成功 = 数据就绪, 不再静默空库)。
+# 3. 环境变量: ADMIN_SECRET / JWT_SECRET / REMOTE_WS_URL / NEXT_PUBLIC_WS_URL
+#    (NEXT_PUBLIC_* 在构建期内联进浏览器包; REMOTE_WS_URL 兼容旧名 GEMTD_WS_URL secret)。
+#
+# v8.9.1 需求4: PROXY_MODE / LANGUAGE 注入 vars 环境变量 —— 两级注入:
+#   ① 构建期: GitHub Variables(vars.PROXY_MODE / vars.LANGUAGE, 优先)或仓库 .env
+#      → next build 环境变量(rewrites/i18n 构建期内联);
+#   ② 运行期: pages 类型经 Pages API PATCH 到项目 deployment_configs.production.env_vars
+#      (PROXY_MODE / LANGUAGE / NODE_ENV = plain_text; ADMIN_SECRET / JWT_SECRET =
+#      secret_text); workers 类型经 `wrangler secret put` 写入(见下)。
+#
+# v8.8.7 需求2: LANGUAGE / PROXY_MODE 均支持 GitHub Variables 覆盖仓库 .env:
+#   仓库 Settings → Secrets and variables → Actions → Variables 添加/修改
+#   LANGUAGE(auto/cn/en/zh) 与 PROXY_MODE(apiKey@https://proxy.example.com 形式) 即可,
+#   优先级: repo Variable > .env 文件; 都未配置时 LANGUAGE=auto(导航栏语言切换)。
+#
+# v8.8.7 需求1: 代理透传模式(PROXY_MODE 开启)= 纯前台 + 统一代理API:
+#   构建前移除 server/(存储引擎独立部署副本)与 db/(本地数据库), 构建产物仅含
+#   前台页面 + Functions /api/* 代理透传链路; 管理面整体关闭(/admin* 与
+#   /api/admin* 直接 404), D1/KV 不创建不绑定。
+#
+# v8.3.1 需求6/7:
+#   - PROXY_MODE 透传模式(.env: apiKey@https://proxy.example.com | https://proxy.example.com):
+#     开启时 /api/* 整体透传到代理服务器, 本机不读写任何数据库 ——
+#     本工作流自动跳过 D1/KV 创建与 schema/seed 应用(远端代理库由代理站自己维护),
+#     仅部署站点本体。
+#   - PORT=3000: 本地/standalone 启动端口(.env → package.json dev/start 脚本 ${PORT:-3000});
+#     Cloudflare 部署与端口无关(workerd 托管), 无需配置。
+#   - PLATFORM=空|server: 存储平台开关; =server 时服务端运行时自动检测
+#     Node / Cloudflare Workers-Pages edge 环境(src/lib/storage runtime-env 自动适配
+#     D1/REST/KV/MySQL/node:sqlite), 应用侧零配置。
+#
 # 需要在 GitHub 仓库 Settings → Secrets and variables → Actions 配置:
 #   Secrets(必填):
 #     CLOUDFLARE_API_TOKEN  部署权限(Pages:Edit + Workers Scripts:Edit, 建议含 D1:Edit)
@@ -436,8 +578,8 @@ jobs:
       - name: Generate Prisma Client (only when project uses Prisma)
         # v8.9.14 根因护栏: 原实现无条件 npx prisma generate, 仅适用于 package.json
         # 携带 prisma/@prisma/client 的项目(npx 命中 npm ci 装好的本地 CLI)。
-        # 依赖里没有 Prisma 的项目(如 xianyu-admin: node:sqlite 原生驱动, prisma/
-        # 目录仅存放 .db 与 d1-schema.sql/seed.sql)本地无 CLI, npx 会静默改拉
+        # 依赖里没有 Prisma 的项目(如本项目: node:sqlite 原生驱动, prisma/ 目录
+        # 仅存放 .db 与 d1-schema.sql/seed.sql)本地无 CLI, npx 会静默改拉
         # npm 远程版 —— 当前 latest 已是 prisma@8.0.0-rc.28, 该版本 CLI 不再注册
         # generate 命令, 直接炸出 [CLI.UNKNOWN_COMMAND] exit 2。
         # 故先探测: 依赖含 prisma/@prisma/client 且存在 schema.prisma 才执行。
