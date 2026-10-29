@@ -312,6 +312,27 @@ jobs:
           echo "REALTIME_ENABLED_RAW=$(read_cfg realtime.enabled | xargs || true)" >> $GITHUB_ENV
           echo "REALTIME_WORKER_CFG=$(read_cfg realtime.workerName | xargs || true)" >> $GITHUB_ENV
           echo "REALTIME_CLASS_CFG=$(read_cfg realtime.className | xargs || true)" >> $GITHUB_ENV
+          # v8.9.15: vars 块整体导出(扁平化: 标量转字符串/对象数组 JSON.stringify,
+          # 与 vars 注释契约一致), 供 "Configure Pages project env vars" 展开注入
+          # —— 此前注释承诺"自动注入"但链路从未实现(XY_INSTALLED 缺失 → 跳 /install)。
+          CFG_VARS_JSON=$(node -e '
+            const fs = require("node:fs");
+            const src = fs.readFileSync("deploy.config.js", "utf8");
+            const url = "data:text/javascript;base64," + Buffer.from(src).toString("base64");
+            import(url).then((m) => {
+              const vars = (m.default && m.default.vars) || {};
+              const out = {};
+              for (const [k, v] of Object.entries(vars)) {
+                if (v === null || v === undefined) continue;
+                out[k] = typeof v === "object" ? JSON.stringify(v) : String(v);
+              }
+              console.log(JSON.stringify(out));
+            }).catch((e) => { console.error("::error::解析 deploy.config.js vars 失败: " + e.message); process.exit(1); });
+          ')
+          echo "CFG_VARS_JSON<<CFG_VARS_JSON_EOF" >> $GITHUB_ENV
+          echo "$CFG_VARS_JSON" >> $GITHUB_ENV
+          echo "CFG_VARS_JSON_EOF" >> $GITHUB_ENV
+          echo "✅ vars 块已导出: $CFG_VARS_JSON"
           echo "::notice::配置: project=$PROJECT_NAME, database=${RAW_DB_ORIG:-'(未配置)'}, d1=$D1_NAME, kv=$KV_NAME, accountId=$CONFIG_ACCOUNT_ID, deployType=$CONFIG_DEPLOY_TYPE, realtime=$REALTIME_ENABLED_RAW"
 
       - name: Validate projectName
@@ -1035,6 +1056,20 @@ jobs:
             NODE_ENV: plain('production'),
             LANGUAGE: plain(process.env.LANGUAGE_RAW || 'auto'),
           };
+          // v8.9.15: deploy.config.js vars 块展开注入(修复"承诺注入但链路缺失",
+          // XY_INSTALLED 等项目自定义键由此到达运行时)。保留名跳过(下方硬编码
+          // 注入值优先), 键名不合规跳过, 解析失败仅告警不阻塞部署。
+          try {
+            const cfgVars = JSON.parse(process.env.CFG_VARS_JSON || '{}');
+            const RESERVED = ['DB', 'KV', 'ASSETS', 'AI', 'NODE_ENV', 'PROXY_MODE', 'ADMIN_SECRET', 'JWT_SECRET', 'AI_API_KEY', 'REMOTE_WS_URL', 'CLOUDFLARE_D1_DATABASE_ID', 'REALTIME_DO', 'REALTIME_HUB'];
+            for (const [k, v] of Object.entries(cfgVars)) {
+              if (RESERVED.includes(k)) { console.log(`::warning::deploy.config.js vars.${k} 为系统保留名, 跳过注入`); continue; }
+              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) { console.log(`::warning::deploy.config.js vars.${k} 键名不合规, 跳过注入`); continue; }
+              envVars[k] = plain(String(v));
+            }
+          } catch (e) {
+            console.log(`::warning::CFG_VARS_JSON 解析失败(vars 不注入): ${e.message}`);
+          }
           // PROXY_MODE: 含 apiKey 的完整透传配置(未开启时注入 'false' 显式关闭)
           envVars.PROXY_MODE = plain(process.env.PROXY_MODE_RAW || 'false');
           // 必填 secrets(上方 Verify 步骤已保证非空)
