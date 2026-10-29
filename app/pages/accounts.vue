@@ -299,12 +299,30 @@
           <p v-if="qrAccountNick" class="text-xs text-slate-400 mt-1">{{ qrAccountNick }}</p>
         </div>
         <!-- Step 4: verification_required -->
-        <div v-else-if="qrState === 'verification_required'" class="text-center py-6">
+        <div v-else-if="qrState === 'verification_required'" class="text-center">
           <div class="w-16 h-16 mx-auto rounded-full bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center text-amber-500 mb-3">
             <Icon name="alert" class="text-3xl" />
           </div>
-          <p class="text-base font-semibold text-slate-800 dark:text-slate-100">需要人脸验证</p>
-          <p class="text-sm text-slate-500 mt-1">该账号触发了风控，请在手机端完成人脸验证后重试</p>
+          <p class="text-base font-semibold text-slate-800 dark:text-slate-100">登录需身份核验</p>
+          <p class="text-sm text-slate-500 mt-1">账号已通过实人认证（一次性资质无法重复发起），当前是登录风控的二次核验</p>
+          <template v-if="qrVerifyUrl">
+            <div class="mt-4 inline-block p-3 bg-white rounded-xl border border-slate-200 dark:border-slate-700">
+              <img
+                :src="`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(qrVerifyUrl)}`"
+                alt="身份核验二维码"
+                class="w-56 h-56"
+              />
+            </div>
+            <p class="text-sm text-slate-500 dark:text-slate-400 mt-3">
+              请用 <span class="font-medium text-slate-700 dark:text-slate-200">闲鱼 App</span> 扫描上方二维码，在 App 内按页面提示完成核验（滑块/人脸以页面实际展示为准）
+            </p>
+            <p class="text-sm text-slate-400 mt-1">核验链接有时效请尽快完成；完成后点「重新生成」再扫登录码</p>
+            <div class="mt-3 flex items-center gap-2 max-w-md mx-auto">
+              <div class="flex-1 text-xs text-slate-400 break-all font-mono bg-slate-50 dark:bg-slate-800/50 p-2 rounded text-left">{{ qrVerifyUrl }}</div>
+              <button class="btn-secondary shrink-0" @click="copyVerifyUrl">复制链接</button>
+            </div>
+          </template>
+          <p v-else class="text-sm text-slate-500 mt-1">本次未拿到核验链接；可稍后重试，或改用「修改密码」流程触发强身份核验后重新扫码</p>
         </div>
         <!-- Step 5: expired/error -->
         <div v-else class="text-center py-6">
@@ -387,6 +405,7 @@ const qrUrl = ref('')
 const qrUrlFallback = ref('')
 const qrSessionKey = ref('')
 const qrError = ref('')
+const qrVerifyUrl = ref('')
 const qrAccountNick = ref('')
 let qrPollTimer: ReturnType<typeof setInterval> | null = null
 const verifyingIds = ref<Set<string>>(new Set())
@@ -653,6 +672,7 @@ async function openQrLogin() {
   qrUrlFallback.value = ''
   qrSessionKey.value = ''
   qrError.value = ''
+  qrVerifyUrl.value = ''
   qrAccountNick.value = ''
   try {
     const r = await startQrLogin()
@@ -687,6 +707,7 @@ function startQrPoll() {
         reload()
       } else if (st === 'verification_required') {
         qrState.value = 'verification_required'
+        qrVerifyUrl.value = r.iframeRedirectUrl || ''
         stopQrPoll()
       } else if (st === 'expired') {
         qrState.value = 'expired'
@@ -708,6 +729,16 @@ function onQrClose() {
 
 function onQrImgError() {
   qrUrlFallback.value = qrUrl.value
+}
+
+async function copyVerifyUrl() {
+  if (!qrVerifyUrl.value) return
+  try {
+    await navigator.clipboard.writeText(qrVerifyUrl.value)
+    toast.success('核验链接已复制，可在手机浏览器打开完成核验')
+  } catch {
+    toast.error('复制失败，请手动长按选择链接复制')
+  }
 }
 
 async function verifyCookie(a: Account) {

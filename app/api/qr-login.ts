@@ -10,6 +10,8 @@ export interface QrLoginStatusResponse {
   xianyuUid?: string
   xianyuNick?: string
   cookieValue?: string
+  /** 风控二次核验页链接 (passport 官方页, 手机闲鱼 App 内打开可带登录态完成核验) */
+  iframeRedirectUrl?: string
 }
 
 export function startQrLogin() {
