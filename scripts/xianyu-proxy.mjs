@@ -1125,6 +1125,9 @@ async function apiCall(url, body, timeoutMs = 30_000) {
     headers: {
       Authorization: `Bearer ${ENGINE_TOKEN}`,
       'Content-Type': 'application/json',
+      // 声明拉取能力: 后台对聊天/交易事件快速 ACK (占位后挂后台决策), 本代理按 event_id 轮询回收
+      // 决策不再阻塞上报响应, 消灭「AI 慢 → 上报超时 → 回队重试 → 重复决策」风暴
+      'x-engine-pull': '1',
     },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(timeoutMs),
@@ -1171,10 +1174,13 @@ async function flushReports() {
     accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state, detail: s.detail || '' })),
   }
   try {
-    // 15s 超时 (链路抖动时更快进入重试); 事件带 event_id 幂等, 后台重放首次决策, 重试绝不重复回复
+    // 15s 超时 (仅防链路异常); 快速 ACK 模式下后台秒回, 决策 (AI 可达 20~30s) 由 pullActions 异步回收;
+    // 旧版后台无拉取协议时同步返回动作, 本函数同样兼容 (响应无 pending 即完事)
     const resp = await apiCall(EVENTS_URL, { status, events }, 15_000)
     const actions = Array.isArray(resp?.actions) ? resp.actions : []
     await executeActions(actions)
+    const pullIds = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
+    if (pullIds.length) await pullActions(pullIds, events)
   } catch (e) {
     if (e?.fatal) {
       log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
@@ -1188,6 +1194,39 @@ async function flushReports() {
       log(`上报失败: ${e?.message} — 事件已回队重试`)
       await sleep(3000)
     }
+    scheduleFlush(500)
+  }
+}
+
+/**
+ * 回收异步决策结果: 后台大脑 (AI/发货链) 完成前, 按 event_id 每 2.5s 轮询拉取,
+ * 动作随拉取响应返回后照常人化执行 (executedActions 按 log_id 去重, 重放绝不重发)。
+ * 占位超时被后台判失效 (expired) 或达拉取上限仍未完成 → 事件重新上报自愈。
+ */
+async function pullActions(ids, originEvents) {
+  let remaining = ids.slice()
+  for (let attempt = 0; attempt < 72 && remaining.length && !stopped; attempt++) {
+    await sleep(attempt === 0 ? 1200 : 2500)
+    let resp
+    try {
+      resp = await apiCall(EVENTS_URL, { pull: remaining }, 15_000)
+    } catch (e) {
+      if (e?.fatal) throw e
+      continue // 网络抖动继续拉, 拉取上限兜底
+    }
+    const actions = Array.isArray(resp?.actions) ? resp.actions : []
+    if (actions.length) await executeActions(actions)
+    const expired = Array.isArray(resp?.expired) ? resp.expired.map(String) : []
+    if (expired.length) {
+      log(`决策超时失效 ${expired.length} 个事件, 重新上报`)
+      reportQueue.unshift(...originEvents)
+      scheduleFlush(500)
+    }
+    remaining = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
+  }
+  if (remaining.length) {
+    log(`${remaining.length} 个事件决策未完成, 重新上报`)
+    reportQueue.unshift(...originEvents)
     scheduleFlush(500)
   }
 }

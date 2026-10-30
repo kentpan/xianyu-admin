@@ -574,10 +574,12 @@ const SCHEMA: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_apilog_key ON api_key_logs(api_key_id, id)`,
   // 引擎事件幂等去重: 远程代理在丢包链路上超时重试会重复上报同一事件,
   // 以 event_id 保证恰好处理一次; actions_json 保存首次决策的动作列表,
-  // 重试时原样重放 (不重算决策、不重复发送), 响应丢失也不再丢单
+  // 重试时原样重放 (不重算决策、不重复发送), 响应丢失也不再丢单。
+  // pending=1 且 actions_json='' 表示决策进行中 (快速 ACK 模式的占位, 拉取完成前不重放)
   `CREATE TABLE IF NOT EXISTS engine_event_dedup (
     event_id VARCHAR(80) PRIMARY KEY,
     actions_json TEXT DEFAULT '[]',
+    pending INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
 ]
@@ -759,6 +761,8 @@ const MIGRATIONS: string[] = [
     paused_until TIMESTAMP NOT NULL,
     PRIMARY KEY (cookie_id, chat_id)
   )`,
+  // 事件决策占位: 快速 ACK 模式下先占位再后台决策 (1=决策中; actions_json='' 未完成不重放)
+  `ALTER TABLE engine_event_dedup ADD COLUMN pending INTEGER DEFAULT 0`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

@@ -8,9 +8,16 @@
  *   - 上报: 账号连接状态 / 风控事件 / 解密后的聊天与交易消息 / 动作执行结果 (转发, 不决策)
  *   - 回收: 本后台大脑 (回复链/发货链) 决策出的动作列表, 代理按 delay_ms 人化执行
  *
- * 幂等: 代理在丢包链路上会超时重试, 同一事件可能重复上报。带 event_id 的事件以
- * engine_event_dedup 表去重: 首次处理即固化决策动作, 重试时原样重放 (不重算决策、
- * 不重复执行), 响应丢失也不再丢单。
+ * 两种决策模式 (按代理版本自动协商):
+ *   - 快速 ACK + 拉取 (新版代理, 请求带 `x-engine-pull: 1` 头): 聊天/交易事件先在
+ *     engine_event_dedup 原子占位 (pending=1) 立即应答, 大脑决策 (AI 外呼/卡券 API 可达
+ *     20~30s) 挂后台执行, 代理按 event_id 轮询 `pull` 回收动作。决策再慢也不会拖垮上报
+ *     请求, 消灭「上报超时→回队重试→重复决策」风暴。
+ *   - 内联决策 (旧版代理, 无头): 同步算完动作随响应返回 (原语义不变, 完全兼容)。
+ *
+ * 幂等: 事件带 event_id 以 engine_event_dedup 表去重 — 首次处理即固化决策动作,
+ * 重试/重报原样重放 (不重算决策、不重复执行)。占位后 3 分钟仍无决策结果 (进程中断)
+ * 则释放占位, 代理收到 expired 后重报自愈。
  *
  * Body:
  * {
@@ -22,15 +29,20 @@
  *       "order_id", "chat_id" },
  *     { "type": "risk",   "account": "xy_1", "event_id", "description" },
  *     { "type": "action_result", "account": "xy_1", "log_id", "ok", "error" }
- *   ]
+ *   ],
+ *   "pull": ["evt_1", ...]   // 新版代理: 拉取这些事件的决策结果 (快速 ACK 模式的回收通道)
  * }
- * Response: { "actions": [ { "type": "send_text"|"send_image", ... , "delay_ms", "log_id" } ] }
+ * Response: { "actions": [...], "pending": ["evt_2"], "expired": ["evt_3"] }
  */
+import type { H3Event } from 'h3'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from '../../utils/xianyu/brain'
 import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from '../../utils/xianyu/im-store'
 import { dispatchNotify } from '../../utils/notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from '../../utils/xianyu/publisher'
 import { consumeRate } from '../../utils/rate-limit'
+
+/** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
+const PENDING_TTL_MS = 3 * 60_000
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -43,6 +55,13 @@ export default defineEventHandler(
     }
 
     const body = await readBody(event) || {}
+
+    // 新版代理的决策结果拉取通道 (快速 ACK 模式的回收)
+    if (Array.isArray(body.pull) && body.pull.length) {
+      const pullIds = body.pull.slice(0, 100).map((v: any) => String(v || '').slice(0, 80)).filter(Boolean)
+      if (pullIds.length) return ok(await pullDecisionActions(event, engine, pullIds))
+    }
+
     const events: any[] = Array.isArray(body.events) ? body.events.slice(0, 100) : []
     const actions: EngineAction[] = []
 
@@ -80,6 +99,10 @@ export default defineEventHandler(
       }
     }
 
+    // 快速 ACK 模式: 新版代理声明拉取能力 → 决策挂后台; 旧版代理 → 内联决策 (原语义)
+    const pullMode = (getHeader(event, 'x-engine-pull') || '') === '1'
+    const pending: string[] = []
+
     for (const ev of events) {
       const account = String(ev?.account || '')
       if (!account) continue
@@ -113,59 +136,9 @@ export default defineEventHandler(
 
         if (ev.type !== 'chat' && ev.type !== 'system' && ev.type !== 'risk') continue
 
-        // 事件幂等去重: 已处理过的事件直接重放首次动作 (不重算不重发)
-        const eventId = String(ev.event_id || '').slice(0, 80)
-        if (eventId) {
-          const seen = await db
-            .get<{ actions_json: string }>('SELECT actions_json FROM engine_event_dedup WHERE event_id = ?', [eventId])
-            .catch(() => null)
-          if (seen) {
-            try {
-              const stored = JSON.parse(seen.actions_json || '[]')
-              if (Array.isArray(stored)) actions.push(...stored)
-            } catch {}
-            continue
-          }
-        }
-
-        let eventActions: EngineAction[] = []
-        if (ev.type === 'chat') {
-          const parsed = {
-            kind: 'chat' as const,
-            chatId: String(ev.chat_id || ''),
-            senderUserId: String(ev.sender_user_id || ''),
-            senderNick: String(ev.sender_nick || '未知用户'),
-            content: String(ev.content || ''),
-            itemId: String(ev.item_id || ''),
-            createTime: Number(ev.create_time || 0),
-            sessionType: String(ev.session_type || '1'),
-            isSelf: !!ev.is_self,
-            raw: ev,
-          }
-          // 事件发布 (旁路): 转发给订阅项目, 不影响大脑决策
-          publishChatEvent(account, parsed, engine.slug)
-          // IM 会话/消息落库 (与内置引擎 onChat 同源: 消息管理页在代理链路下同样实时可见)
-          void persistChatMessage(account, parsed)
-          eventActions = await handleChatEvent(account, parsed, { source: engine.slug })
-        } else if (ev.type === 'system') {
-          const parsed = {
-            kind: 'system' as const,
-            redReminder: String(ev.red_reminder || ''),
-            itemId: String(ev.item_id || ''),
-            buyerId: String(ev.buyer_id || ''),
-            orderId: String(ev.order_id || ''),
-            chatId: String(ev.chat_id || ''),
-            cardTitle: '',
-            amount: '',
-            raw: ev,
-          }
-          publishSystemEvent(account, parsed, engine.slug)
-          // 交易卡片落库 (与内置引擎 onSystem 同源)
-          void persistSystemMessage(account, parsed)
-          eventActions = await handleSystemEvent(account, parsed, { source: engine.slug })
-        } else if (ev.type === 'risk') {
+        // 风控事件轻量 (无外呼决策), 内联处理
+        if (ev.type === 'risk') {
           publishRiskEvent(account, String(ev.description || ''), engine.slug)
-          // 风控通知 (与内置引擎 persistRisk 同语义, 冷却去重在 notify 内)
           dispatchNotify({
             type: 'risk',
             cookieId: account,
@@ -183,12 +156,51 @@ export default defineEventHandler(
               [account, String(ev.description || '').slice(0, 500)],
             )
             .catch(() => {})
+          continue
         }
 
-        // 固化首次处理结果: 并发重复上报以 INSERT OR IGNORE 保证只有一份
+        const eventId = String(ev.event_id || '').slice(0, 80)
+
+        // ---- 快速 ACK 模式: 原子占位 + 后台决策, 代理按 event_id 拉取回收 ----
+        if (pullMode && eventId) {
+          const claimSql = "INSERT OR IGNORE INTO engine_event_dedup (event_id, actions_json, pending) VALUES (?, '', 1)"
+          let claim = await db.run(claimSql, [eventId]).catch(() => ({ changes: 0 }))
+          if (claim.changes === 0) {
+            const seen = await db
+              .get<{ actions_json: string }>('SELECT actions_json FROM engine_event_dedup WHERE event_id = ?', [eventId])
+              .catch(() => null)
+            if (seen?.actions_json) {
+              actions.push(...parseActions(seen.actions_json))
+              continue
+            }
+            if (seen) {
+              pending.push(eventId) // 决策仍在后台进行
+              continue
+            }
+            // 占位行不存在 (例行清理恰好清掉): 重新占位
+            claim = await db.run(claimSql, [eventId]).catch(() => ({ changes: 0 }))
+          }
+          if (claim.changes > 0) {
+            runDetached(event, decideInBackground(db, engine, ev, account, eventId))
+            pending.push(eventId)
+          }
+          continue
+        }
+
+        // ---- 内联决策 (旧版代理/无 event_id): 同步算完随响应返回 ----
+        if (eventId) {
+          const seen = await db
+            .get<{ actions_json: string }>('SELECT actions_json FROM engine_event_dedup WHERE event_id = ?', [eventId])
+            .catch(() => null)
+          if (seen) {
+            actions.push(...parseActions(seen.actions_json))
+            continue
+          }
+        }
+        const eventActions = await decideEvent(db, engine, ev, account)
         if (eventId) {
           await db
-            .run('INSERT OR IGNORE INTO engine_event_dedup (event_id, actions_json) VALUES (?, ?)', [
+            .run('INSERT OR IGNORE INTO engine_event_dedup (event_id, actions_json, pending) VALUES (?, ?, 0)', [
               eventId,
               JSON.stringify(eventActions),
             ])
@@ -199,32 +211,169 @@ export default defineEventHandler(
               .catch(() => {})
           }
         }
-
         actions.push(...eventActions)
       } catch (e: any) {
         console.log(`[engine-api] 事件处理失败 (${ev?.type}/${account}): ${e?.message}`)
       }
     }
 
-    await db
-      .run(
-        'UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?',
-        [`events=${events.length} actions=${actions.length}`, enginePollIp(event), engine.id],
-      )
-      .catch(() => {})
+    await touchEngine(db, event, engine, `events=${events.length} pending=${pending.length} actions=${actions.length}`)
+    markDelivered(db, actions)
 
-    // 动作已随本轮轮询响应投递给代理 → 决策日志标记「已下发」(旧版代理无 action_result 回报时,
-    // 发送状态不再永远停在未发送; 新版代理回报后升级为已发送/发送失败)
-    const deliveredLogIds = [...new Set(actions.map((a) => Number((a as any).log_id || 0)).filter((v) => v > 0))]
-    if (deliveredLogIds.length) {
-      await db
-        .run(
-          `UPDATE auto_reply_logs SET send_status = 'sent' WHERE send_status = 'pending' AND id IN (${deliveredLogIds.map(() => '?').join(',')})`,
-          deliveredLogIds,
-        )
-        .catch(() => {})
-    }
-
-    return ok({ actions })
+    return ok({ actions, pending })
   }),
 )
+
+/* ----------------------- 快速 ACK 模式: 后台决策与拉取回收 ----------------------- */
+
+/** 单个 chat/system 事件的大脑决策 (事件发布 + 消息落库 + 回复/发货链), 内联与后台共用 */
+async function decideEvent(
+  db: Awaited<ReturnType<typeof getDb>>,
+  engine: { slug: string },
+  ev: any,
+  account: string,
+): Promise<EngineAction[]> {
+  if (ev.type === 'chat') {
+    const parsed = {
+      kind: 'chat' as const,
+      chatId: String(ev.chat_id || ''),
+      senderUserId: String(ev.sender_user_id || ''),
+      senderNick: String(ev.sender_nick || '未知用户'),
+      content: String(ev.content || ''),
+      itemId: String(ev.item_id || ''),
+      createTime: Number(ev.create_time || 0),
+      sessionType: String(ev.session_type || '1'),
+      isSelf: !!ev.is_self,
+      raw: ev,
+    }
+    // 事件发布 (旁路): 转发给订阅项目; IM 会话/消息落库 (与内置引擎 onChat 同源, 消息页实时可见)
+    publishChatEvent(account, parsed, engine.slug)
+    void persistChatMessage(account, parsed)
+    return handleChatEvent(account, parsed, { source: engine.slug })
+  }
+  const parsed = {
+    kind: 'system' as const,
+    redReminder: String(ev.red_reminder || ''),
+    itemId: String(ev.item_id || ''),
+    buyerId: String(ev.buyer_id || ''),
+    orderId: String(ev.order_id || ''),
+    chatId: String(ev.chat_id || ''),
+    cardTitle: '',
+    amount: '',
+    raw: ev,
+  }
+  publishSystemEvent(account, parsed, engine.slug)
+  void persistSystemMessage(account, parsed)
+  return handleSystemEvent(account, parsed, { source: engine.slug })
+}
+
+/** 后台决策任务: 完成后固化动作到占位行 (代理拉取回收); 失败释放占位由代理重报自愈 */
+async function decideInBackground(
+  db: Awaited<ReturnType<typeof getDb>>,
+  engine: { slug: string },
+  ev: any,
+  account: string,
+  eventId: string,
+): Promise<void> {
+  try {
+    const decided = await decideEvent(db, engine, ev, account)
+    await db
+      .run('UPDATE engine_event_dedup SET actions_json = ?, pending = 0 WHERE event_id = ?', [
+        JSON.stringify(decided),
+        eventId,
+      ])
+      .catch(() => {})
+  } catch (e: any) {
+    console.log(`[engine-api] 后台决策失败 (${ev?.type}/${account}): ${e?.message}`)
+    await db.run("DELETE FROM engine_event_dedup WHERE event_id = ? AND actions_json = ''", [eventId]).catch(() => {})
+  }
+}
+
+/** 新版代理的决策结果拉取: 已完成→重放动作; 进行中→保持 pending; 占位超时→expired 由代理重报 */
+async function pullDecisionActions(
+  event: H3Event,
+  engine: { id: number; is_active: number },
+  ids: string[],
+): Promise<{ actions: EngineAction[]; pending: string[]; expired: string[] }> {
+  if (!engine.is_active) {
+    return { actions: [], pending: [], expired: [] }
+  }
+  const db = await getDb()
+  const actions: EngineAction[] = []
+  const pending: string[] = []
+  const expired: string[] = []
+  for (const eventId of ids) {
+    const row = await db
+      .get<{ actions_json: string; created_at: string }>(
+        'SELECT actions_json, created_at FROM engine_event_dedup WHERE event_id = ?',
+        [eventId],
+      )
+      .catch(() => null)
+    if (!row) {
+      expired.push(eventId)
+      continue
+    }
+    if (row.actions_json) {
+      actions.push(...parseActions(row.actions_json))
+      continue
+    }
+    const created = Date.parse(String(row.created_at || '').includes('T') || String(row.created_at || '').includes('Z')
+      ? String(row.created_at)
+      : `${String(row.created_at).replace(' ', 'T')}Z`)
+    if (Date.now() - (Number.isFinite(created) ? created : 0) > PENDING_TTL_MS) {
+      await db.run("DELETE FROM engine_event_dedup WHERE event_id = ? AND actions_json = ''", [eventId]).catch(() => {})
+      expired.push(eventId)
+    } else {
+      pending.push(eventId)
+    }
+  }
+  await touchEngine(db, event, engine, `pull=${ids.length} pending=${pending.length} actions=${actions.length}`)
+  markDelivered(db, actions)
+  return { actions, pending, expired }
+}
+
+function parseActions(json: string): EngineAction[] {
+  try {
+    const stored = JSON.parse(json || '[]')
+    return Array.isArray(stored) ? stored : []
+  } catch {
+    return []
+  }
+}
+
+/** 后台任务挂载: CF Workers 用 waitUntil 保活 (响应返回后继续执行), Node 直接执行 */
+function runDetached(event: H3Event, task: Promise<void>): void {
+  const cf: any = (event.context as any)?.cloudflare
+  const waitUntil: ((p: Promise<any>) => void) | undefined =
+    cf?.context?.waitUntil?.bind(cf.context) ?? cf?.waitUntil?.bind(cf)
+  if (waitUntil) waitUntil(task.catch(() => {}))
+  else void task
+}
+
+async function touchEngine(
+  db: Awaited<ReturnType<typeof getDb>>,
+  event: H3Event,
+  engine: { id: number },
+  status: string,
+): Promise<void> {
+  await db
+    .run('UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?', [
+      status,
+      enginePollIp(event),
+      engine.id,
+    ])
+    .catch(() => {})
+}
+
+/** 动作已随响应/拉取投递给代理 → 决策日志标记「已下发」(代理回报后升级为已发送/发送失败) */
+async function markDelivered(db: Awaited<ReturnType<typeof getDb>>, actions: EngineAction[]): Promise<void> {
+  const deliveredLogIds = [...new Set(actions.map((a) => Number((a as any).log_id || 0)).filter((v) => v > 0))]
+  if (deliveredLogIds.length) {
+    await db
+      .run(
+        `UPDATE auto_reply_logs SET send_status = 'sent' WHERE send_status = 'pending' AND id IN (${deliveredLogIds.map(() => '?').join(',')})`,
+        deliveredLogIds,
+      )
+      .catch(() => {})
+  }
+}

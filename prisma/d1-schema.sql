@@ -321,6 +321,7 @@ CREATE TABLE engine_subscribers (
 CREATE TABLE engine_event_dedup (
     event_id VARCHAR(80) PRIMARY KEY,
     actions_json TEXT DEFAULT '[]',
+    pending INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
