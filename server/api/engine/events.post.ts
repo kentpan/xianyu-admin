@@ -27,6 +27,7 @@
  * Response: { "actions": [ { "type": "send_text"|"send_image", ... , "delay_ms", "log_id" } ] }
  */
 import { handleChatEvent, handleSystemEvent, type EngineAction } from '../../utils/xianyu/brain'
+import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from '../../utils/xianyu/im-store'
 import { dispatchNotify } from '../../utils/notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from '../../utils/xianyu/publisher'
 import { consumeRate } from '../../utils/rate-limit'
@@ -94,6 +95,18 @@ export default defineEventHandler(
                 logId,
               ])
               .catch(() => {})
+            // 发送成功 → 出站消息落库 (代理链路与内置引擎 executeActions 同语义, 消息页可见回复内容)
+            if (ev.ok) {
+              const logRow = await db
+                .get<{ cookie_id: string; chat_id: string; sender_user_id: string; reply_text: string }>(
+                  'SELECT cookie_id, chat_id, sender_user_id, reply_text FROM auto_reply_logs WHERE id = ?',
+                  [logId],
+                )
+                .catch(() => null)
+              if (logRow?.chat_id && logRow.reply_text) {
+                void persistOutgoingMessage(logRow.cookie_id || account, logRow.chat_id, logRow.sender_user_id || '', logRow.reply_text, 'text')
+              }
+            }
           }
           continue
         }
@@ -131,6 +144,8 @@ export default defineEventHandler(
           }
           // 事件发布 (旁路): 转发给订阅项目, 不影响大脑决策
           publishChatEvent(account, parsed, engine.slug)
+          // IM 会话/消息落库 (与内置引擎 onChat 同源: 消息管理页在代理链路下同样实时可见)
+          void persistChatMessage(account, parsed)
           eventActions = await handleChatEvent(account, parsed, { source: engine.slug })
         } else if (ev.type === 'system') {
           const parsed = {
@@ -140,9 +155,13 @@ export default defineEventHandler(
             buyerId: String(ev.buyer_id || ''),
             orderId: String(ev.order_id || ''),
             chatId: String(ev.chat_id || ''),
+            cardTitle: '',
+            amount: '',
             raw: ev,
           }
           publishSystemEvent(account, parsed, engine.slug)
+          // 交易卡片落库 (与内置引擎 onSystem 同源)
+          void persistSystemMessage(account, parsed)
           eventActions = await handleSystemEvent(account, parsed, { source: engine.slug })
         } else if (ev.type === 'risk') {
           publishRiskEvent(account, String(ev.description || ''), engine.slug)

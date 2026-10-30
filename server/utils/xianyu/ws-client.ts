@@ -191,6 +191,7 @@ export class XianyuAccountClient {
   private connectionFailures = 0
   private generation = 0 // 连接代次: 心跳/接收循环只服务当前代
   private holdNoted = false // 人工验证持有期只报一次状态, 避免每 5s 重复写心跳
+  private lastDownstreamAt = Date.now() // 最近一次收到任意下行帧 (含心跳回包): 静默断线检测依据
 
   // 发送人化队列: 串行 + 随机间隔 + 滑动窗口限速
   private sendChain: Promise<void> = Promise.resolve()
@@ -356,6 +357,15 @@ export class XianyuAccountClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     const tick = () => {
       if (this.stopped || gen !== this.generation) return
+      // 静默断线检测: 正常连接心跳回包 ≤15s 一帧, 超过 6 个心跳周期无任何下行帧 = 连接已假死
+      // (TCP 半开不触发 close/error, 不主动重连会永远停在 listening 却收不到任何消息)
+      if (Date.now() - this.lastDownstreamAt > 90_000) {
+        logWarn(`[${this.cookieId}] 连接静默超过 90s (无任何下行帧), 判定假死, 主动断开重连`)
+        try {
+          ws.close()
+        } catch {}
+        return
+      }
       try {
         if (ws.readyState === 1) ws.send(buildHeartbeatMsg())
       } catch {
@@ -370,6 +380,7 @@ export class XianyuAccountClient {
     await new Promise<void>((resolve) => {
       ws.addEventListener('message', (ev: any) => {
         if (gen !== this.generation || this.stopped) return resolve()
+        this.lastDownstreamAt = Date.now()
         const raw = typeof ev.data === 'string' ? ev.data : ''
         if (!raw) return
         let message: any

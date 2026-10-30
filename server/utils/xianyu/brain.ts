@@ -47,6 +47,14 @@ const ORDER_COOLDOWN_MS = 10 * 60 * 1000
 /** 卖家手动回复后暂停该会话自动回复 (到期时间戳; 时长读账号级 pause_duration, 0 = 不暂停, butler pause_chat 语义)。 */
 const chatPause = new Map<string, number>()
 
+/** 会话级回复冷却: 距上次自动回复不足该时长则跳过 (用户要求至少 1 分钟内不重复回复)。 */
+const REPLY_COOLDOWN_MS = 60_000
+
+function parseUtcTimestamp(t: string): number {
+  const parsed = Date.parse(t.includes('T') || t.includes('Z') ? t : t.replace(' ', 'T') + 'Z')
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 /* ---------------------------------- 常量 (语义对齐 butler handle_message) ---------------------------------- */
 
 /**
@@ -105,6 +113,12 @@ export async function handleChatEvent(
       .catch(() => null)
     const pauseMinutes = Math.max(Number(pauseRow?.pause_duration ?? 10) || 0, 0)
     if (pauseMinutes > 0) chatPause.set(`${cookieId}:${msg.chatId}`, Date.now() + pauseMinutes * 60_000)
+    // 决策日志可见: 卖家在 APP 手动回复 → 该会话自动回复暂停 (排查「为什么没回」的直接证据)
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'manual_reply_pause',
+      reply_strategy: 'none',
+    })
     return []
   }
 
@@ -197,6 +211,24 @@ export async function handleChatEvent(
     send_user_id: msg.senderUserId,
     send_message: msg.content,
     item_id: msg.itemId,
+  }
+
+  // 会话级回复冷却: 距上次自动回复不足 1 分钟不重复回复 (连续刷屏场景每会话至多一分钟一条)
+  const lastReply = await db
+    .get<{ created_at: string }>(
+      `SELECT created_at FROM auto_reply_logs
+       WHERE cookie_id = ? AND chat_id = ? AND decision_reason = 'reply_sent' AND process_status = 'success'
+       ORDER BY id DESC LIMIT 1`,
+      [cookieId, msg.chatId],
+    )
+    .catch(() => null)
+  if (lastReply?.created_at && Date.now() - parseUtcTimestamp(lastReply.created_at) < REPLY_COOLDOWN_MS) {
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'reply_cooldown',
+      reply_strategy: 'none',
+    })
+    return []
   }
 
   // 1) 关键词回复 (商品绑定 > 通用)

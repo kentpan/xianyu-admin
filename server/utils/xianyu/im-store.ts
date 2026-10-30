@@ -64,34 +64,35 @@ export interface ImUpsertResult {
   conversationId: string
 }
 
-/** 入站聊天消息落库 + 会话聚合。 */
+/** 入站聊天消息落库 + 会话聚合 (卖家自己在 APP 发出的消息按 out 方向记录)。 */
 export async function persistChatMessage(cookieId: string, msg: ParsedChatMessage): Promise<ImUpsertResult> {
   const db = await getDb().catch(() => null)
   if (!db || !msg.chatId) return { stored: false, conversationId: '' }
-  const key = messageKey([cookieId, msg.chatId, msg.senderUserId, msg.createTime, msg.content, 'in'])
+  const direction = msg.isSelf ? 'out' : 'in'
+  const key = messageKey([cookieId, msg.chatId, msg.senderUserId, msg.createTime, msg.content, direction])
   const timeStr = imTimestamp(msg.createTime)
   const contentType = msg.content.startsWith('[图片]') || msg.raw?.['1']?.['10']?.reminderContentType === 2 ? 'image' : 'text'
 
   const res = await db
     .run(
       `INSERT INTO im_messages (cookie_id, chat_id, direction, message_key, sender_user_id, sender_nick, content, content_type, item_id, msg_time)
-       VALUES (?, ?, 'in', ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(cookie_id, message_key) DO NOTHING`,
-      [cookieId, msg.chatId, key, msg.senderUserId, msg.senderNick, msg.content, contentType, msg.itemId || '', timeStr],
+      [cookieId, msg.chatId, direction, key, msg.senderUserId, msg.isSelf ? '我' : msg.senderNick, msg.content, contentType, msg.itemId || '', timeStr],
     )
     .catch(() => ({ changes: 0, lastInsertId: 0 }))
   const stored = (res?.changes || 0) > 0
 
   await upsertConversation(cookieId, msg.chatId, {
-    peer_user_id: msg.senderUserId,
-    peer_nick: msg.senderNick,
+    peer_user_id: msg.isSelf ? '' : msg.senderUserId,
+    peer_nick: msg.isSelf ? '' : msg.senderNick,
     item_id: msg.itemId || '',
     last_message: msg.content,
     last_message_type: contentType,
     last_message_time: timeStr,
   })
   if (stored) {
-    emitImEvent({ type: 'chat', cookieId, chatId: msg.chatId, message: { direction: 'in', content: msg.content, sender_nick: msg.senderNick, sender_user_id: msg.senderUserId, content_type: contentType, item_id: msg.itemId, msg_time: timeStr } })
+    emitImEvent({ type: msg.isSelf ? 'sent' : 'chat', cookieId, chatId: msg.chatId, message: { direction, content: msg.content, sender_nick: msg.isSelf ? '我' : msg.senderNick, sender_user_id: msg.senderUserId, content_type: contentType, item_id: msg.itemId, msg_time: timeStr } })
   }
   return { stored, conversationId: msg.chatId }
 }

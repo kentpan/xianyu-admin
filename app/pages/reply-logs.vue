@@ -68,7 +68,7 @@
                   <p class="text-slate-500 dark:text-slate-400 truncate">{{ log.source_message || '-' }}</p>
                 </td>
                 <td>
-                  <span class="badge" :class="strategyMeta(log.reply_strategy, log.process_status).cls">{{ strategyMeta(log.reply_strategy, log.process_status).label }}</span>
+                  <span class="badge" :class="strategyMeta(log).cls">{{ strategyMeta(log).label }}</span>
                 </td>
                 <td class="max-w-[140px] truncate text-slate-500 dark:text-slate-400">{{ log.matched_keyword || '-' }}</td>
                 <td class="max-w-[260px]">
@@ -144,9 +144,17 @@ async function loadMore() {
   }
 }
 
-function strategyMeta(strategy: string, processStatus: string) {
-  if (processStatus === 'skipped') return { label: '跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-  switch (strategy) {
+function strategyMeta(log: ReplyLog) {
+  if (log.process_status === 'skipped') {
+    switch (log.decision_reason) {
+      case 'manual_reply_pause': return { label: '手动回复暂停', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
+      case 'reply_cooldown': return { label: '冷却跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'system_notice': return { label: '系统通知', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'skip_reply_filter': return { label: '过滤规则', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      default: return { label: '跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+    }
+  }
+  switch (log.reply_strategy) {
     case 'keyword': return { label: '关键词', cls: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400' }
     case 'ai': return { label: 'AI', cls: 'bg-violet-50 text-violet-600 dark:bg-violet-900/30 dark:text-violet-400' }
     case 'default': return { label: '默认回复', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
