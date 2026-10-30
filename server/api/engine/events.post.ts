@@ -5,20 +5,26 @@
  * 限速: 每令牌令牌桶 120 次/分钟 (突发 40), 超限 429 + Retry-After。
  *
  * 代理只做纯粹的消息监听与转发, 不持有任何业务状态:
- *   - 上报: 账号连接状态 / 风控事件 / 解密后的聊天与交易消息 (转发, 不决策)
+ *   - 上报: 账号连接状态 / 风控事件 / 解密后的聊天与交易消息 / 动作执行结果 (转发, 不决策)
  *   - 回收: 本后台大脑 (回复链/发货链) 决策出的动作列表, 代理按 delay_ms 人化执行
+ *
+ * 幂等: 代理在丢包链路上会超时重试, 同一事件可能重复上报。带 event_id 的事件以
+ * engine_event_dedup 表去重: 首次处理即固化决策动作, 重试时原样重放 (不重算决策、
+ * 不重复执行), 响应丢失也不再丢单。
  *
  * Body:
  * {
  *   "status": { "accounts": [{ "id": "xy_1", "state": "listening", "detail": "" }] },   // 可选
  *   "events": [
- *     { "type": "chat",   "account": "xy_1", "chat_id", "sender_user_id", "sender_nick",
+ *     { "type": "chat",   "account": "xy_1", "event_id", "chat_id", "sender_user_id", "sender_nick",
  *       "content", "item_id", "create_time", "session_type", "is_self" },
- *     { "type": "system", "account": "xy_1", "red_reminder", "item_id", "buyer_id",
- *       "order_id", "chat_id" }
+ *     { "type": "system", "account": "xy_1", "event_id", "red_reminder", "item_id", "buyer_id",
+ *       "order_id", "chat_id" },
+ *     { "type": "risk",   "account": "xy_1", "event_id", "description" },
+ *     { "type": "action_result", "account": "xy_1", "log_id", "ok", "error" }
  *   ]
  * }
- * Response: { "actions": [ { "type": "send_text"|"send_image", ... , "delay_ms" } ] }
+ * Response: { "actions": [ { "type": "send_text"|"send_image", ... , "delay_ms", "log_id" } ] }
  */
 import { handleChatEvent, handleSystemEvent, type EngineAction } from '../../utils/xianyu/brain'
 import { dispatchNotify } from '../../utils/notify'
@@ -77,6 +83,39 @@ export default defineEventHandler(
       const account = String(ev?.account || '')
       if (!account) continue
       try {
+        // 动作执行结果回报: 代理按 log_id 回写发送结果, 决策日志的发送状态由此闭环
+        if (ev.type === 'action_result') {
+          const logId = Number(ev.log_id || 0)
+          if (logId > 0) {
+            await db
+              .run('UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?', [
+                ev.ok ? 'success' : 'failed',
+                String(ev.error || '').slice(0, 300),
+                logId,
+              ])
+              .catch(() => {})
+          }
+          continue
+        }
+
+        if (ev.type !== 'chat' && ev.type !== 'system' && ev.type !== 'risk') continue
+
+        // 事件幂等去重: 已处理过的事件直接重放首次动作 (不重算不重发)
+        const eventId = String(ev.event_id || '').slice(0, 80)
+        if (eventId) {
+          const seen = await db
+            .get<{ actions_json: string }>('SELECT actions_json FROM engine_event_dedup WHERE event_id = ?', [eventId])
+            .catch(() => null)
+          if (seen) {
+            try {
+              const stored = JSON.parse(seen.actions_json || '[]')
+              if (Array.isArray(stored)) actions.push(...stored)
+            } catch {}
+            continue
+          }
+        }
+
+        let eventActions: EngineAction[] = []
         if (ev.type === 'chat') {
           const parsed = {
             kind: 'chat' as const,
@@ -92,7 +131,7 @@ export default defineEventHandler(
           }
           // 事件发布 (旁路): 转发给订阅项目, 不影响大脑决策
           publishChatEvent(account, parsed, engine.slug)
-          actions.push(...(await handleChatEvent(account, parsed, { source: engine.slug })))
+          eventActions = await handleChatEvent(account, parsed, { source: engine.slug })
         } else if (ev.type === 'system') {
           const parsed = {
             kind: 'system' as const,
@@ -104,7 +143,7 @@ export default defineEventHandler(
             raw: ev,
           }
           publishSystemEvent(account, parsed, engine.slug)
-          actions.push(...(await handleSystemEvent(account, parsed, { source: engine.slug })))
+          eventActions = await handleSystemEvent(account, parsed, { source: engine.slug })
         } else if (ev.type === 'risk') {
           publishRiskEvent(account, String(ev.description || ''), engine.slug)
           // 风控通知 (与内置引擎 persistRisk 同语义, 冷却去重在 notify 内)
@@ -126,6 +165,23 @@ export default defineEventHandler(
             )
             .catch(() => {})
         }
+
+        // 固化首次处理结果: 并发重复上报以 INSERT OR IGNORE 保证只有一份
+        if (eventId) {
+          await db
+            .run('INSERT OR IGNORE INTO engine_event_dedup (event_id, actions_json) VALUES (?, ?)', [
+              eventId,
+              JSON.stringify(eventActions),
+            ])
+            .catch(() => {})
+          if (Math.random() < 0.02) {
+            await db
+              .run("DELETE FROM engine_event_dedup WHERE created_at < datetime('now', '-2 days')")
+              .catch(() => {})
+          }
+        }
+
+        actions.push(...eventActions)
       } catch (e: any) {
         console.log(`[engine-api] 事件处理失败 (${ev?.type}/${account}): ${e?.message}`)
       }

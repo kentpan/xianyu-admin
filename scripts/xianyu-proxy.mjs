@@ -1092,6 +1092,7 @@ const clients = new Map()
 const latestCookies = new Map()
 let engineActive = false
 let pollSeconds = DEFAULT_POLL_SECONDS
+let heartbeatSeconds = 15
 let stopped = false
 let configFailStreak = 0
 let pollOkCount = 0
@@ -1107,7 +1108,7 @@ function log(msg) {
 }
 
 
-async function apiCall(url, body) {
+async function apiCall(url, body, timeoutMs = 30_000) {
   const res = await fetch(url, {
     method: body ? 'POST' : 'GET',
     headers: {
@@ -1115,7 +1116,7 @@ async function apiCall(url, body) {
       'Content-Type': 'application/json',
     },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('retry-after') || 5) || 5
@@ -1159,7 +1160,8 @@ async function flushReports() {
     accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state, detail: s.detail || '' })),
   }
   try {
-    const resp = await apiCall(EVENTS_URL, { status, events })
+    // 15s 超时 (链路抖动时更快进入重试); 事件带 event_id 幂等, 后台重放首次决策, 重试绝不重复回复
+    const resp = await apiCall(EVENTS_URL, { status, events }, 15_000)
     const actions = Array.isArray(resp?.actions) ? resp.actions : []
     await executeActions(actions)
   } catch (e) {
@@ -1179,13 +1181,46 @@ async function flushReports() {
   }
 }
 
+/** 已执行动作登记 (按决策日志 id): 重试重放同一动作时只回执不重发, 保证买家恰好收到一次 */
+const executedActions = new Map()
+
+function pruneExecutedActions() {
+  if (executedActions.size <= 500) return
+  const cutoff = Date.now() - 30 * 60_000
+  for (const [k, v] of executedActions) {
+    if (v.at < cutoff) executedActions.delete(k)
+  }
+  while (executedActions.size > 800) {
+    const first = executedActions.keys().next().value
+    if (first === undefined) break
+    executedActions.delete(first)
+  }
+}
+
 async function executeActions(actions) {
+  const logCounter = new Map()
   for (const action of actions) {
     const client = clients.get(String(action.account || ''))
     if (!client) {
       log(`动作丢弃: 账号 ${action.account} 不由本代理托管`)
       continue
     }
+    const logId = Number(action.log_id || 0)
+    let actionKey = ''
+    if (logId > 0) {
+      const seq = logCounter.get(logId) || 0
+      logCounter.set(logId, seq + 1)
+      actionKey = `${logId}#${seq}`
+      const done = executedActions.get(actionKey)
+      if (done) {
+        // 同一动作的重放 (上轮响应丢失后的重试): 不重发, 仅补报执行结果
+        if (done.ok) log(`动作已执行过, 跳过重发 (log ${logId})`)
+        enqueueReport({ type: 'action_result', account: String(action.account || ''), log_id: logId, ok: done.ok, error: done.error || '' })
+        continue
+      }
+    }
+    let ok = true
+    let err = ''
     try {
       const delay = Math.max(0, Math.round(Number(action.delay_ms || 0)))
       if (action.type === 'send_text') {
@@ -1203,9 +1238,30 @@ async function executeActions(actions) {
         log(`已发送图片 → 账号 ${action.account} 会话 ${action.chat_id}`)
       }
     } catch (e) {
-      log(`动作执行失败 (${action.type} → ${action.account}): ${e?.message}`)
+      ok = false
+      err = String(e?.message || '').slice(0, 300)
+      log(`动作执行失败 (${action.type} → ${action.account}): ${err}`)
+    }
+    if (logId > 0) {
+      executedActions.set(actionKey, { ok, error: err, at: Date.now() })
+      pruneExecutedActions()
+      enqueueReport({ type: 'action_result', account: String(action.account || ''), log_id: logId, ok, error: err })
     }
   }
+}
+
+/* ------------- 事件幂等 id (同一消息/交易卡片在重连重放与上报重试间保持稳定) ------------- */
+
+function chatEventId(cookieId, msg) {
+  return 'c:' + createHash('sha1')
+    .update([cookieId, msg.chatId || '', msg.senderUserId || '', msg.content || '', msg.createTime || 0, msg.itemId || '', msg.isSelf ? 1 : 0].join('|'))
+    .digest('hex')
+}
+
+function systemEventId(cookieId, msg) {
+  return 's:' + createHash('sha1')
+    .update([cookieId, msg.redReminder || '', msg.itemId || '', msg.buyerId || '', msg.orderId || '', msg.chatId || ''].join('|'))
+    .digest('hex')
 }
 
 const sink = {
@@ -1217,6 +1273,7 @@ const sink = {
     enqueueReport({
       type: 'chat',
       account: cookieId,
+      event_id: chatEventId(cookieId, msg),
       chat_id: msg.chatId,
       sender_user_id: msg.senderUserId,
       sender_nick: msg.senderNick,
@@ -1231,6 +1288,7 @@ const sink = {
     enqueueReport({
       type: 'system',
       account: cookieId,
+      event_id: systemEventId(cookieId, msg),
       red_reminder: msg.redReminder,
       item_id: msg.itemId,
       buyer_id: msg.buyerId,
@@ -1239,7 +1297,7 @@ const sink = {
     })
   },
   onRisk(cookieId, description) {
-    enqueueReport({ type: 'risk', account: cookieId, description })
+    enqueueReport({ type: 'risk', account: cookieId, event_id: 'r:' + createHash('sha1').update([cookieId, description].join('|')).digest('hex') })
   },
   onCookieRotated(cookieId, mergedStr) {
     latestCookies.set(cookieId, mergedStr)
@@ -1297,6 +1355,9 @@ async function pollConfigOnce() {
     engineActive = !!cfg.active
     if (cfg.intervals?.poll_seconds) {
       pollSeconds = Math.max(10, Math.round(Number(cfg.intervals.poll_seconds) || DEFAULT_POLL_SECONDS))
+    }
+    if (cfg.intervals?.heartbeat_seconds) {
+      heartbeatSeconds = Math.min(60, Math.max(5, Math.round(Number(cfg.intervals.heartbeat_seconds) || 15)))
     }
 
     if (!engineActive) {
@@ -1420,6 +1481,19 @@ async function configLoop() {
   }
 }
 
+/**
+ * 状态心跳: 空闲期也定期上报连接状态, 后台账号心跳 (cookies.last_check_at) 由此保持
+ * 新鲜 —— 否则静默 60s 后监听页会把在线账号误判为 engine_offline (监听中归零)。
+ * 队列非空时跳过 (上报本身就携带 status)。
+ */
+async function statusHeartbeatLoop() {
+  while (!stopped) {
+    await sleep(jitter(Math.max(5, heartbeatSeconds) * 1000, 0.15))
+    if (stopped || !engineActive) continue
+    if (!reportQueue.length) enqueueReport({ type: '__state__' })
+  }
+}
+
 /* --------------------- 健康检查 (选填) --------------------- */
 
 if (PROXY_PORT > 0) {
@@ -1459,3 +1533,4 @@ configLoop().catch((e) => {
   log(`主循环异常退出: ${e?.message}`)
   process.exit(1)
 })
+statusHeartbeatLoop().catch(() => {})

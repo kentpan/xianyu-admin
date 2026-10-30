@@ -265,9 +265,10 @@ async function executeActions(actions: EngineAction[]): Promise<void> {
         await client.sendImage(action.chat_id, action.to_user_id, action.image_url, action.width, action.height, action.delay_ms)
         void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.image_url, 'image')
       }
-      markActionSent(action)
+      await markActionResult(action, true, '')
     } catch (e: any) {
       console.log(`[xianyu-engine] 动作执行失败 (${action.type} → ${action.account}): ${e?.message}`)
+      await markActionResult(action, false, String(e?.message || '').slice(0, 300))
     }
   }
 }
@@ -290,14 +291,16 @@ export function getAccountClient(cookieId: string): XianyuAccountClient | null {
   return runtime.clients.get(cookieId) || null
 }
 
-async function markActionSent(action: EngineAction): Promise<void> {
+/** 内置引擎发送结果回写: 按决策日志 id 精确更新, 不再猜“该账号最新一条”。 */
+async function markActionResult(action: EngineAction, sent: boolean, error: string): Promise<void> {
+  const logId = Number((action as { log_id?: number }).log_id || 0)
+  if (!logId) return
   const db = await getDb().catch(() => null)
   if (!db) return
   await db
     .run(
-      `UPDATE auto_reply_logs SET send_status = 'success'
-       WHERE id = (SELECT id FROM auto_reply_logs WHERE cookie_id = ? ORDER BY id DESC LIMIT 1)`,
-      [action.account],
+      'UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?',
+      [sent ? 'success' : 'failed', sent ? null : error, logId],
     )
     .catch(() => {})
 }

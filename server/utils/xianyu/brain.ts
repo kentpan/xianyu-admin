@@ -21,7 +21,7 @@ import { fetchItemDetail, confirmOrderShipped, freeshippingOrder } from './mtop'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
-  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number }
+  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number }
   | {
       type: 'send_image'
       account: string
@@ -31,6 +31,7 @@ export type EngineAction =
       width: number
       height: number
       delay_ms: number
+      log_id?: number
     }
 
 interface BrainOptions {
@@ -210,7 +211,7 @@ export async function handleChatEvent(
     return []
   }
   if (keywordHit.actions.length) {
-    await addLog(db, cookieId, msg, opts, {
+    const logId = await addLog(db, cookieId, msg, opts, {
       process_status: 'success',
       decision_reason: 'reply_sent',
       reply_strategy: 'keyword',
@@ -218,20 +219,20 @@ export async function handleChatEvent(
       reply_text: keywordHit.preview,
       send_status: 'pending',
     })
-    return keywordHit.actions
+    return keywordHit.actions.map((a) => ({ ...a, log_id: logId }))
   }
 
   // 2) AI 回复 (意图识别 + 议价控制 + 商品上下文)
   const aiReply = await getAiReply(db, cookieId, msg)
   if (aiReply) {
-    await addLog(db, cookieId, msg, opts, {
+    const logId = await addLog(db, cookieId, msg, opts, {
       process_status: 'success',
       decision_reason: 'reply_sent',
       reply_strategy: 'ai',
       reply_text: aiReply,
       send_status: 'pending',
     })
-    return [textAction(cookieId, msg, applyVars(aiReply, vars))]
+    return [textAction(cookieId, msg, applyVars(aiReply, vars), 0, logId)]
   }
 
   // 3) 指定商品回复
@@ -241,14 +242,14 @@ export async function handleChatEvent(
   )
   if (itemReply?.reply_content) {
     const text = applyVars(itemReply.reply_content, vars)
-    await addLog(db, cookieId, msg, opts, {
+    const logId = await addLog(db, cookieId, msg, opts, {
       process_status: 'success',
       decision_reason: 'reply_sent',
       reply_strategy: 'default',
       reply_text: text,
       send_status: 'pending',
     })
-    return [textAction(cookieId, msg, text)]
+    return [textAction(cookieId, msg, text, 0, logId)]
   }
 
   // 4) 默认回复 (支持只回复一次 + 图片; 账号未启用时回退系统全局 default_reply 设置, 纯文本不重复)
@@ -293,14 +294,14 @@ export async function handleChatEvent(
     if (text) {
       actions.push(textAction(cookieId, msg, text, image ? 1200 : 0))
     }
-    await addLog(db, cookieId, msg, opts, {
+    const logId = await addLog(db, cookieId, msg, opts, {
       process_status: 'success',
       decision_reason: 'reply_sent',
       reply_strategy: 'default',
       reply_text: text || image,
       send_status: 'pending',
     })
-    return actions
+    return actions.map((a) => ({ ...a, log_id: logId }))
   }
 
   return []
@@ -1130,8 +1131,8 @@ async function extractCardContent(
 
 /* ---------------------------------- 工具 ---------------------------------- */
 
-function textAction(cookieId: string, msg: ParsedChatMessage, text: string, delayMs = 0): EngineAction {
-  return { type: 'send_text', account: cookieId, chat_id: msg.chatId, to_user_id: msg.senderUserId, text, delay_ms: delayMs }
+function textAction(cookieId: string, msg: ParsedChatMessage, text: string, delayMs = 0, logId = 0): EngineAction {
+  return { type: 'send_text', account: cookieId, chat_id: msg.chatId, to_user_id: msg.senderUserId, text, delay_ms: delayMs, ...(logId ? { log_id: logId } : {}) }
 }
 
 function imageAction(
@@ -1139,6 +1140,7 @@ function imageAction(
   msg: ParsedChatMessage,
   imageUrl: string,
   delayMs = 0,
+  logId = 0,
 ): EngineAction {
   return {
     type: 'send_image',
@@ -1149,6 +1151,7 @@ function imageAction(
     width: 800,
     height: 600,
     delay_ms: delayMs,
+    ...(logId ? { log_id: logId } : {}),
   }
 }
 
@@ -1167,8 +1170,8 @@ async function addLog(
   msg: ParsedChatMessage,
   opts: BrainOptions,
   fields: Record<string, string>,
-): Promise<void> {
-  await db
+): Promise<number> {
+  const r = await db
     .run(
       `INSERT INTO auto_reply_logs
        (cookie_id, chat_id, item_id, sender_user_id, sender_user_name, source_message,
@@ -1189,7 +1192,8 @@ async function addLog(
         fields.send_status || 'unknown',
       ],
     )
-    .catch(() => {})
+    .catch(() => null)
+  return r ? Number(r.lastInsertId) : 0
 }
 
 function sleep(ms: number): Promise<void> {

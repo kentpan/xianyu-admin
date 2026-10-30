@@ -571,6 +571,14 @@ const SCHEMA: string[] = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_apilog_key ON api_key_logs(api_key_id, id)`,
+  // 引擎事件幂等去重: 远程代理在丢包链路上超时重试会重复上报同一事件,
+  // 以 event_id 保证恰好处理一次; actions_json 保存首次决策的动作列表,
+  // 重试时原样重放 (不重算决策、不重复发送), 响应丢失也不再丢单
+  `CREATE TABLE IF NOT EXISTS engine_event_dedup (
+    event_id VARCHAR(80) PRIMARY KEY,
+    actions_json TEXT DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
 ]
 
 /**
@@ -776,10 +784,9 @@ const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = 
 
 export async function initSchema(db: DatabaseAdapter): Promise<void> {
   const auto = AUTO[db.driver] || AUTO.sqlite
-  for (const stmt of SCHEMA) {
-    const finalSql = stmt.replace(/__AUTO__/g, auto)
-    await db.exec(finalSql)
-  }
+  // 全量建表语句合并为一次 exec: D1 适配器把多语句打包成一个 batch (单次往返),
+  // 云端冷启动从 ~130 次串行往返降为 1 次, 显著缩短首个请求的建立时间
+  await db.exec(SCHEMA.map((stmt) => stmt.replace(/__AUTO__/g, auto)).join(';\n'))
 
   // Idempotent column migrations (ALTER TABLE ADD COLUMN) — ignore "duplicate column" errors
   for (const stmt of MIGRATIONS) {
@@ -824,15 +831,16 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     console.error('[xianyu-admin] ai_configs data migration failed:', e?.message || e)
   }
 
-  // Seed default system settings (idempotent, cross-driver)
+  // Seed default system settings (idempotent, cross-driver); 一次读全量 key 再补插, 避免逐条 SELECT
+  const existingKeys = new Set(
+    (await db.all<{ key_name: string }>('SELECT key_name FROM system_settings').catch(() => [])).map((r) => r.key_name),
+  )
   for (const s of DEFAULT_SETTINGS) {
-    const exists = await db.get('SELECT key_name FROM system_settings WHERE key_name = ?', [s.key])
-    if (!exists) {
-      await db.run(
-        'INSERT INTO system_settings (key_name, value, description) VALUES (?, ?, ?)',
-        [s.key, s.value, s.description],
-      )
-    }
+    if (existingKeys.has(s.key)) continue
+    await db.run(
+      'INSERT INTO system_settings (key_name, value, description) VALUES (?, ?, ?)',
+      [s.key, s.value, s.description],
+    )
   }
 }
 

@@ -200,11 +200,16 @@ class D1Adapter implements DatabaseAdapter {
     return { changes: r.meta?.changes ?? 0, lastInsertId: r.meta?.last_row_id ?? 0 }
   }
   async exec(sql: string): Promise<void> {
-    // D1 has no exec; split & run statements
+    // D1 has no exec; single statement runs directly, multi-statement packs into
+    // one batch round-trip (schema init on cold start drops from ~130 sequential
+    // round-trips to a single call)
     const stmts = sql.split(';').map((s) => s.trim()).filter(Boolean)
-    for (const s of stmts) {
-      await this.d1.prepare(s).run()
+    if (!stmts.length) return
+    if (stmts.length === 1) {
+      await this.d1.prepare(stmts[0]).run()
+      return
     }
+    await this.d1.batch(stmts.map((s) => this.d1.prepare(s)))
   }
   async transaction<T>(fn: () => Promise<T>): Promise<T> {
     // D1 batch is non-interactive; emulate best-effort (no nested tx)

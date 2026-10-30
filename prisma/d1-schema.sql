@@ -318,6 +318,12 @@ CREATE TABLE engine_subscribers (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
+CREATE TABLE engine_event_dedup (
+    event_id VARCHAR(80) PRIMARY KEY,
+    actions_json TEXT DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
 CREATE TABLE engines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug VARCHAR(32) NOT NULL UNIQUE,

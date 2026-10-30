@@ -55,7 +55,7 @@
 - 🛡️ **管理后台** — 用户管理、操作审计日志、风控日志、数据备份恢复、ER 图
 - 🎨 **多主题** — 5 种主题色实时切换、深浅色模式、响应式设计
 - ⌨️ **快捷操作** — Cmd+K 命令面板、键盘快捷键、批量操作倒计时确认
-- 📱 **PWA** — 离线缓存、可安装到桌面
+- 📱 **移动适配** — 响应式设计, 移动端管理无忧
 - 🗄️ **多数据库** — SQLite / MySQL / Cloudflare D1 / 内存模式无缝切换
 - ☁️ **双环境** — Node.js 自托管 + Cloudflare Pages Serverless
 
@@ -391,7 +391,7 @@ xianyu-admin/
 │   ├── utils/              # 工具 (db, auth, config, response, audit, schema)
 │   ├── plugins/            # 服务端插件 (init, audit)
 │   └── middleware/         # 服务端中间件 (install guard)
-├── public/                 # 静态资源 (favicon, manifest, sw.js)
+├── public/                 # 静态资源 (favicon, robots)
 ├── nuxt.config.ts          # Nuxt 配置
 ├── tailwind.config.js      # Tailwind 配置
 ├── wrangler.toml.example   # Cloudflare 配置模板
