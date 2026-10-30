@@ -3,9 +3,11 @@
  *
  * 引擎存活判定 (如实反映, 不拿账号状态冒充引擎状态):
  *   - 内置引擎: 进程内调度器运行中 (isBuiltinEngineRunning) 或心跳 (engines.last_seen_at) 新鲜 ≤ 60s
- *   - 远程代理: last_seen_at 新鲜 ≤ 60s
+ *   - 远程代理: 登记地址 /health 实测 (未登记地址回退 last_seen_at 新鲜度 ≤ 60s)
  * 账号状态为每账号独立心跳: listening/connecting/reconnecting/risk_cooldown/need_relogin/error
  */
+import { probeEngines } from '../../utils/xianyu/engine-probe'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
@@ -66,15 +68,27 @@ export default defineEventHandler(
       .map((a) => ({ id: a.id, remark: a.remark, username: a.username, streak: a.token_fail_streak }))
 
     // 内置引擎存活: 进程内调度器真实运行状态优先, 心跳新鲜度兜底 (跨进程/重启后也如实)
-    const engineRows = await db.all<any>(`SELECT slug, type, is_active, last_seen_at FROM engines`)
+    // 远程代理存活: 登记地址 /health 实测 (与引擎列表同一判定源); 未登记地址回退轮询心跳
+    const engineRows = await db.all<any>(`SELECT slug, type, is_active, host, port, last_seen_at FROM engines`)
     const parseTs = (v: any) => (v ? new Date(String(v).replace(' ', 'T') + 'Z').getTime() || 0 : 0)
     const builtinRow = engineRows.find((e) => e.slug === 'builtin')
     const remoteRows = engineRows.filter((e) => e.type === 'remote' && e.is_active === 1)
     const inProcessRunning = typeof isBuiltinEngineRunning === 'function' ? isBuiltinEngineRunning() : false
     const builtinHeartbeatFresh = !!builtinRow?.last_seen_at && now - parseTs(builtinRow.last_seen_at) < FRESH_MS
     const builtinOnline = inProcessRunning || builtinHeartbeatFresh
-    const remoteOnline = remoteRows.some((e) => now - parseTs(e.last_seen_at) < FRESH_MS)
-    const engineRunning = builtinOnline || remoteOnline
+
+    const withAddr = remoteRows.filter((e) => e.host && e.port)
+    const remoteProbes = withAddr.length
+      ? await probeEngines(withAddr.map((e) => ({ id: e.id, host: e.host, port: e.port })))
+      : new Map()
+    const remoteOnline = withAddr.length
+      ? [...remoteProbes.values()].some((p) => p.ok && p.engine_active)
+      : remoteRows.some((e) => now - parseTs(e.last_seen_at) < FRESH_MS)
+
+    // 引擎状态 = 当前「使用中」引擎是否真实在服务:
+    // 内置引擎待命 (远程代理使用中) 时其心跳不冒充引擎存活
+    const activeEngine = engineRows.find((e) => e.is_active === 1)
+    const engineRunning = activeEngine ? (activeEngine.slug === 'builtin' ? builtinOnline : remoteOnline) : false
 
     // 引擎相关系统设置回显
     const settingRows = await db.all<any>(

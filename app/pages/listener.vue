@@ -72,8 +72,8 @@
                     <span class="text-amber-600 dark:text-amber-400">不可用</span>
                   </template>
                   <template v-else>
-                    <span class="inline-block w-2 h-2 rounded-full" :class="e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'" />
-                    <span class="text-slate-500 dark:text-slate-400">{{ e.online ? '在线' : '离线' }}</span>
+                    <span class="inline-block w-2 h-2 rounded-full" :class="engineStatusMeta(e).dot" />
+                    <span class="text-slate-500 dark:text-slate-400" :title="engineStatusMeta(e).tip">{{ engineStatusMeta(e).label }}</span>
                   </template>
                 </span>
               </td>
@@ -177,7 +177,7 @@
         <p class="mt-2 text-xl font-semibold" :class="status?.engine_online ? 'text-emerald-600 dark:text-emerald-400' : enginesRuntime === 'cloudflare' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'">
           {{ status?.engine_online ? '运行中' : enginesRuntime === 'cloudflare' ? '待接入代理' : '未运行' }}
         </p>
-        <p class="text-slate-400 mt-1">{{ enginesRuntime === 'cloudflare' ? 'Cloudflare 无常驻进程，内置引擎不可用；部署独立代理后「设为使用」' : '按内置引擎进程心跳判定，与账号状态无关' }}</p>
+        <p class="text-slate-400 mt-1">{{ enginesRuntime === 'cloudflare' ? 'Cloudflare 无常驻进程，内置引擎不可用；部署独立代理后「设为使用」' : '内置=进程心跳；远程代理=登记地址健康实测，与账号状态无关' }}</p>
       </div>
       <div class="card p-4">
         <div class="flex items-center gap-2 text-slate-500 dark:text-slate-400">
@@ -306,7 +306,7 @@
           </div>
           <div>
             <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1.5">端口（选填）</label>
-            <input v-model.number="form.port" type="number" min="0" class="input w-full" placeholder="代理健康检查端口，仅登记展示用" />
+            <input v-model.number="form.port" type="number" min="0" class="input w-full" placeholder="代理健康检查端口 XY_PROXY_PORT；登记后按此地址实测在线状态" />
           </div>
         </template>
         <div>
@@ -451,6 +451,32 @@ const snippetCopied = ref(false)
 function maskToken(token: string): string {
   if (!token) return '未生成'
   return token.length > 12 ? `${token.slice(0, 8)}••••••••${token.slice(-4)}` : token
+}
+
+/** 在线状态列四态: 在线(实测健康) / 待拉取(进程活着但未在服务) / 地址不可达(实测失败) / 心跳回退 */
+function engineStatusMeta(e: EngineRow): { label: string; dot: string; tip: string } {
+  if (e.type === 'builtin') {
+    return { label: e.online ? '在线' : '离线', dot: e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600', tip: '按内置引擎进程心跳判定' }
+  }
+  if (e.health) {
+    if (e.health.engine_active) {
+      const listening = e.health.accounts.filter((a) => a.state === 'listening').length
+      return {
+        label: '在线',
+        dot: 'bg-emerald-500',
+        tip: `健康检查通过 · ${e.health.script_version || '未知版本'} · 账号 ${e.health.accounts.length} 个${listening ? `（监听中 ${listening}）` : ''} · 运行 ${e.health.uptime_seconds}s`,
+      }
+    }
+    return { label: '待拉取', dot: 'bg-amber-500', tip: '代理进程在线但未在服务（未拉到本引擎配置）— 核对代理 XY_ENGINE_TOKEN 是否为本引擎令牌，以及本引擎是否已「设为使用」' }
+  }
+  if (e.health_error) {
+    return {
+      label: '地址不可达',
+      dot: 'bg-rose-500',
+      tip: `健康检查失败：${e.health_error}${e.pull_online ? ' — 但令牌轮询正常，说明有别的实例持同一令牌回连：核对部署地址是否填错' : ''}`,
+    }
+  }
+  return { label: e.online ? '在线' : '离线', dot: e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600', tip: '未登记部署地址，按令牌轮询心跳判定（登记地址后启用健康实测）' }
 }
 
 const deploySnippet = computed(() => {

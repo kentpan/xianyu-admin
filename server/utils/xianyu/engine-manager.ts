@@ -7,8 +7,8 @@
  *   - 每 10s 心跳回写: engines.last_seen_at (内置行) + cookies.cookie_status_text/last_check_at
  *   - 事件 → brain 决策 → 动作执行 (发文本/发图片)
  */
-import crypto from 'node:crypto'
 import { getDb } from '../db'
+import { generateEngineToken } from '../engine-auth'
 import { XianyuAccountClient, type AccountState, type ManualTokenOutcome } from './ws-client'
 import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 import { fetchItemList, polishItem, fetchOrderDetail } from './mtop'
@@ -634,8 +634,6 @@ export async function ensureEngineTokens(): Promise<void> {
   if (!db) return
   const rows = await db.all<any>("SELECT id FROM engines WHERE token IS NULL OR token = ''").catch(() => [])
   for (const row of rows) {
-    await db
-      .run('UPDATE engines SET token = ? WHERE id = ?', [crypto.randomBytes(24).toString('hex'), row.id])
-      .catch(() => {})
+    await db.run('UPDATE engines SET token = ? WHERE id = ?', [generateEngineToken(), row.id]).catch(() => {})
   }
 }
