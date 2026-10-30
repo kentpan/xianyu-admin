@@ -166,6 +166,7 @@ function strategyMeta(log: ReplyLog) {
 function sendMeta(sendStatus: string) {
   switch (sendStatus) {
     case 'success': return { label: '已发送', cls: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400' }
+    case 'sent': return { label: '已下发', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
     case 'failed': return { label: '发送失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
     default: return { label: '未发送', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
   }

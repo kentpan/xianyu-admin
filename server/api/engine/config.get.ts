@@ -22,12 +22,13 @@ export default defineEventHandler(
 
     const db = await getDb()
     const active = !!engine.is_active
+    const pollIp = enginePollIp(event)
 
     if (!active) {
       await db
         .run(
-          "UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = 'standby' WHERE id = ?",
-          [engine.id],
+          "UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = 'standby', last_poll_ip = ? WHERE id = ?",
+          [pollIp, engine.id],
         )
         .catch(() => {})
       return ok({ active: false, accounts: [], intervals: { poll_seconds: 30 } })
@@ -42,8 +43,8 @@ export default defineEventHandler(
 
     await db
       .run(
-        "UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ? WHERE id = ?",
-        [`serving accounts=${accounts.length}`, engine.id],
+        'UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?',
+        [`serving accounts=${accounts.length}`, pollIp, engine.id],
       )
       .catch(() => {})
 

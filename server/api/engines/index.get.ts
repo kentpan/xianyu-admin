@@ -11,8 +11,9 @@ import { probeEngines, type EngineProbeResult } from '../../utils/xianyu/engine-
  *
  * 在线判定:
  *   - 内置引擎: last_seen_at 60s 新鲜度
- *   - 远程代理: 登记地址 /health 实测为准 (令牌轮询心跳只证明"某处有实例在回连",
- *     证明不了登记地址存活); 未登记地址时回退轮询心跳
+ *   - 远程代理: 登记地址 /health 实测优先; 实测失败时回退「回连来源核验」——
+ *     心跳新鲜 且 回连来源 IP (cf-connecting-ip/XFF, 不可伪造) 与登记 host 一致 → 在线
+ *     (随机填写的地址永远对不上回连来源; CF 边缘出站实测受限时不误杀真实代理)
  */
 export default defineEventHandler(
   withApi(async (event) => {
@@ -41,7 +42,9 @@ export default defineEventHandler(
         : 0
       const pullOnline = !!lastSeen && now - lastSeen < FRESH_MS
       const probe: EngineProbeResult | undefined = probes.get(r.id)
-      const online = r.type === 'remote' && r.host && r.port ? !!probe?.ok : pullOnline
+      const pollIp = String(r.last_poll_ip || '')
+      const pollVerified = pullOnline && !!pollIp && !!r.host && pollIp === String(r.host).trim()
+      const online = r.type === 'remote' && r.host && r.port ? !!probe?.ok || pollVerified : pullOnline
       return {
         id: r.id,
         slug: r.slug,
@@ -56,6 +59,10 @@ export default defineEventHandler(
         online,
         /** 令牌轮询心跳是否新鲜 (与 online 分离: 地址不可达但令牌在回连时, 说明地址填错/令牌被共用) */
         pull_online: pullOnline,
+        /** 回连核验: 心跳新鲜且来源 IP 与登记 host 一致 (探测失败时的在线兜底判定源) */
+        poll_verified: pollVerified,
+        /** 最近一次回连来源 IP (tooltip 展示, 便于发现登记地址与实际部署点不符) */
+        poll_ip: pollIp,
         /** /health 实测详情 (探测成功时; engine_active=false = 进程活着但未在服务) */
         health:
           probe && probe.ok

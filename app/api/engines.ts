@@ -22,6 +22,10 @@ export interface EngineRow {
   online: boolean
   /** 令牌轮询心跳是否新鲜（地址不可达但该项为 true → 地址填错或令牌被别的实例共用） */
   pull_online?: boolean
+  /** 回连核验：心跳新鲜且来源 IP 与登记 host 一致（探测失败时的在线兜底判定源） */
+  poll_verified?: boolean
+  /** 最近一次回连来源 IP（cf-connecting-ip/XFF） */
+  poll_ip?: string
   /** /health 实测详情（探测成功时） */
   health?: EngineHealth | null
   /** /health 探测失败原因 */

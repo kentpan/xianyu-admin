@@ -68,8 +68,11 @@ export default defineEventHandler(
       .map((a) => ({ id: a.id, remark: a.remark, username: a.username, streak: a.token_fail_streak }))
 
     // 内置引擎存活: 进程内调度器真实运行状态优先, 心跳新鲜度兜底 (跨进程/重启后也如实)
-    // 远程代理存活: 登记地址 /health 实测 (与引擎列表同一判定源); 未登记地址回退轮询心跳
-    const engineRows = await db.all<any>(`SELECT slug, type, is_active, host, port, last_seen_at FROM engines`)
+    // 远程代理存活: 登记地址 /health 实测 (与引擎列表同一判定源);
+    //   实测失败时回退「回连来源核验」: 心跳新鲜 且 回连来源 IP 与登记 host 一致 (cf-connecting-ip/XFF 不可伪造)
+    const engineRows = await db.all<any>(
+      `SELECT slug, type, is_active, host, port, last_seen_at, last_poll_ip FROM engines`,
+    )
     const parseTs = (v: any) => (v ? new Date(String(v).replace(' ', 'T') + 'Z').getTime() || 0 : 0)
     const builtinRow = engineRows.find((e) => e.slug === 'builtin')
     const remoteRows = engineRows.filter((e) => e.type === 'remote' && e.is_active === 1)
@@ -81,8 +84,13 @@ export default defineEventHandler(
     const remoteProbes = withAddr.length
       ? await probeEngines(withAddr.map((e) => ({ id: e.id, host: e.host, port: e.port })))
       : new Map()
+    const pollVerified = (e: any) =>
+      !!e.host &&
+      now - parseTs(e.last_seen_at) < FRESH_MS &&
+      !!e.last_poll_ip &&
+      String(e.last_poll_ip) === String(e.host).trim()
     const remoteOnline = withAddr.length
-      ? [...remoteProbes.values()].some((p) => p.ok && p.engine_active)
+      ? [...remoteProbes.values()].some((p) => p.ok && p.engine_active) || remoteRows.some((e) => pollVerified(e))
       : remoteRows.some((e) => now - parseTs(e.last_seen_at) < FRESH_MS)
 
     // 引擎状态 = 当前「使用中」引擎是否真实在服务:

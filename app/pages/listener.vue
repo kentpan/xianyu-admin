@@ -470,10 +470,17 @@ function engineStatusMeta(e: EngineRow): { label: string; dot: string; tip: stri
     return { label: '待拉取', dot: 'bg-amber-500', tip: '代理进程在线但未在服务（未拉到本引擎配置）— 核对代理 XY_ENGINE_TOKEN 是否为本引擎令牌，以及本引擎是否已「设为使用」' }
   }
   if (e.health_error) {
+    if (e.online && e.poll_verified) {
+      return {
+        label: '在线',
+        dot: 'bg-emerald-500',
+        tip: `代理回连心跳正常，来源 IP（${e.poll_ip}）与登记地址一致 → 在线。登记地址实测未通过（${e.health_error}），不影响监听链路`,
+      }
+    }
     return {
       label: '地址不可达',
       dot: 'bg-rose-500',
-      tip: `健康检查失败：${e.health_error}${e.pull_online ? ' — 但令牌轮询正常，说明有别的实例持同一令牌回连：核对部署地址是否填错' : ''}`,
+      tip: `健康检查失败：${e.health_error}${e.poll_ip ? ` · 最近回连来源 IP：${e.poll_ip}${e.pull_online ? '（与登记地址不符：核对部署地址是否填错，或令牌被别的实例共用）' : ''}` : e.pull_online ? ' — 但令牌轮询正常，说明有别的实例持同一令牌回连：核对部署地址是否填错' : ''}`,
     }
   }
   return { label: e.online ? '在线' : '离线', dot: e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600', tip: '未登记部署地址，按令牌轮询心跳判定（登记地址后启用健康实测）' }

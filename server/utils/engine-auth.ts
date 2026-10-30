@@ -9,7 +9,7 @@
  */
 import crypto from 'node:crypto'
 import type { H3Event } from 'h3'
-import { createError } from 'h3'
+import { createError, getRequestIP } from 'h3'
 import { getDb } from './db'
 
 export interface EngineIdentity {
@@ -33,6 +33,19 @@ export function extractBearerToken(event: H3Event): string {
   const auth = getHeader(event, 'authorization') || ''
   if (!auth.toLowerCase().startsWith('bearer ')) return ''
   return auth.slice(7).trim()
+}
+
+/**
+ * 代理回连来源真实 IP: CF 边缘注入的 cf-connecting-ip 不可伪造 (生产判定源),
+ * 自托管取 XFF 首个 (反代追加) 兜底直连地址。用于「登记地址 = 回连来源」核验。
+ */
+export function enginePollIp(event: H3Event): string {
+  return (
+    getHeader(event, 'cf-connecting-ip') ||
+    String(getHeader(event, 'x-forwarded-for') || '').split(',')[0].trim() ||
+    getRequestIP(event) ||
+    ''
+  ).slice(0, 64)
 }
 
 /**

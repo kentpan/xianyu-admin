@@ -208,10 +208,22 @@ export default defineEventHandler(
 
     await db
       .run(
-        'UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ? WHERE id = ?',
-        [`events=${events.length} actions=${actions.length}`, engine.id],
+        'UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?',
+        [`events=${events.length} actions=${actions.length}`, enginePollIp(event), engine.id],
       )
       .catch(() => {})
+
+    // 动作已随本轮轮询响应投递给代理 → 决策日志标记「已下发」(旧版代理无 action_result 回报时,
+    // 发送状态不再永远停在未发送; 新版代理回报后升级为已发送/发送失败)
+    const deliveredLogIds = [...new Set(actions.map((a) => Number((a as any).log_id || 0)).filter((v) => v > 0))]
+    if (deliveredLogIds.length) {
+      await db
+        .run(
+          `UPDATE auto_reply_logs SET send_status = 'sent' WHERE send_status = 'pending' AND id IN (${deliveredLogIds.map(() => '?').join(',')})`,
+          deliveredLogIds,
+        )
+        .catch(() => {})
+    }
 
     return ok({ actions })
   }),

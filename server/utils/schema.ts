@@ -523,6 +523,7 @@ const SCHEMA: string[] = [
     is_active INTEGER DEFAULT 0,
     last_seen_at TIMESTAMP,
     last_status TEXT,
+    last_poll_ip VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -642,6 +643,8 @@ const MIGRATIONS: string[] = [
   // 监听引擎: 通知规则事件类型过滤
   `ALTER TABLE message_notifications ADD COLUMN name VARCHAR(128) DEFAULT ''`,
   `ALTER TABLE message_notifications ADD COLUMN event_types TEXT`,
+  // 监听引擎: 回连来源 IP (cf-connecting-ip/XFF, 不可伪造) — 登记地址与回连来源一致即真实部署点
+  `ALTER TABLE engines ADD COLUMN last_poll_ip VARCHAR(64) DEFAULT ''`,
   // 监听引擎注册表 (新建表, CREATE IF NOT EXISTS 幂等) + 内置引擎种子行
   `CREATE TABLE IF NOT EXISTS engines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

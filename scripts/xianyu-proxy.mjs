@@ -799,6 +799,7 @@ class XianyuAccountClient {
     this.riskStreak = 0
     this.connectionFailures = 0
     this.generation = 0
+    this.lastDownstreamAt = Date.now()
 
     this.sendChain = Promise.resolve()
     this.sendTimestamps = []
@@ -924,6 +925,15 @@ class XianyuAccountClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     const tick = () => {
       if (this.stopped || gen !== this.generation) return
+      // 静默断线检测 (与后台内置引擎同源): 正常连接心跳回包 ≤15s 一帧,
+      // 超过 6 个心跳周期无任何下行帧 = TCP 半开假死, 不主动重连会永远停在 listening 却收不到消息
+      if (Date.now() - this.lastDownstreamAt > 90_000) {
+        log(`账号 ${this.cookieId} 连接静默超过 90s (无任何下行帧), 判定假死, 主动断开重连`)
+        try {
+          ws.close()
+        } catch {}
+        return
+      }
       try {
         if (ws.readyState === 1) ws.send(buildHeartbeatMsg())
       } catch {}
@@ -936,6 +946,7 @@ class XianyuAccountClient {
     await new Promise((resolve) => {
       ws.addEventListener('message', (ev) => {
         if (gen !== this.generation || this.stopped) return resolve()
+        this.lastDownstreamAt = Date.now()
         const raw = typeof ev.data === 'string' ? ev.data : ''
         if (!raw) return
         let message
@@ -1503,6 +1514,7 @@ if (PROXY_PORT > 0) {
       res.end(
         JSON.stringify({
           ok: true,
+          script_version: 'v2.0.9',
           engine_active: engineActive,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),
           uptime_seconds: Math.round(process.uptime()),
