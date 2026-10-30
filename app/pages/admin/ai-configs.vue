@@ -155,7 +155,39 @@
               <Icon name="sparkles" /> {{ testing ? '测试中...' : '发送测试' }}
             </button>
           </div>
-          <p v-if="testReply" class="mt-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 p-3 text-emerald-700 dark:text-emerald-300 whitespace-pre-wrap">AI 回复: {{ testReply }}</p>
+          <p v-if="testReply" class="mt-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 p-3 text-emerald-700 dark:text-emerald-300 whitespace-pre-wrap break-all">AI 回复: {{ testReply }}</p>
+          <p v-if="testError" class="mt-2 rounded-lg bg-red-50 dark:bg-red-900/20 p-3 text-red-600 dark:text-red-300 whitespace-pre-wrap">{{ testError }}</p>
+          <!-- 调试面板: 原始发送 URL 与响应 (能用的 API 报「未返回内容」时, 对照这里一眼定位) -->
+          <div v-if="testDebug" class="mt-2 rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
+            <div class="px-3 py-2 bg-slate-50 dark:bg-slate-800/60 flex items-center justify-between gap-2 flex-wrap">
+              <span class="font-semibold text-slate-700 dark:text-slate-200">请求 / 响应详情</span>
+              <span class="badge" :class="testDebug.status >= 200 && testDebug.status < 300 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'">
+                HTTP {{ testDebug.status || '—' }} · {{ testDebug.elapsed_ms }}ms
+              </span>
+            </div>
+            <div class="p-3 space-y-2">
+              <div class="flex gap-2 flex-wrap">
+                <span class="text-slate-400 shrink-0 w-20">基础 URL</span>
+                <span class="font-mono break-all text-slate-700 dark:text-slate-200">{{ baseUrlPreview }}</span>
+              </div>
+              <div class="flex gap-2 flex-wrap">
+                <span class="text-slate-400 shrink-0 w-20">发送 URL</span>
+                <span class="font-mono break-all text-slate-700 dark:text-slate-200">{{ testDebug.url }}</span>
+              </div>
+              <div v-if="testDebug.error" class="flex gap-2 flex-wrap">
+                <span class="text-slate-400 shrink-0 w-20">错误</span>
+                <span class="text-red-500 break-all">{{ testDebug.error }}</span>
+              </div>
+              <details>
+                <summary class="cursor-pointer select-none text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">发送体 (JSON)</summary>
+                <pre class="mt-1 p-2 rounded bg-slate-50 dark:bg-slate-800/60 overflow-x-auto whitespace-pre-wrap break-all font-mono text-slate-600 dark:text-slate-300">{{ prettyBody(testDebug.request_body) }}</pre>
+              </details>
+              <details>
+                <summary class="cursor-pointer select-none text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">响应原文</summary>
+                <pre class="mt-1 p-2 rounded bg-slate-50 dark:bg-slate-800/60 overflow-x-auto whitespace-pre-wrap break-all font-mono text-slate-600 dark:text-slate-300">{{ prettyBody(testDebug.response_body) || '(空)' }}</pre>
+              </details>
+            </div>
+          </div>
         </div>
       </div>
       <template #footer>
@@ -172,7 +204,7 @@
 
 <script setup lang="ts">
 import { getAiConfigs, createAiConfig, updateAiConfig, deleteAiConfig, testAiConfig } from '~/api/ai-configs'
-import type { AiConfig } from '~/api/ai-configs'
+import type { AiConfig, AiTestDebug } from '~/api/ai-configs'
 
 definePageMeta({ layout: 'default' })
 
@@ -195,6 +227,21 @@ const form = ref<any>({ name: '', model_name: 'qwen-plus', api_key: '', api_key_
 const testMessage = ref('')
 const testing = ref(false)
 const testReply = ref('')
+const testError = ref('')
+const testDebug = ref<AiTestDebug | null>(null)
+
+const baseUrlPreview = computed(() => {
+  const u = String(testDebug.value?.url || '')
+  return u.replace(/\/chat\/completions$/, '') || form.value.base_url || '—'
+})
+
+function prettyBody(s: string): string {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2)
+  } catch {
+    return s
+  }
+}
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
@@ -231,6 +278,8 @@ function openCreate() {
   editing.value = false
   editingId.value = 0
   testReply.value = ''
+  testError.value = ''
+  testDebug.value = null
   form.value = { name: '', model_name: 'qwen-plus', api_key: '', api_key_masked: false, base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', enabled: true, remark: '' }
   modalOpen.value = true
 }
@@ -239,6 +288,8 @@ function openEdit(c: AiConfig) {
   editing.value = true
   editingId.value = c.id
   testReply.value = ''
+  testError.value = ''
+  testDebug.value = null
   form.value = {
     name: c.name,
     model_name: c.model_name,
@@ -315,7 +366,8 @@ async function quickTest(c: AiConfig) {
   testingId.value = c.id
   try {
     const r = await testAiConfig(c.id, '你好，这个能便宜点吗')
-    toast.success(`「${c.name}」连通正常 (${r.model}): ${r.reply.slice(0, 60)}`)
+    if (r.ok) toast.success(`「${c.name}」连通正常 (${r.model}): ${r.reply.slice(0, 60)}`)
+    else toast.error(`「${c.name}」${r.error || '测试未通过'} — 打开编辑弹窗查看请求/响应详情`)
   } catch (e: any) {
     toast.error(e.message || '测试失败')
   } finally {
@@ -327,11 +379,15 @@ async function runTest() {
   if (!editing.value) return
   testing.value = true
   testReply.value = ''
+  testError.value = ''
+  testDebug.value = null
   try {
     const r = await testAiConfig(editingId.value, testMessage.value)
     testReply.value = r.reply
+    testDebug.value = r.debug || null
+    if (!r.ok) testError.value = r.error || 'AI 接口未返回内容, 请根据下方请求/响应原文排查'
   } catch (e: any) {
-    toast.error(e.message || '测试失败')
+    testError.value = e.message || '测试失败'
   } finally {
     testing.value = false
   }

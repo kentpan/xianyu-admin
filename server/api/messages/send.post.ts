@@ -22,6 +22,13 @@ export default defineEventHandler(
     } catch (e: any) {
       throw new ApiError(409, e?.message || '发送失败 (账号不在线或引擎未托管)')
     }
+    // 人工介入暂停: 后台手动回复后该会话自动回复暂停 pause_duration 分钟 (与 APP isSelf 暂停同语义,
+    // 落库 chat_pauses 全局可见 — 否则卖家正在对话中引擎还会插一条自动回复)
+    const pauseRow = await db
+      .get<{ pause_duration: number }>('SELECT pause_duration FROM cookies WHERE id = ?', [cookieId])
+      .catch(() => null)
+    const { pauseChatAutoReply } = await import('../../utils/xianyu/brain')
+    await pauseChatAutoReply(db, cookieId, chatId, Number(pauseRow?.pause_duration ?? 10))
     return ok({ sent: true }, '已发送')
   }),
 )

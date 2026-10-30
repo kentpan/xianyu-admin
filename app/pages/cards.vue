@@ -220,23 +220,79 @@
         </div>
 
         <!-- Type-specific content -->
-        <div v-if="form.type === 'api'">
-          <label class="label">API 配置 (JSON)</label>
-          <textarea v-model="form.api_config" rows="6" class="input font-mono text-xs" placeholder='{"url":"https://...","method":"POST","headers":{}}'></textarea>
-          <p class="text-slate-400 mt-1">发货时请求外部接口，data_path 指定从响应 JSON 提取发货文本的字段路径（如 data.url 取加密提取页链接）</p>
-          <div class="mt-2 flex flex-wrap gap-2">
-            <button type="button" class="btn-secondary !py-1.5 !px-3" @click="fillCardsHubTemplate">填入 cards-hub 加密 URL 发货模板</button>
-            <button type="button" class="btn-ghost !py-1.5 !px-3" @click="testApiConfig">测试请求</button>
-            <span v-if="apiTestResult" class="self-center text-slate-500 break-all">{{ apiTestResult }}</span>
+        <div v-if="form.type === 'api'" class="space-y-4">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="sm:col-span-2">
+              <label class="label">接口地址 <span class="text-red-500">*</span></label>
+              <input v-model="form.api_url" class="input" placeholder="https://你的-cards-hub-域名/api/issue" />
+            </div>
+            <div>
+              <label class="label">请求方式</label>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  v-for="m in ['GET', 'POST']"
+                  :key="m"
+                  type="button"
+                  class="rounded-lg border px-2 py-2 transition-colors"
+                  :class="form.api_method === m
+                    ? 'border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-900/20 dark:text-brand-300'
+                    : 'border-slate-200 text-slate-600 hover:border-slate-300 dark:border-slate-700 dark:text-slate-300'"
+                  @click="form.api_method = m"
+                >
+                  {{ m }}
+                </button>
+              </div>
+            </div>
           </div>
-          <div class="mt-2 rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="label">鉴权密钥 (apikey)</label>
+              <input v-model="form.api_key" class="input font-mono" placeholder="ak-... / sk-..." />
+              <p class="text-slate-400 mt-1">发货时 {apikey} 替换为这里填写的密钥</p>
+            </div>
+            <div>
+              <label class="label">返回数据格式 (data_path)</label>
+              <input v-model="form.data_path" class="input font-mono" placeholder="data.url" />
+              <p class="text-slate-400 mt-1">从响应 JSON 提取分享链接的字段路径, 如 data.url</p>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3 space-y-2">
+            <p class="font-medium text-slate-700 dark:text-slate-200">请求参数勾选 (发货时代码自动拼装进请求)</p>
+            <div class="flex flex-wrap gap-x-6 gap-y-2">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input v-model="form.use_auth" type="checkbox" class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500" />
+                <span class="text-slate-700 dark:text-slate-200">鉴权头 Authorization: Bearer {apikey}</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input v-model="form.use_title" type="checkbox" class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500" />
+                <span class="text-slate-700 dark:text-slate-200">商品名称 title</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input v-model="form.use_price" type="checkbox" class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500" />
+                <span class="text-slate-700 dark:text-slate-200">价格 price</span>
+              </label>
+            </div>
+            <p class="text-slate-400">勾选后以 POST JSON 拼装请求体 (title/price 发货时替换为实际商品值); 不勾选则发 GET 无体</p>
+          </div>
+          <div class="flex flex-wrap gap-2 items-center">
+            <button type="button" class="btn-secondary !py-1.5 !px-3" @click="fillCardsHubTemplate">填入 cards-hub 模板</button>
+            <button type="button" class="btn-ghost !py-1.5 !px-3" :disabled="apiTesting" @click="testApiConfig">测试请求</button>
+            <span v-if="apiTestResult" class="text-slate-500 break-all">{{ apiTestResult }}</span>
+          </div>
+          <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
             <p class="text-slate-600 dark:text-slate-300 font-medium">对接 cloudflare-cards-hub（资源交付系统）</p>
-            <p class="text-slate-500 mt-1">填入模板后改 3 处：① url 换成你的 cards-hub 域名 ② Authorization 换成「APIKEY 管理」里的 ak- 开头密钥 ③ body.script_id 换成资源管理里的资源 ID。发货时自动调 /api/issue 生成一单一密的加密提取页链接发给买家，买家打开即自动核销下载（全程看不到真实文件路径）。</p>
+            <p class="text-slate-500 mt-1">填入模板后改 3 处：① 接口地址换你的 cards-hub 域名 ② 鉴权密钥填「APIKEY 管理」里的 ak- 密钥 ③ 资源 ID。发货时自动调 /api/issue 生成一单一密的加密提取页链接发给买家，买家打开即自动核销下载（全程看不到真实文件路径）。</p>
+          </div>
+          <div>
+            <label class="label">发货文案 (可选)</label>
+            <textarea id="card-input-text_content" v-model="form.text_content" rows="3" class="input" placeholder="留空发送接口返回原文；可写 恭喜购买{title}！您的资源链接：{shareURL} 请查收" />
+            <VarHints @insert="(v: string) => insertVar('text_content', v)" />
           </div>
         </div>
         <div v-else-if="form.type === 'text'">
           <label class="label">文本内容</label>
-          <textarea v-model="form.text_content" rows="4" class="input" placeholder="直接回复的文本内容" />
+          <textarea id="card-input-text_content" v-model="form.text_content" rows="4" class="input" placeholder="直接回复的文本内容" />
+          <VarHints @insert="(v: string) => insertVar('text_content', v)" />
         </div>
         <div v-else-if="form.type === 'code'" class="rounded-lg border border-slate-200 dark:border-slate-700 p-4 space-y-4">
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -279,19 +335,28 @@
           </div>
           <div>
             <label class="label">卡密文案</label>
-            <input v-model="form.code_template" class="input" placeholder="你的验证码为: {code}, 请复制后加群验证!" />
-            <p class="text-xs text-slate-400 mt-1">发货时发送给买家的消息，{code} 会替换为本次生成的随机卡密；留空使用默认文案</p>
+            <input id="card-input-code_template" v-model="form.code_template" class="input" placeholder="你的验证码为: {code}, 请复制后加群验证!" />
+            <div class="flex items-center gap-2 mt-1 flex-wrap">
+              <p class="text-xs text-slate-400">发货时发送给买家的消息，{code} 会替换为本次生成的随机卡密</p>
+              <VarHints inline @insert="(v: string) => insertVar('code_template', v)" />
+            </div>
           </div>
         </div>
         <div v-else-if="form.type === 'image'">
           <label class="label">图片 URL</label>
           <input v-model="form.image_url" class="input" placeholder="https://.../card.png" />
+          <div class="mt-2">
+            <label class="label">随图文字 (可选)</label>
+            <textarea id="card-input-text_content" v-model="form.text_content" rows="2" class="input" placeholder="随图片一起发送的文本" />
+            <VarHints @insert="(v: string) => insertVar('text_content', v)" />
+          </div>
         </div>
 
         <div>
           <label class="label">消息回复</label>
-          <textarea v-model="form.description" rows="2" class="input" placeholder="可选，如 感谢购买，请加群 xxx 获取售后" />
+          <textarea id="card-input-description" v-model="form.description" rows="2" class="input" placeholder="可选，如 感谢购买，请加群 xxx 获取售后" />
           <p class="text-xs text-slate-400 mt-1">发货时随卡券内容一起发送给买家；留空则发货时不同时发送消息</p>
+          <VarHints @insert="(v: string) => insertVar('description', v)" />
         </div>
 
         <div class="grid grid-cols-2 gap-3">
@@ -438,7 +503,13 @@ const form = ref<any>({
   id: null,
   name: '',
   type: 'text',
-  api_config: '',
+  api_url: '',
+  api_method: 'POST',
+  api_key: '',
+  use_auth: true,
+  use_title: true,
+  use_price: true,
+  data_path: 'data.url',
   text_content: '',
   image_url: '',
   code_length: 6,
@@ -475,35 +546,67 @@ const apiTestResult = ref('')
 /** 一键填入 cards-hub (资源交付系统) 加密 URL 发货模板, 用户只需改域名/密钥/资源 ID 三处 */
 function fillCardsHubTemplate() {
   form.value.type = 'api'
-  form.value.api_config = JSON.stringify(
-    {
-      url: 'https://你的-cards-hub-域名/api/issue',
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        Authorization: 'Bearer ak-你的APIKEY',
-      },
-      body: {
-        title: form.value.name || '商品名称',
-        price: 9.9,
-        script_id: 1,
-      },
-      data_path: 'data.url',
-    },
-    null,
-    2,
-  )
+  form.value.api_url = 'https://你的-cards-hub-域名/api/issue'
+  form.value.api_method = 'POST'
+  form.value.api_key = 'ak-你的APIKEY'
+  form.value.use_auth = true
+  form.value.use_title = true
+  form.value.use_price = true
+  form.value.data_path = 'data.url'
+}
+
+/** 表单 → api_config JSON 拼装 (勾选鉴权头/商品名称/价格 → 代码拼装, 存储结构不变向后兼容) */
+function buildApiConfig(): string {
+  const conf: any = { url: form.value.api_url.trim(), method: form.value.api_method }
+  if (form.value.use_auth) {
+    if (form.value.api_key.trim()) conf.api_key = form.value.api_key.trim()
+    conf.headers = { 'content-type': 'application/json', Authorization: 'Bearer {apikey}' }
+  }
+  const body: any = {}
+  if (form.value.use_title) body.title = '{title}'
+  if (form.value.use_price) body.price = '{price}'
+  if (Object.keys(body).length) conf.body = body
+  conf.data_path = form.value.data_path.trim() || 'data'
+  return JSON.stringify(conf)
+}
+
+/** api_config JSON → 表单回填 (兼容旧手写 JSON: Authorization 真实密钥/任意 body) */
+function parseApiConfig(raw: string): void {
+  let conf: any = {}
+  try { conf = JSON.parse(raw || '{}') } catch { conf = {} }
+  form.value.api_url = String(conf.url || '')
+  form.value.api_method = String(conf.method || 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET'
+  const auth = String(conf.headers?.Authorization || conf.headers?.authorization || '')
+  const bearerKey = auth.replace(/^Bearer\s+/i, '')
+  form.value.use_auth = !!auth
+  form.value.api_key = String(conf.api_key || (bearerKey && bearerKey !== '{apikey}' ? bearerKey : ''))
+  form.value.use_title = conf.body != null && typeof conf.body === 'object' && 'title' in conf.body
+  form.value.use_price = conf.body != null && typeof conf.body === 'object' && 'price' in conf.body
+  form.value.data_path = String(conf.data_path || 'data')
+}
+
+/** 点击变量徽章插入到指定输入框光标处 */
+function insertVar(field: 'text_content' | 'code_template' | 'description', token: string) {
+  const el = document.getElementById(`card-input-${field}`) as HTMLTextAreaElement | HTMLInputElement | null
+  const cur = String(form.value[field] || '')
+  if (el && typeof el.selectionStart === 'number') {
+    const s = el.selectionStart
+    const e = el.selectionEnd ?? s
+    form.value[field] = cur.slice(0, s) + token + cur.slice(e)
+    requestAnimationFrame(() => {
+      el.focus()
+      el.selectionStart = el.selectionEnd = s + token.length
+    })
+  } else {
+    form.value[field] = cur + token
+  }
 }
 
 /** 服务端代发一次请求并按 data_path 提取 (浏览器直连外部接口有 CORS 限制) */
 async function testApiConfig() {
   if (apiTesting.value) return
-  let conf: any
-  try {
-    conf = JSON.parse(form.value.api_config || '{}')
-  } catch {
-    apiTestResult.value = 'API 配置不是合法 JSON'
-    toast.error('API 配置不是合法 JSON')
+  if (!form.value.api_url.trim()) {
+    toast.error('请填写接口地址')
     return
   }
   apiTesting.value = true
@@ -511,7 +614,7 @@ async function testApiConfig() {
   try {
     const r: any = await $fetch('/api/cards/test-api', {
       method: 'POST',
-      body: { api_config: JSON.stringify(conf) },
+      body: { api_config: buildApiConfig() },
     })
     const d = r?.data || {}
     apiTestResult.value = d.ok
@@ -542,7 +645,8 @@ function openCreate() {
   editing.value = false
   form.value = {
     id: null, name: '', type: 'text',
-    api_config: '', text_content: '', image_url: '',
+    api_url: '', api_method: 'POST', api_key: '', use_auth: true, use_title: true, use_price: true, data_path: 'data.url',
+    text_content: '', image_url: '',
     code_length: 6, code_letters: true, code_digits: true, code_case: 'mixed', code_template: DEFAULT_CODE_TEMPLATE,
     description: '', enabled: true, delay_seconds: 0,
     is_multi_spec: false, spec_name: '', spec_value: '',
@@ -556,7 +660,7 @@ function openEdit(c: Card) {
   editing.value = true
   form.value = {
     id: c.id, name: c.name, type: c.type,
-    api_config: c.api_config || '',
+    api_url: '', api_method: 'POST', api_key: '', use_auth: false, use_title: false, use_price: false, data_path: 'data',
     text_content: c.text_content || '',
     image_url: c.image_url || '',
     code_length: c.code_length || 6,
@@ -576,6 +680,7 @@ function openEdit(c: Card) {
     min_price: c.min_price || '',
     dock_visibility: c.dock_visibility || 'public',
   }
+  if (c.type === 'api') parseApiConfig(c.api_config || '')
   modalOpen.value = true
 }
 
@@ -602,8 +707,16 @@ async function saveCard() {
       min_price: form.value.min_price || null,
       dock_visibility: form.value.dock_visibility,
     }
-    if (form.value.type === 'api') payload.api_config = form.value.api_config
-    if (form.value.type === 'text') payload.text_content = form.value.text_content
+    if (form.value.type === 'api') {
+      if (!form.value.api_url.trim()) {
+        toast.error('请填写 API 接口地址')
+        return
+      }
+      payload.api_config = buildApiConfig()
+    }
+    if (form.value.type === 'text' || form.value.type === 'image' || form.value.type === 'api') {
+      payload.text_content = form.value.text_content
+    }
     if (form.value.type === 'image') payload.image_url = form.value.image_url
     if (form.value.type === 'code') {
       if (!form.value.code_letters && !form.value.code_digits) {

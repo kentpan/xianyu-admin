@@ -1,4 +1,5 @@
-/** POST /api/ai-configs/test — AI 配置连通性测试 (管理页「发送测试」按钮)。Body: { id, message? } */
+/** POST /api/ai-configs/test — AI 配置连通性测试 (管理页「发送测试」按钮)。Body: { id, message? }。
+ *  失败也返回 200: reply 为空时前端用 debug 面板呈现原始请求/响应, 不再只给一句「详见服务端日志」。 */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
@@ -19,7 +20,9 @@ export default defineEventHandler(
       { base_url: conf.base_url, model_name: conf.model_name, api_key: conf.api_key },
       String(body?.message || ''),
     )
-    if (!result.ok) throw new ApiError(400, result.error || 'AI 测试失败')
-    return ok({ reply: result.reply, model: result.model }, `AI 回复成功 (模型: ${result.model})`)
+    return ok(
+      { ok: result.ok, reply: result.reply, model: result.model, error: result.error, debug: result.debug },
+      result.ok ? `AI 回复成功 (模型: ${result.model})` : 'AI 测试未通过, 请查看请求/响应详情',
+    )
   }),
 )

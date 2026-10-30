@@ -12,26 +12,78 @@ export interface ApiCardFetchResult {
   message: string
 }
 
+/** 卡券发货上下文变量: 发货请求 (url/头/体) 与发货文案/消息回复共用。 */
+export interface ApiCardVars {
+  /** 商品名称 */
+  title?: string
+  /** 商品价格 */
+  price?: string
+  /** 鉴权密钥 (API 卡券配置的 api_key) */
+  apikey?: string
+  /** 买家闲鱼昵称 */
+  username?: string
+  /** 买家用户 ID */
+  userid?: string
+  /** API 接口返回的资源交付分享 URL (data_path 提取结果) */
+  shareURL?: string
+}
+
+const VAR_KEYS = ['title', 'price', 'apikey', 'username', 'userid', 'shareURL'] as const
+
+/** 卡券变量替换: {title}/{price}/{apikey}/{username}/{userid}/{shareURL}; 整值占位且为数字时转 Number (如 price 传数字类型)。 */
+export function applyCardVars(text: unknown, vars?: ApiCardVars): string {
+  let out = String(text ?? '')
+  if (!out || !vars) return out
+  for (const k of VAR_KEYS) {
+    if (!out.includes(`{${k}}`)) continue
+    const v = String(vars[k] ?? '')
+    out = out.replaceAll(`{${k}}`, v)
+  }
+  return out
+}
+
+/** 递归替换配置对象中所有字符串值 (url/headers/body 共用); 纯占位整值替换后为数字则转数字。 */
+function deepApplyVars(value: unknown, vars: ApiCardVars): unknown {
+  if (typeof value === 'string') {
+    const out = applyCardVars(value, vars)
+    if (/^-?\d+(\.\d+)?$/.test(out) && /^\{\w+\}$/.test(value.trim())) return Number(out)
+    return out
+  }
+  if (Array.isArray(value)) return value.map((v) => deepApplyVars(v, vars))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = deepApplyVars(v, vars)
+    return out
+  }
+  return value
+}
+
 /**
  * 按 api_config 配置请求外部接口并提取发货文本。
- * conf: { url, method?, headers?, body?, data_path? } — data_path 默认 'data',
+ * conf: { url, method?, headers?, body?, api_key?, data_path? } — data_path 默认 'data',
  * 如 cards-hub 的 /api/issue 响应用 data.url 取加密提取页链接。
+ * vars 提供时 url/headers/body 中的 {title}/{price}/{apikey}/{username}/{userid} 先行替换。
  */
-export async function fetchApiCardContent(conf: unknown): Promise<ApiCardFetchResult> {
+export async function fetchApiCardContent(conf: unknown, vars?: ApiCardVars): Promise<ApiCardFetchResult> {
   const c = (conf && typeof conf === 'object' ? conf : {}) as Record<string, unknown>
-  const url = String(c.url || '').trim()
-  if (!url) return { ok: false, text: '', status: 0, message: '缺少 url' }
+  const rawUrl = String(c.url || '').trim()
+  if (!rawUrl) return { ok: false, text: '', status: 0, message: '缺少 url' }
 
+  const v = vars || {}
+  const url = applyCardVars(rawUrl, { ...v, apikey: v.apikey ?? String(c.api_key || '') })
   try {
     const isPost = String(c.method || 'GET').toUpperCase() === 'POST'
-    const headers =
+    const headers = deepApplyVars(
       c.headers && typeof c.headers === 'object' && !Array.isArray(c.headers)
-        ? (c.headers as Record<string, string>)
-        : { 'content-type': 'application/json' }
+        ? c.headers
+        : { 'content-type': 'application/json' },
+      { ...v, apikey: v.apikey ?? String(c.api_key || '') },
+    ) as Record<string, string>
+    const body = isPost && c.body != null ? JSON.stringify(deepApplyVars(c.body, { ...v, apikey: v.apikey ?? String(c.api_key || '') })) : undefined
     const res = await fetch(url, {
       method: isPost ? 'POST' : 'GET',
       headers,
-      body: isPost && c.body != null ? JSON.stringify(c.body) : undefined,
+      body,
       signal: AbortSignal.timeout(15_000),
     })
     const json: any = await res.json().catch(() => null)

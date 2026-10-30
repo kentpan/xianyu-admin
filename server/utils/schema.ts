@@ -751,6 +751,14 @@ const MIGRATIONS: string[] = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_apilog_key ON api_key_logs(api_key_id, id)`,
+  // 人工接入暂停 (落库, 跨引擎/跨实例全局可见): 卖家手动回复 (APP isSelf 或后台消息页发送)
+  // 后该会话自动回复暂停 pause_duration 分钟 — 内存 Map 在 CF 多实例/多进程下不可见, 必须落库
+  `CREATE TABLE IF NOT EXISTS chat_pauses (
+    cookie_id VARCHAR(64) NOT NULL,
+    chat_id VARCHAR(64) NOT NULL,
+    paused_until TIMESTAMP NOT NULL,
+    PRIMARY KEY (cookie_id, chat_id)
+  )`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

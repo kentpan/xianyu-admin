@@ -53,7 +53,25 @@ export function deleteAiConfig(id: number) {
   return useApi().del<{ id: number }>(`/api/ai-configs/${id}`)
 }
 
-/** AI 配置连通性测试 (与引擎同一条 callAiApi 分派链路, 不落库) */
+/** AI 调试面板数据 (原始请求/响应, 排查「未返回内容」) */
+export interface AiTestDebug {
+  url: string
+  status: number
+  elapsed_ms: number
+  request_body: string
+  response_body: string
+  error: string
+}
+
+export interface AiTestResult {
+  ok: boolean
+  reply: string
+  model: string
+  error: string
+  debug?: AiTestDebug
+}
+
+/** AI 配置连通性测试 (与引擎同一条 callAiApi 分派链路, 不落库; 失败也返回 200 + debug 面板数据) */
 export function testAiConfig(id: number, message?: string) {
-  return useApi().post<{ reply: string; model: string }>('/api/ai-configs/test', { id, message })
+  return useApi().post<AiTestResult>('/api/ai-configs/test', { id, message })
 }

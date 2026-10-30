@@ -324,6 +324,13 @@ CREATE TABLE engine_event_dedup (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
+CREATE TABLE chat_pauses (
+    cookie_id VARCHAR(64) NOT NULL,
+    chat_id VARCHAR(64) NOT NULL,
+    paused_until TIMESTAMP NOT NULL,
+    PRIMARY KEY (cookie_id, chat_id)
+  );
+
 CREATE TABLE engines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug VARCHAR(32) NOT NULL UNIQUE,
@@ -336,6 +343,7 @@ CREATE TABLE engines (
     is_active INTEGER DEFAULT 0,
     last_seen_at TIMESTAMP,
     last_status TEXT,
+    last_poll_ip VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , token VARCHAR(64) DEFAULT '');

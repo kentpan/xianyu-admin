@@ -5,6 +5,17 @@
 # → prisma/*.db 探测; wrangler.toml 由本工作流按配置动态生成(仓库无需携带)
 # —— 复制两件套(pages-deploy.yml + deploy.config.js)到任何 Nuxt/Next 项目即可直接使用。
 # ============================================================================
+# v8.9.18 需求: D1 部署不再清库, 线上数据永久保留 —— 原"diff 比对导入"(v8.9.14)
+#   以本地 dump 哈希为门控, 本地 db 一有改动就 DROP D1 全部对象按仓库 dev 库重建,
+#   线上最新数据(订单/会话/卡密/设置)每次部署被旧快照覆盖。现改为纯增量 schema 迁移:
+#   ① 两侧 sqlite_master 清单求差(本地 sqlite3 -json vs D1 wrangler --json);
+#   ② 只补差异: 新表/新列(ALTER ADD COLUMN)/新索引/触发器/视图, 永不 DROP/DELETE;
+#   ③ SQLite ALTER 硬限制(新增列含主键/唯一约束)→ ::error:: 终止交人工迁移,
+#      绝不静默丢数据; D1 多出的孤儿对象只警告保留, 不删;
+#   ④ D1 无用户表(首次安装)才全量导入仓库 db 提供 schema+种子(与旧行为一致);
+#   ⑤ 应用后重新求差核验必须为空, 非空 fail hard(发布成功 = schema 就位);
+#   ⑥ 每次部署补跑 INSERT OR IGNORE 种子设置 —— 线上已有键零触碰, 仅补新版本新增键;
+#   ⑦ _sync_meta 哈希记账整体退役(增量迁移天然幂等, 无需记账)。
 # v8.9.17 需求: D1 导入核验"本地 42 张 vs D1 43 张"失败修复(实跑日志复盘):
 #   ① 孤儿表根因: 原 DROP 清单从"本地 sqlite_master"生成 —— 只能删掉本地也存在的
 #      表; D1 中历史运行(早期 seed/schema 版本)留下的、本地已不存在的孤儿表永远
@@ -557,7 +568,7 @@ jobs:
           if [ -n "$DB_FILE_PATH" ]; then
             echo "DB_FILE_EXISTS=true" >> $GITHUB_ENV
             echo "DB_FILE_PATH=$DB_FILE_PATH" >> $GITHUB_ENV
-            echo "✅ 数据库已解析 | 来源: $DB_SRC | DATABASE_URL=$DB_URL | 文件: $DB_FILE_PATH($(du -h "$DB_FILE_PATH" | cut -f1)) → D1 全量数据导入"
+            echo "✅ 数据库已解析 | 来源: $DB_SRC | DATABASE_URL=$DB_URL | 文件: $DB_FILE_PATH($(du -h "$DB_FILE_PATH" | cut -f1)) → D1 增量 schema 迁移(线上数据保留)"
           else
             echo "DB_FILE_EXISTS=false" >> $GITHUB_ENV
             echo "DB_FILE_PATH=" >> $GITHUB_ENV
@@ -925,81 +936,160 @@ jobs:
           npx wrangler d1 execute "$D1_NAME" --remote --file="$SEED_FILE"
           echo "✓ D1 seed 数据已推送: $SEED_FILE"
 
-      - name: Sync local database → D1 (diff-aware import)
-        # v8.9.14: "比对 db 是否有改动再导入" —— 仓库携带本地 SQLite 数据文件时,
-        # 该文件就是 D1 的数据真源(与上方 schema/seed 两步门控互斥, 二选一):
-        #   ① sha256(本地 .dump 内容) = 逻辑内容哈希(免疫 WAL 字节抖动);
-        #   ② 与 D1 _sync_meta 回写的上次导入哈希比对 → 一致 = 无改动, 零写入跳过;
-        #   ③ 有改动/首次导入: 按 D1 实际对象清单清空(v8.9.17) + .dump 全量重建;
-        #   ④ 导入后按表名集合双向核验(v8.9.17), 通过才回写哈希, 失败 fail hard
-        #      (发布成功 = 数据就绪, 与 schema/seed 口径一致)。
+      - name: Migrate D1 schema (additive, data-preserving)
+        # v8.9.18: 摘掉"全量重建"这把屠刀 —— 原步骤(v8.9.14)以本地 dump 哈希为门控,
+        # 一有差异就 DROP D1 全部对象按仓库 dev 库重建, 线上最新数据(订单/会话/卡密/
+        # 设置)每次部署被旧快照覆盖。现改为纯增量 schema 迁移: 两侧 sqlite_master 求
+        # 差 → 只补新表/新列/新索引/触发器/视图, 数据一行不动, 永不 DROP/DELETE;
+        # D1 无用户表(首次安装)才全量导入仓库 db 作种子; 应用后重新求差核验必须为空,
+        # 非空 fail hard(发布成功 = schema 就位)。_sync_meta 哈希记账整体退役。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS == 'true'
         run: |
-          # ① 本地逻辑内容哈希(过滤 PRAGMA/事务包裹行, 与导入 SQL 同源)
-          LOCAL_SHA=$(sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;' | sha256sum | awk '{print $1}')
-          if [ -z "$LOCAL_SHA" ]; then
-            echo "::error::本地数据文件 .dump 失败: $DB_FILE_PATH"
-            exit 1
-          fi
-          echo "本地库: $DB_FILE_PATH(dump sha256=${LOCAL_SHA:0:16}…)"
+          cat > /tmp/d1-schema-diff.mjs << 'DIFF_EOF'
+          // 两侧 sqlite_master 清单 → 纯增量 DDL(新表/新列/索引/触发器/视图), 永不 DROP/DELETE/INSERT 数据
+          // 退出码: 0=已一致 3=D1 空(首次安装) 4=计划已生成 1=硬限制需人工迁移
+          import { readFileSync, writeFileSync } from 'node:fs'
 
-          # ② 读取 D1 上次导入哈希(表/记录不存在 → 视为首次导入)
-          META_OUT=$(npx wrangler d1 execute "$D1_NAME" --remote --json \
-            --command "SELECT value FROM _sync_meta WHERE key = 'db_dump_sha256'" 2>/dev/null || true)
-          REMOTE_SHA=$(echo "$META_OUT" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[0].value // empty' 2>/dev/null || true)
-          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
-            echo "✓ D1 与本地库内容一致(sha256=${LOCAL_SHA:0:16}…), 跳过导入(零写入)"
-            exit 0
-          fi
-          if [ -n "$REMOTE_SHA" ]; then
-            echo "检测到数据库改动: 本地 ${LOCAL_SHA:0:16}… ≠ D1 记录 ${REMOTE_SHA:0:16}… → 执行全量导入"
+          const [localPath, remotePath, outPath] = process.argv.slice(2)
+          const fatal = (msg) => { console.error('::error::' + msg); process.exit(1) }
+
+          // 兼容三形态: sqlite3 -json 行数组 / wrangler 块数组 / wrangler {result:{results}}
+          function load(p) {
+            const j = JSON.parse(readFileSync(p, 'utf8'))
+            const blocks = Array.isArray(j) ? j : (Array.isArray(j?.result) ? j.result : j?.result ? [j.result] : [])
+            return blocks.flatMap((b) => {
+              if (Array.isArray(b?.results)) return b.results
+              return Array.isArray(b) ? b : [b]
+            })
+          }
+
+          // CREATE TABLE 括号体按顶层逗号切段(引号/嵌套括号感知)
+          function topLevelParts(sql) {
+            const parts = []
+            let depth = 0, cur = '', str = null
+            for (let i = 0; i < sql.length; i++) {
+              const c = sql[i]
+              if (str) { cur += c; if (c === str) { if (sql[i + 1] === str) cur += sql[++i]; else str = null } continue }
+              if (c === "'" || c === '"' || c === '`') { str = c; cur += c; continue }
+              if (c === '[') { const j = sql.indexOf(']', i); cur += sql.slice(i, j === -1 ? sql.length : j + 1); if (j !== -1) i = j; continue }
+              if (c === '(') { depth++; if (depth === 1) { cur = ''; continue } }
+              if (c === ')') { depth--; if (depth === 0) { if (cur.trim()) parts.push(cur.trim()); return parts } }
+              if (c === ',' && depth === 1) { if (cur.trim()) parts.push(cur.trim()); cur = ''; continue }
+              if (depth >= 1) cur += c
+            }
+            if (cur.trim()) parts.push(cur.trim())
+            return parts
+          }
+
+          const TABLE_CONSTRAINT = /^(PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i
+          function colInfo(def) {
+            if (TABLE_CONSTRAINT.test(def)) return null
+            const m = def.match(/^"((?:[^"]|"")+)"/) || def.match(/^\[([^\]]+)\]/) || def.match(/^`([^`]+)`/) || def.match(/^([A-Za-z_][A-Za-z0-9_$]*)/)
+            if (!m) return null
+            return { name: m[1] ?? m[2] ?? m[3] ?? m[4], rest: def.slice(m[0].length).trim() }
+          }
+
+          function ifNotExists(sql) {
+            return sql
+              .replace(/^CREATE\s+UNIQUE\s+INDEX\s+/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
+              .replace(/^CREATE\s+INDEX\s+/i, 'CREATE INDEX IF NOT EXISTS ')
+              .replace(/^CREATE\s+TRIGGER\s+/i, 'CREATE TRIGGER IF NOT EXISTS ')
+              .replace(/^CREATE\s+VIEW\s+/i, 'CREATE VIEW IF NOT EXISTS ')
+              .replace(/^CREATE\s+TABLE\s+/i, 'CREATE TABLE IF NOT EXISTS ')
+          }
+
+          const local = load(localPath)
+          const remote = load(remotePath)
+          const rTables = new Map(), rOther = new Set()
+          for (const r of remote) {
+            if (r.type === 'table') rTables.set(r.name, r)
+            else rOther.add(r.name)
+          }
+          if (!rTables.size && !rOther.size) {
+            console.error('D1 无任何用户对象 → 首次安装(交回调用方全量导入)')
+            process.exit(3)
+          }
+
+          const stmts = []
+          const warns = []
+          for (const t of local.filter((r) => r.type === 'table')) {
+            if (!rTables.has(t.name)) {
+              stmts.push(ifNotExists(t.sql) + ';')
+              continue
+            }
+            const rCols = new Set(topLevelParts(rTables.get(t.name).sql || '').map((d) => colInfo(d)?.name).filter(Boolean))
+            const lCols = []
+            for (const def of topLevelParts(t.sql || '')) {
+              const info = colInfo(def)
+              if (!info) continue
+              lCols.push(info.name)
+              if (rCols.has(info.name)) continue
+              const bare = info.rest.replace(/'(?:[^']|'')*'/g, "''")
+              if (/\b(PRIMARY\s+KEY|UNIQUE)\b/i.test(bare))
+                fatal(`表 ${t.name} 新增列 ${info.name} 含主键/唯一约束 — SQLite ALTER 无法直接添加, 请人工迁移(建新表搬数据)后重试`)
+              stmts.push(`ALTER TABLE "${t.name}" ADD COLUMN ${def};`)
+            }
+            for (const c of rCols) if (!lCols.includes(c)) warns.push(`D1 表 ${t.name} 有本地 schema 没有的列 ${c} → 保留不动`)
+          }
+          for (const o of local.filter((r) => r.type !== 'table' && r.sql)) {
+            if (!rOther.has(o.name) && !rTables.has(o.name)) stmts.push(ifNotExists(o.sql) + ';')
+          }
+
+          const lNames = new Set(local.filter((r) => r.type === 'table' || r.sql).map((r) => r.name))
+          for (const name of rTables.keys()) if (!lNames.has(name)) warns.push(`D1 多出本地没有的表 ${name} → 数据保留不动`)
+          for (const n of rOther) if (!lNames.has(n)) warns.push(`D1 多出本地没有的 ${n} → 保留不动`)
+
+          for (const w of warns) console.error('  ⚠ ' + w)
+          if (!stmts.length) {
+            console.error('✓ 本地 schema 与 D1 完全一致 → 零写入')
+            process.exit(0)
+          }
+          writeFileSync(outPath, stmts.join('\n') + '\n')
+          console.error(`生成增量 DDL ${stmts.length} 条 → ${outPath}`)
+          process.exit(4)
+          DIFF_EOF
+
+          INV_Q="SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta'"
+          sqlite3 -json "$DB_FILE_PATH" "$INV_Q" > /tmp/d1-local-inv.json
+
+          # ① 拉取 D1 现状清单 + ② 计算纯增量迁移计划(数据不动)
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-remote-inv.json
+          RC=0
+          node /tmp/d1-schema-diff.mjs /tmp/d1-local-inv.json /tmp/d1-remote-inv.json /tmp/d1-migrate.sql || RC=$?
+          if [ "$RC" -eq 3 ]; then
+            # 首次安装: D1 还是空库 → 全量导入仓库 db 提供 schema 与种子数据(此后部署只走增量)
+            echo "D1 无用户表(首次安装) → 全量导入仓库 db(schema + 种子数据)"
+            sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;|^CREATE TABLE _sync_meta|^INSERT INTO _sync_meta' > /tmp/d1-migrate.sql
+            npx wrangler d1 execute "$D1_NAME" --remote --file=/tmp/d1-migrate.sql
+          elif [ "$RC" -eq 4 ]; then
+            echo "schema 有增量 → 只应用以下 DDL, 线上数据一行不动:"
+            cat /tmp/d1-migrate.sql
+            npx wrangler d1 execute "$D1_NAME" --remote --file=/tmp/d1-migrate.sql
+          elif [ "$RC" -eq 0 ]; then
+            echo "✓ schema 与 D1 完全一致 → 零写入"
           else
-            echo "D1 无同步记录(首次导入) → 执行全量导入"
+            exit "$RC"
           fi
 
-          # ③ 生成 DROP 清单 —— 从 D1 实际对象(v8.9.17, 关键修正): 原清单取自本地
-          #    sqlite_master, D1 中历史孤儿表(本地已不存在的旧 seed/schema 对象)永远
-          #    清不掉, 导致"本地 42 vs D1 43"核验失败。现按 D1 sqlite_master 现状
-          #    逐对象生成 DROP; 排除 sqlite_* / _cf_* 内部对象与 _sync_meta 门控表。
-          D1_OBJECTS=$(npx wrangler d1 execute "$D1_NAME" --remote --json \
-            --command "SELECT type, name FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta'" 2>/dev/null || true)
-          DROP_SQL=$(echo "$D1_OBJECTS" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[] | "DROP \(.type | ascii_upcase) IF EXISTS \"\(.name | gsub("\""; "\"\""))\";"' 2>/dev/null || true)
-          DROP_COUNT=$(echo "$DROP_SQL" | grep -c . || true)
-          echo "D1 现有用户对象: ${DROP_COUNT} 个 → 全部 DROP 后按本地库重建"
+          # ③ 种子设置补缺(INSERT OR IGNORE 幂等: 线上已有键零触碰, 仅补新版本新增键)
+          for f in prisma/seed.sql server/seed.sql; do
+            if [ -f "$f" ]; then
+              echo "补缺种子设置: $f"
+              npx wrangler d1 execute "$D1_NAME" --remote --file="$f"
+              break
+            fi
+          done
 
-          # ④ 组装导入 SQL: DROP 清单 + .dump 全量重建。本库无外键声明无依赖顺序
-          #    问题; 过滤 PRAGMA/BEGIN/COMMIT —— D1 逐语句自动提交, sqlite .dump
-          #    的事务包裹在 D1 会报 cannot start a transaction
-          IMPORT_SQL=/tmp/d1-import.sql
-          {
-            echo "$DROP_SQL"
-            sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;'
-          } > "$IMPORT_SQL"
-          echo "导入 SQL: $(wc -l < "$IMPORT_SQL") 行 / $(grep -c '^CREATE TABLE' "$IMPORT_SQL") 张表"
-          npx wrangler d1 execute "$D1_NAME" --remote --file="$IMPORT_SQL"
-          rm -f "$IMPORT_SQL"
-
-          # ⑤ 导入核验(v8.9.17): 本地与 D1 表名集合双向比对 —— 集合相等是比数量
-          #    相等更强的保证, 差集直接打印, 失败立知多了/少了哪张表
-          sqlite3 "$DB_FILE_PATH" "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name" > /tmp/local-tables.txt
-          VERIFY_OUT=$(npx wrangler d1 execute "$D1_NAME" --remote --json \
-            --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta' ORDER BY name" 2>/dev/null || true)
-          echo "$VERIFY_OUT" | jq -r '(if type == "array" then . else (.result // []) end)[0].results[].name' 2>/dev/null | sort > /tmp/d1-tables.txt
-          LOCAL_TABLES=$(wc -l < /tmp/local-tables.txt | tr -d ' ')
-          D1_TABLES=$(wc -l < /tmp/d1-tables.txt | tr -d ' ')
-          if ! diff -u /tmp/local-tables.txt /tmp/d1-tables.txt > /tmp/tables-diff.txt 2>&1; then
-            echo "::error::D1 导入核验失败: 本地 ${LOCAL_TABLES} 张表, D1 ${D1_TABLES} 张表, 表名集合不一致。差异(- 本地有/D1 缺, + D1 多出)如下:"
-            cat /tmp/tables-diff.txt
+          # ④ 核验: 重新求差必须为空 —— 表/列/索引全部就位, 否则 fail hard
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-verify-inv.json
+          VRC=0
+          node /tmp/d1-schema-diff.mjs /tmp/d1-local-inv.json /tmp/d1-verify-inv.json /tmp/d1-verify.sql || VRC=$?
+          if [ "$VRC" -ne 0 ] || [ -s /tmp/d1-verify.sql ]; then
+            echo "::error::D1 迁移核验失败: 应用后仍有未就位对象(exit=$VRC):"
+            cat /tmp/d1-verify.sql 2>/dev/null || true
             exit 1
           fi
-          echo "✓ 导入核验通过: ${D1_TABLES} 张表名集合与本地完全一致"
-
-          # ⑥ 回写新哈希(v8.9.17 时序修正: 核验通过后才写) —— 原时序在核验失败时
-          #    留下"已同步"假标记, 下次运行哈希相等直接跳过导入, 残留永无清理机会。
-          #    现核验失败即退出不回写, 下次运行必然重走全量导入。
-          npx wrangler d1 execute "$D1_NAME" --remote \
-            --command "CREATE TABLE IF NOT EXISTS _sync_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO _sync_meta (key, value) VALUES ('db_dump_sha256', '$LOCAL_SHA') ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
-          echo "✓ D1 同步完成: ${D1_TABLES} 张表全部就位(sha256=${LOCAL_SHA:0:16}… 已回写)"
+          echo "✓ D1 schema 迁移完成: 表/列/索引全部就位, 线上数据全量保留"
 
       - name: Deploy realtime hub Worker (Durable Objects)
         # v8.9.13: 配套实时 Worker 独立部署 DO hub —— Pages 项目不能在自身内承载
@@ -1734,10 +1824,10 @@ jobs:
           else
             echo "| D1 数据库 | ${{ env.D1_NAME }}(ID 创建后回填) |" >> $GITHUB_STEP_SUMMARY
           fi
-          # v8.9.14: 同步方式一目了然(全量数据导入 vs schema/seed 回落)
+          # v8.9.18: 同步方式一目了然(增量迁移数据保留 vs 首次导入 vs schema/seed 回落)
           if [ "${{ env.PROXY_PASSTHROUGH }}" != "true" ] && [ "${{ env.DATABASE_ENABLED }}" = "true" ]; then
             if [ "${{ env.DB_FILE_EXISTS }}" = "true" ]; then
-              echo "| D1 数据同步 | 携带数据文件 ${{ env.DB_FILE_PATH }} → 全量导入 D1(内容哈希一致时零写入跳过) |" >> $GITHUB_STEP_SUMMARY
+              echo "| D1 数据同步 | 携带数据文件 ${{ env.DB_FILE_PATH }} → 增量 schema 迁移(线上数据保留, 仅首次安装全量导入) |" >> $GITHUB_STEP_SUMMARY
             else
               echo "| D1 数据同步 | schema/seed 回落(仓库未携带数据文件) |" >> $GITHUB_STEP_SUMMARY
             fi

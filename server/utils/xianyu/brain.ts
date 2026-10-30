@@ -16,7 +16,7 @@
 import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
-import { fetchApiCardContent } from '../card-api'
+import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
 import { fetchItemDetail, confirmOrderShipped, freeshippingOrder } from './mtop'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
@@ -44,11 +44,74 @@ const orderLocks = new Map<string, Promise<unknown>>()
 const orderCooldown = new Map<string, number>()
 const ORDER_COOLDOWN_MS = 10 * 60 * 1000
 
-/** 卖家手动回复后暂停该会话自动回复 (到期时间戳; 时长读账号级 pause_duration, 0 = 不暂停, butler pause_chat 语义)。 */
-const chatPause = new Map<string, number>()
+/** 卖家手动回复后暂停该会话自动回复 (落库 chat_pauses, 跨引擎/跨实例全局可见; minutes=账号 pause_duration, 0 = 不暂停)。 */
+export async function pauseChatAutoReply(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  chatId: string,
+  minutes: number,
+): Promise<void> {
+  const mins = Math.max(Number(minutes) || 0, 0)
+  if (!chatId || mins <= 0) return
+  await db
+    .run(
+      `INSERT INTO chat_pauses (cookie_id, chat_id, paused_until)
+       VALUES (?, ?, datetime('now', '+' || ? || ' minutes'))
+       ON CONFLICT(cookie_id, chat_id) DO UPDATE SET paused_until = excluded.paused_until`,
+      [cookieId, chatId, mins],
+    )
+    .catch(() => {})
+}
+
+async function chatPaused(db: Awaited<ReturnType<typeof getDb>>, cookieId: string, chatId: string): Promise<boolean> {
+  if (!chatId) return false
+  const row = await db
+    .get<{ paused_until: string }>(
+      'SELECT paused_until FROM chat_pauses WHERE cookie_id = ? AND chat_id = ? AND paused_until > datetime(\'now\')',
+      [cookieId, chatId],
+    )
+    .catch(() => null)
+  return !!row
+}
 
 /** 会话级回复冷却: 距上次自动回复不足该时长则跳过 (用户要求至少 1 分钟内不重复回复)。 */
 const REPLY_COOLDOWN_MS = 60_000
+
+/** 旧消息过滤: 断线重连 sync 会重推几分钟前的历史消息, 直接回复会插进正在进行的对话
+ *  (XianyuAutoAgent MESSAGE_EXPIRE_TIME 同语义, 默认 5 分钟)。仅作用于回复链, isSelf/付款触发不受限。 */
+const STALE_MESSAGE_MS = 5 * 60 * 1000
+
+/**
+ * 回复动作统一出口: 落决策日志前二次检测人工暂停。
+ * AI 生成/卡券拉取耗时窗口内卖家可能已在 APP/后台人工回复 (xianyu-auto-reply 二次检测同语义),
+ * 此时放弃回复, 避免「人工对话中突然插进一条自动回复」。
+ */
+async function emitReplyActions(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  msg: ParsedChatMessage,
+  opts: BrainOptions,
+  actions: EngineAction[],
+  fields: { reply_strategy: string; matched_keyword?: string; reply_text: string },
+): Promise<EngineAction[]> {
+  if (await chatPaused(db, cookieId, msg.chatId)) {
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'manual_reply_pause',
+      reply_strategy: 'none',
+    })
+    return []
+  }
+  const logId = await addLog(db, cookieId, msg, opts, {
+    process_status: 'success',
+    decision_reason: 'reply_sent',
+    reply_strategy: fields.reply_strategy,
+    matched_keyword: fields.matched_keyword || '',
+    reply_text: fields.reply_text,
+    send_status: 'pending',
+  })
+  return actions.map((a) => ({ ...a, log_id: logId }))
+}
 
 function parseUtcTimestamp(t: string): number {
   const parsed = Date.parse(t.includes('T') || t.includes('Z') ? t : t.replace(' ', 'T') + 'Z')
@@ -111,8 +174,7 @@ export async function handleChatEvent(
     const pauseRow = await db
       .get<{ pause_duration: number }>('SELECT pause_duration FROM cookies WHERE id = ?', [cookieId])
       .catch(() => null)
-    const pauseMinutes = Math.max(Number(pauseRow?.pause_duration ?? 10) || 0, 0)
-    if (pauseMinutes > 0) chatPause.set(`${cookieId}:${msg.chatId}`, Date.now() + pauseMinutes * 60_000)
+    await pauseChatAutoReply(db, cookieId, msg.chatId, Number(pauseRow?.pause_duration ?? 10))
     // 决策日志可见: 卖家在 APP 手动回复 → 该会话自动回复暂停 (排查「为什么没回」的直接证据)
     await addLog(db, cookieId, msg, opts, {
       process_status: 'skipped',
@@ -159,11 +221,17 @@ export async function handleChatEvent(
     }, opts)
   }
 
-  // 人工接入暂停检查 (仅作用于回复链, 付款触发已在上方提前处理)
-  const pausedUntil = chatPause.get(`${cookieId}:${msg.chatId}`)
-  if (pausedUntil !== undefined) {
-    if (Date.now() >= pausedUntil) chatPause.delete(`${cookieId}:${msg.chatId}`)
-    else return []
+  // 人工接入暂停检查 (落库状态, APP/后台消息页人工回复均触发; 仅作用于回复链, 付款触发已在上方提前处理)
+  if (await chatPaused(db, cookieId, msg.chatId)) return []
+
+  // 旧消息过滤: 断线重连 sync 重推的历史消息不进回复链 (否则旧会话突然收到一条自动回复)
+  if (msg.createTime > 0 && Date.now() - msg.createTime > STALE_MESSAGE_MS) {
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'stale_message',
+      reply_strategy: 'none',
+    })
+    return []
   }
 
   // 过滤规则
@@ -243,28 +311,20 @@ export async function handleChatEvent(
     return []
   }
   if (keywordHit.actions.length) {
-    const logId = await addLog(db, cookieId, msg, opts, {
-      process_status: 'success',
-      decision_reason: 'reply_sent',
+    return emitReplyActions(db, cookieId, msg, opts, keywordHit.actions, {
       reply_strategy: 'keyword',
       matched_keyword: keywordHit.keyword || '',
       reply_text: keywordHit.preview,
-      send_status: 'pending',
     })
-    return keywordHit.actions.map((a) => ({ ...a, log_id: logId }))
   }
 
   // 2) AI 回复 (意图识别 + 议价控制 + 商品上下文)
   const aiReply = await getAiReply(db, cookieId, msg)
   if (aiReply) {
-    const logId = await addLog(db, cookieId, msg, opts, {
-      process_status: 'success',
-      decision_reason: 'reply_sent',
+    return emitReplyActions(db, cookieId, msg, opts, [textAction(cookieId, msg, applyVars(aiReply, vars), 0)], {
       reply_strategy: 'ai',
       reply_text: aiReply,
-      send_status: 'pending',
     })
-    return [textAction(cookieId, msg, applyVars(aiReply, vars), 0, logId)]
   }
 
   // 3) 指定商品回复
@@ -274,14 +334,10 @@ export async function handleChatEvent(
   )
   if (itemReply?.reply_content) {
     const text = applyVars(itemReply.reply_content, vars)
-    const logId = await addLog(db, cookieId, msg, opts, {
-      process_status: 'success',
-      decision_reason: 'reply_sent',
+    return emitReplyActions(db, cookieId, msg, opts, [textAction(cookieId, msg, text, 0)], {
       reply_strategy: 'default',
       reply_text: text,
-      send_status: 'pending',
     })
-    return [textAction(cookieId, msg, text, 0, logId)]
   }
 
   // 4) 默认回复 (支持只回复一次 + 图片; 账号未启用时回退系统全局 default_reply 设置, 纯文本不重复)
@@ -326,14 +382,10 @@ export async function handleChatEvent(
     if (text) {
       actions.push(textAction(cookieId, msg, text, image ? 1200 : 0))
     }
-    const logId = await addLog(db, cookieId, msg, opts, {
-      process_status: 'success',
-      decision_reason: 'reply_sent',
+    return emitReplyActions(db, cookieId, msg, opts, actions, {
       reply_strategy: 'default',
       reply_text: text || image,
-      send_status: 'pending',
     })
-    return actions.map((a) => ({ ...a, log_id: logId }))
   }
 
   return []
@@ -681,7 +733,7 @@ ${historyStr || '（无）'}
 
 请根据以上信息生成回复：`
 
-  const reply = await callAiApi(endpoint.baseUrl, endpoint.model, endpoint.apiKey, systemPrompt, userPrompt, history)
+  const { text: reply } = await callAiApi(endpoint.baseUrl, endpoint.model, endpoint.apiKey, systemPrompt, userPrompt, history)
   if (!reply) return ''
 
   await saveConversation(db, cookieId, msg, 'assistant', reply, intent)
@@ -704,6 +756,50 @@ async function saveConversation(
     .catch(() => {})
 }
 
+/** AI 调用调试信息 (测试面板透出原始请求/响应, 排查「未返回内容」不再靠猜)。 */
+export interface AiCallDebug {
+  url: string
+  status: number
+  elapsed_ms: number
+  request_body: string
+  response_body: string
+  error: string
+}
+
+type AiCallResult = { text: string; debug: AiCallDebug }
+
+function emptyDebug(url: string): AiCallDebug {
+  return { url, status: 0, elapsed_ms: 0, request_body: '', response_body: '', error: '' }
+}
+
+/**
+ * 从各类响应结构提取回复文本: OpenAI choices/message / 老 completions / OpenAI Responses API
+ * (output_text 或 output[].content[].text) / Anthropic messages (content[].text)。
+ * 兼容 one-api/new-api 类中转站的实际返回与协议混用 — 解析不到时返回空串, 由 debug 呈现原文。
+ */
+function extractAiContent(json: any): string {
+  if (!json || typeof json !== 'object') return ''
+  const cand = Array.isArray(json.choices) ? json.choices[0] : null
+  const direct = String(cand?.message?.content ?? '') || String(cand?.text ?? '') || String(json.output_text ?? '')
+  if (direct.trim()) return direct.trim()
+  if (Array.isArray(json.output)) {
+    for (const item of json.output) {
+      for (const c of Array.isArray(item?.content) ? item.content : []) {
+        const t = String(c?.text ?? '').trim()
+        if (t) return t
+      }
+    }
+  }
+  if (Array.isArray(json.content)) {
+    for (const c of json.content) {
+      if (c?.type === 'thinking') continue
+      const t = String(c?.text ?? '').trim()
+      if (t) return t
+    }
+  }
+  return ''
+}
+
 /** AI 服务调用分派: Gemini(模型名含 gemini) / DashScope 应用(base_url 含 /apps/) / OpenAI 兼容(默认)。 */
 async function callAiApi(
   baseUrlRaw: string,
@@ -712,7 +808,7 @@ async function callAiApi(
   systemPrompt: string,
   userPrompt: string,
   history: { role: 'user' | 'assistant'; content: string }[],
-): Promise<string> {
+): Promise<AiCallResult> {
   const baseUrl = baseUrlRaw.replace(/\/+$/, '')
   try {
     if (model.toLowerCase().includes('gemini')) {
@@ -724,7 +820,7 @@ async function callAiApi(
     return await callOpenAiCompatibleApi(baseUrl, model, apiKey, systemPrompt, userPrompt, history)
   } catch (e: any) {
     logWarn(`AI 接口调用失败: ${e?.message}`)
-    return ''
+    return { text: '', debug: { ...emptyDebug(`${baseUrl}/chat/completions`), error: e?.message || '调用失败' } }
   }
 }
 
@@ -735,54 +831,114 @@ async function callOpenAiCompatibleApi(
   systemPrompt: string,
   userPrompt: string,
   history: { role: 'user' | 'assistant'; content: string }[],
-): Promise<string> {
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+): Promise<AiCallResult> {
+  const url = `${baseUrl}/chat/completions`
+  const bodyObj = {
+    model,
+    messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: userPrompt }],
+    max_tokens: 300,
+    temperature: 0.7,
+  }
+  const request_body = JSON.stringify(bodyObj)
+  const started = Date.now()
+  const debug = (patch: Partial<AiCallDebug>): AiCallDebug => ({
+    ...emptyDebug(url),
+    elapsed_ms: Date.now() - started,
+    request_body: request_body.slice(0, 800),
+    ...patch,
+  })
+  let res: Response
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: request_body,
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch (e: any) {
+    return { text: '', debug: debug({ error: `网络请求失败: ${e?.message || '超时/DNS/连接错误'}` }) }
+  }
+  const raw = await res.text().catch(() => '')
+  let json: any = null
+  try {
+    json = JSON.parse(raw)
+  } catch {}
+  const text = extractAiContent(json)
+  const error = text
+    ? ''
+    : json?.error?.message
+      ? `接口报错: ${String(json.error.message).slice(0, 300)}`
+      : res.ok
+        ? 'HTTP 200 但响应结构解析不出回复内容 (检查响应原文)'
+        : `HTTP ${res.status} ${res.statusText || ''}`.trim()
+  return { text, debug: debug({ status: res.status, response_body: raw.slice(0, 800), error }) }
+}
+
+async function callGeminiApi(model: string, apiKey: string, systemPrompt: string, userPrompt: string): Promise<AiCallResult> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`
+  const request_body = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+    generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
+    ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
+  })
+  const started = Date.now()
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: userPrompt }],
-      max_tokens: 300,
-      temperature: 0.7,
-    }),
+    headers: { 'content-type': 'application/json' },
+    body: request_body,
     signal: AbortSignal.timeout(20_000),
   })
-  const json: any = await res.json()
-  return String(json?.choices?.[0]?.message?.content || '').trim()
-}
-
-async function callGeminiApi(model: string, apiKey: string, systemPrompt: string, userPrompt: string): Promise<string> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
-        ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
-      }),
-      signal: AbortSignal.timeout(20_000),
+  const raw = await res.text().catch(() => '')
+  let json: any = null
+  try {
+    json = JSON.parse(raw)
+  } catch {}
+  const text = String(json?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim()
+  return {
+    text,
+    debug: {
+      url,
+      status: res.status,
+      elapsed_ms: Date.now() - started,
+      request_body: request_body.slice(0, 800),
+      response_body: raw.slice(0, 800),
+      error: text ? '' : json?.error?.message ? `接口报错: ${String(json.error.message).slice(0, 300)}` : `HTTP ${res.status}`,
     },
-  )
-  const json: any = await res.json()
-  return String(json?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim()
+  }
 }
 
-async function callDashscopeAppApi(baseUrl: string, apiKey: string, systemPrompt: string, userPrompt: string): Promise<string> {
+async function callDashscopeAppApi(baseUrl: string, apiKey: string, systemPrompt: string, userPrompt: string): Promise<AiCallResult> {
   const appId = baseUrl.split('/apps/')[1]?.split('/')[0] || ''
   if (!appId) throw new Error('DashScope 应用 URL 中未找到 app_id')
-  const res = await fetch(`https://dashscope.aliyuncs.com/api/v1/apps/${appId}/completion`, {
+  const url = `https://dashscope.aliyuncs.com/api/v1/apps/${appId}/completion`
+  const request_body = JSON.stringify({
+    input: { prompt: `${systemPrompt}\n\n用户问题：${userPrompt}\n\n请直接回答用户的问题：` },
+    parameters: { max_tokens: 300, temperature: 0.7 },
+  })
+  const started = Date.now()
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      input: { prompt: `${systemPrompt}\n\n用户问题：${userPrompt}\n\n请直接回答用户的问题：` },
-      parameters: { max_tokens: 300, temperature: 0.7 },
-    }),
+    body: request_body,
     signal: AbortSignal.timeout(30_000),
   })
-  const json: any = await res.json()
-  return String(json?.output?.text || '').trim()
+  const raw = await res.text().catch(() => '')
+  let json: any = null
+  try {
+    json = JSON.parse(raw)
+  } catch {}
+  const text = String(json?.output?.text || '').trim()
+  return {
+    text,
+    debug: {
+      url,
+      status: res.status,
+      elapsed_ms: Date.now() - started,
+      request_body: request_body.slice(0, 800),
+      response_body: raw.slice(0, 800),
+      error: text ? '' : json?.message ? `接口报错: ${String(json.message).slice(0, 300)}` : `HTTP ${res.status}`,
+    },
+  }
 }
 
 /* ---------------------------------- 自动发货 ---------------------------------- */
@@ -903,6 +1059,24 @@ async function autoDeliver(
       )
       return []
     }
+    // 发货变量 ({title}/{price}/{apikey}/{username}/{userid}/{shareURL}): 发货请求/文案/消息回复共用
+    let apiConf: any = {}
+    if (card.type === 'api') {
+      try { apiConf = JSON.parse(String(card.api_config || '{}')) } catch {}
+    }
+    const conv = chatId
+      ? await db
+          .get<{ peer_nick: string }>('SELECT peer_nick FROM im_conversations WHERE cookie_id = ? AND chat_id = ?', [cookieId, chatId])
+          .catch(() => null)
+      : null
+    const deliverVars: ApiCardVars = {
+      title: String(item.item_title || ''),
+      price: String(item.item_price || ''),
+      apikey: String(apiConf.api_key || ''),
+      username: String(conv?.peer_nick || buyerId || ''),
+      userid: String(buyerId || ''),
+    }
+
     // 发送数量 = 订单数量(多数量发货开启时) × delivery_count (卡密型按份逐一生成, 需先于内容提取)
     const orderQty = item.multi_quantity_delivery ? Math.max(parseInt(String(order?.quantity || '1'), 10) || 1, 1) : 1
     const perDelivery = Math.max(parseInt(String(rule.delivery_count || '1'), 10) || 1, 1)
@@ -910,7 +1084,7 @@ async function autoDeliver(
     const delayMs = Math.max(parseInt(String(card.delay_seconds || '0'), 10) || 0, 0) * 1000
 
     // 卡券内容提取 (text 原文, data 按行原子扣减, code 按份生成随机卡密, api 实时拉取, image 直接发送)
-    const extract = await extractCardContent(db, card, cookieId, total)
+    const extract = await extractCardContent(db, card, cookieId, total, deliverVars)
     if (!extract.items.length) {
       logWarn(`[${cookieId}] 卡券「${card.name}」无可用内容, 跳过自动发货`)
       dispatchNotify(
@@ -1004,8 +1178,8 @@ async function autoDeliver(
         }
       }
     }
-    // 消息回复 (卡券级附加消息): 留空则发货时不同时发送消息
-    const replyMsg = String(card.description || '').trim()
+    // 消息回复 (卡券级附加消息): 留空则发货时不同时发送消息; 支持发货变量 ({shareURL} = API 提取结果)
+    const replyMsg = applyCardVars(String(card.description || '').trim(), deliverVars)
     if (replyMsg) {
       actions.push({
         type: 'send_text',
@@ -1111,15 +1285,16 @@ async function extractCardContent(
   card: any,
   cookieId: string,
   count = 1,
+  vars?: ApiCardVars,
 ): Promise<{ items: { parts: { kind: 'text' | 'image'; value: string }[]; preview: string }[]; generatedCodes?: string[] }> {
   const parts: { kind: 'text' | 'image'; value: string }[] = []
   const previewOf = () => parts.map((p) => (p.kind === 'image' ? `[图片] ${p.value}` : p.value)).join(' | ')
 
   if (card.type === 'text') {
-    if (card.text_content) parts.push({ kind: 'text', value: String(card.text_content) })
+    if (card.text_content) parts.push({ kind: 'text', value: applyCardVars(card.text_content, vars) })
   } else if (card.type === 'image') {
     if (card.image_url) parts.push({ kind: 'image', value: String(card.image_url) })
-    if (card.text_content) parts.push({ kind: 'text', value: String(card.text_content) })
+    if (card.text_content) parts.push({ kind: 'text', value: applyCardVars(card.text_content, vars) })
   } else if (card.type === 'code') {
     const items: { parts: { kind: 'text'; value: string }[]; preview: string }[] = []
     const generatedCodes: string[] = []
@@ -1127,7 +1302,7 @@ async function extractCardContent(
       const code = generateCardCode(card)
       generatedCodes.push(code)
       items.push({
-        parts: [{ kind: 'text', value: renderCodeTemplate(card.code_template, code) }],
+        parts: [{ kind: 'text', value: applyCardVars(renderCodeTemplate(card.code_template, code), vars) }],
         preview: `[卡密] ${code}`,
       })
     }
@@ -1143,15 +1318,20 @@ async function extractCardContent(
           card.id,
         ])
         .catch(() => {})
-      parts.push({ kind: 'text', value: taken })
+      parts.push({ kind: 'text', value: applyCardVars(taken, vars) })
     }
   } else if (card.type === 'api') {
-    // API 卡券拉取逻辑唯一实现在 server/utils/card-api.ts (与 /api/cards/test-api 共用)
+    // API 卡券拉取逻辑唯一实现在 server/utils/card-api.ts (与 /api/cards/test-api 共用);
+    // 提取结果即资源交付分享 URL ({shareURL}), 回写 vars 供发货文案与消息回复渲染
     try {
       const conf = JSON.parse(String(card.api_config || '{}'))
-      const r = await fetchApiCardContent(conf)
-      if (r.text) parts.push({ kind: 'text', value: r.text })
-      else logWarn(`[${cookieId}] API 卡券拉取失败: ${r.message}`)
+      const r = await fetchApiCardContent(conf, vars)
+      if (r.text) {
+        if (vars) vars.shareURL = r.text
+        // 发货文案: text_content 有值时渲染变量 ({shareURL} 指向提取结果), 留空发送接口返回原文
+        const tpl = String(card.text_content || '').trim()
+        parts.push({ kind: 'text', value: tpl ? applyCardVars(tpl, { ...vars, shareURL: r.text }) : r.text })
+      } else logWarn(`[${cookieId}] API 卡券拉取失败: ${r.message}`)
     } catch (e: any) {
       logWarn(`[${cookieId}] API 卡券拉取失败: ${e?.message}`)
     }
@@ -1244,7 +1424,7 @@ export async function testAiReply(
   cookieId: string,
   testMessage: string,
   itemCtx?: { item_title?: string; item_price?: string; item_desc?: string },
-): Promise<{ ok: boolean; reply: string; model: string; error: string }> {
+): Promise<{ ok: boolean; reply: string; model: string; error: string; debug?: AiCallDebug }> {
   const db = await getDb()
   const conf = await db.get<any>('SELECT * FROM ai_reply_settings WHERE cookie_id = ?', [cookieId])
   if (!conf) return { ok: false, reply: '', model: '', error: '该账号尚未保存 AI 配置' }
@@ -1285,7 +1465,7 @@ export async function testAiReply(
 
 请根据以上信息生成回复：`
 
-  const reply = await callAiApi(
+  const { text: reply, debug } = await callAiApi(
     endpoint.baseUrl,
     endpoint.model,
     endpoint.apiKey,
@@ -1294,9 +1474,15 @@ export async function testAiReply(
     [],
   )
   if (!reply) {
-    return { ok: false, reply: '', model: endpoint.model, error: 'AI 接口未返回内容, 请检查 API 地址 / 模型名 / Key (详见服务端日志)' }
+    return {
+      ok: false,
+      reply: '',
+      model: endpoint.model,
+      error: debug.error || 'AI 接口未返回内容, 请根据下方请求/响应原文排查',
+      debug,
+    }
   }
-  return { ok: true, reply, model: endpoint.model, error: '' }
+  return { ok: true, reply, model: endpoint.model, error: '', debug }
 }
 
 /**
@@ -1306,7 +1492,7 @@ export async function testAiReply(
 export async function probeAiConfig(
   conf: { base_url: string; model_name: string; api_key: string },
   testMessage: string,
-): Promise<{ ok: boolean; reply: string; model: string; error: string }> {
+): Promise<{ ok: boolean; reply: string; model: string; error: string; debug?: AiCallDebug }> {
   const model = String(conf.model_name || 'qwen-plus')
   const apiKey = String(conf.api_key || '')
   if (!apiKey) return { ok: false, reply: '', model, error: '该配置未填写 API Key' }
@@ -1331,7 +1517,7 @@ export async function probeAiConfig(
 买家消息：${message}
 
 请根据以上信息生成回复：`
-  const reply = await callAiApi(
+  const { text: reply, debug } = await callAiApi(
     String(conf.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
     model,
     apiKey,
@@ -1340,7 +1526,13 @@ export async function probeAiConfig(
     [],
   )
   if (!reply) {
-    return { ok: false, reply: '', model, error: 'AI 接口未返回内容, 请检查 API 地址 / 模型名 / Key (详见服务端日志)' }
+    return {
+      ok: false,
+      reply: '',
+      model,
+      error: debug.error || 'AI 接口未返回内容, 请根据下方请求/响应原文排查',
+      debug,
+    }
   }
-  return { ok: true, reply, model, error: '' }
+  return { ok: true, reply, model, error: '', debug }
 }

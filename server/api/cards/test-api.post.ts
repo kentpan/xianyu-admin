@@ -10,7 +10,15 @@ export default defineEventHandler(
     } catch {
       throw new ApiError(400, 'API 配置不是合法 JSON')
     }
-    const result = await fetchApiCardContent(conf)
+    // 测试时用模拟上下文替换变量 ({title}/{price}/{apikey} 等), 与真实发货请求一致
+    const c = conf as Record<string, unknown>
+    const result = await fetchApiCardContent(conf, {
+      title: '测试商品',
+      price: '9.9',
+      apikey: String(c?.api_key || ''),
+      username: '测试买家',
+      userid: 'test_buyer_id',
+    })
     return ok({
       ok: result.ok,
       status: result.status,
