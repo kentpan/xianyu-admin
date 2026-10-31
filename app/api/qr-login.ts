@@ -2,6 +2,7 @@ import { useApi } from '~/composables/useApi'
 
 export interface QrLoginStartResponse {
   sessionKey: string
+  /** 服务端渲染的二维码 PNG data-url, <img :src> 直显 */
   qrUrl: string
 }
 
@@ -10,17 +11,19 @@ export interface QrLoginStatusResponse {
   xianyuUid?: string
   xianyuNick?: string
   cookieValue?: string
-  /** 风控二次核验页链接 (passport 官方页, 前端按钮新开顶部标签页打开完成人脸/滑块核验) */
-  iframeRedirectUrl?: string
+  errorMessage?: string
+  /** 需身份核验时: 服务端自动跟随核验链提取的人脸验证二维码 (手机闲鱼 App 扫码) */
+  faceQrUrl?: string
 }
 
 export function startQrLogin() {
   return useApi().post<QrLoginStartResponse>('/api/xianyu/qr-login/start')
 }
 
-export function pollQrStatus(sessionKey: string) {
+export function pollQrStatus(sessionKey: string, signal?: AbortSignal) {
   return useApi().get<QrLoginStatusResponse>(
     `/api/xianyu/qr-login/status?sessionKey=${encodeURIComponent(sessionKey)}`,
+    { signal },
   )
 }
 

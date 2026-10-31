@@ -84,6 +84,11 @@ const RISK_LADDER_WINDOW_MS = 30 * 60 * 1000
 /** token 刷新周期 1h ± 5min 抖动。 */
 const TOKEN_REFRESH_MS = 3600 * 1000
 
+/** cookie 保活周期 3 分钟 (参考项目 cookie_refresh_interval=180s)。 */
+const COOKIE_KEEPALIVE_MS = 180 * 1000
+/** 收到聊天消息后 5 分钟内不滚动 cookie (参考项目 message_cookie_refresh_cooldown=300s)。 */
+const COOKIE_MSG_COOLDOWN_MS = 300 * 1000
+
 function jitter(ms: number, ratio = 0.15): number {
   return Math.round(ms * (1 - ratio + Math.random() * ratio * 2))
 }
@@ -185,6 +190,9 @@ export class XianyuAccountClient {
   private tokenTimer: NodeJS.Timeout | null = null
   private heartbeatTimer: NodeJS.Timeout | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
+  private cookieKeepaliveTimer: NodeJS.Timeout | null = null
+  private cookieRefreshing = false
+  private lastChatMessageAt = 0
   private riskCooldownUntil = 0
   private riskLadderIndex = 0
   private lastRiskTripAt = 0
@@ -239,15 +247,20 @@ export class XianyuAccountClient {
     this.tokenTimer = setInterval(() => {
       if (!this.stopped) void this.refreshTokenSafely()
     }, jitter(TOKEN_REFRESH_MS, 0.08))
+    // cookie 保活 (复刻参考项目 cookie_refresh_loop): 每 3 分钟调 token API,
+    // 服务端下发的 Set-Cookie 合并回写 DB, 会话持续滚动 → 登录态不衰减不掉线
+    this.cookieKeepaliveTimer = setInterval(() => {
+      if (!this.stopped) void this.maybeCookieKeepalive()
+    }, jitter(COOKIE_KEEPALIVE_MS, 0.1))
   }
 
   async stop(): Promise<void> {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer, this.reconnectTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.reconnectTimer, this.cookieKeepaliveTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
-    this.tokenTimer = this.heartbeatTimer = this.reconnectTimer = null
+    this.tokenTimer = this.heartbeatTimer = this.reconnectTimer = this.cookieKeepaliveTimer = null
     this.generation++
     this.setState('disabled', '已停止')
     try {
@@ -414,7 +427,10 @@ export class XianyuAccountClient {
               try {
                 const parsed = parseSyncItem(item.data, this.myId)
                 if (!parsed) continue
-                if (parsed.kind === 'chat') this.events.onChat(this.cookieId, parsed)
+                if (parsed.kind === 'chat') {
+                  this.lastChatMessageAt = Date.now()
+                  this.events.onChat(this.cookieId, parsed)
+                }
                 else this.events.onSystem(this.cookieId, parsed)
               } catch (e: any) {
                 logWarn(`[${this.cookieId}] 同步包解析失败: ${e?.message}`)
@@ -433,6 +449,22 @@ export class XianyuAccountClient {
   }
 
   /* ---------------------------- Token ---------------------------- */
+
+  /**
+   * cookie 保活一次 (复刻参考项目语义): 收到聊天消息后 5 分钟内跳过 (活跃会话
+   * 期间不滚动 cookie, 避免令牌轮换干扰对话); 防重入; 风控/人工验证持有期由
+   * refreshTokenSafely 内部短路。
+   */
+  private async maybeCookieKeepalive(): Promise<void> {
+    if (this.cookieRefreshing || this.stopped) return
+    if (this.lastChatMessageAt && Date.now() - this.lastChatMessageAt < COOKIE_MSG_COOLDOWN_MS) return
+    this.cookieRefreshing = true
+    try {
+      await this.refreshTokenSafely()
+    } finally {
+      this.cookieRefreshing = false
+    }
+  }
 
   private async refreshTokenSafely(): Promise<void> {
     // 人工验证持有期: 引擎静默, token 刷新完全交给弹窗内的人工重试

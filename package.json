@@ -1,6 +1,6 @@
 {
   "name": "xianyu-admin",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "private": true,
   "type": "module",
   "description": "闲鱼超级管家 - 现代化的闲鱼自动回复与管理平台，基于 Nuxt 4 + Tailwind CSS 3 构建，支持闲鱼多账号管理、二维码扫码登录、返佣分销系统，支持 SQLite/MySQL/Cloudflare D1 多数据库无缝切换。",
@@ -19,6 +19,7 @@
     "mysql2": "^3.14.0",
     "nodemailer": "^10.0.14",
     "nuxt": "4.4.8",
+    "qrcode": "^1.5.4",
     "vue": "^3.5.13",
     "vue-router": "^4.5.0"
   },
@@ -26,6 +27,7 @@
     "@nuxtjs/tailwindcss": "^6.13.1",
     "@types/bcryptjs": "^2.4.6",
     "@types/nodemailer": "^8.0.2",
+    "@types/qrcode": "^1.5.6",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.5.3",
     "tailwindcss": "3.4.19",

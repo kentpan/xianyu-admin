@@ -1,16 +1,8 @@
 /** GET /api/xianyu/qr-login/status?sessionKey=... — poll QR scan status.
  *
- * On `success`, also persist the account into the `cookies` table:
- *   - id           = `xy_<xianyuUid>` (falls back to `acc_<rand>` if no unb)
- *   - value        = full cookie string
- *   - user_id      = session.userId
- *   - remark       = xianyuNick || xianyuUid
- *   - login_type   = 'qrcode'
- *   - xianyu_uid   = xianyuUid
- *   - cookie_status_text = 'valid'
- *
- * If a cookie row with the same id already exists for this user, the value
- * is updated in place (re-login refreshes the session).
+ * 纯内存读取 (服务端后台监控驱动状态机), status 响应毫秒级。
+ * On `success`, persist the account into the `cookies` table; the builtin
+ * engine (engine-manager 5s poll) picks it up automatically → 监听自动拉起。
  */
 export default defineEventHandler(
   withApi(async (event) => {
@@ -20,13 +12,13 @@ export default defineEventHandler(
     if (!sessionKey) throw new ApiError(400, '缺少 sessionKey 参数')
 
     // Verify ownership: the session's userId must match the caller (admin bypass)
-    const sessionUserId = await getSessionUserId(sessionKey)
+    const sessionUserId = getSessionUserId(sessionKey)
     if (sessionUserId == null) throw new ApiError(404, '二维码会话不存在')
     if (!payload.isAdmin && sessionUserId !== payload.userId) {
       throw new ApiError(403, '无权访问此二维码会话')
     }
 
-    const result = await pollQrStatus(sessionKey)
+    const result = await getSessionStatus(sessionKey)
 
     if (result.status === 'success' && result.cookieValue && result.xianyuUid) {
       const db = await getDb()

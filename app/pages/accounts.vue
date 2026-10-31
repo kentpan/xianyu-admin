@@ -267,13 +267,7 @@
         <!-- Step 2: waiting/scanned -->
         <div v-else-if="qrState === 'waiting' || qrState === 'scanned'" class="text-center">
           <div class="relative inline-block p-3 bg-white rounded-xl border border-slate-200 dark:border-slate-700">
-            <img
-              v-if="qrUrl"
-              :src="`https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(qrUrl)}`"
-              alt="闲鱼登录二维码"
-              class="w-60 h-60"
-              @error="onQrImgError"
-            />
+            <img v-if="qrUrl" :src="qrUrl" alt="闲鱼登录二维码" class="w-60 h-60" />
             <div v-if="qrState === 'scanned'" class="absolute inset-0 bg-white/80 dark:bg-slate-900/80 rounded-xl flex flex-col items-center justify-center">
               <div class="w-14 h-14 rounded-full bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center text-emerald-500 mb-2">
                 <Icon name="check" class="text-2xl" />
@@ -284,10 +278,7 @@
           <p class="text-sm text-slate-500 dark:text-slate-400 mt-4">
             请使用 <span class="font-medium text-slate-700 dark:text-slate-200">闲鱼 App</span> 扫描上方二维码完成登录
           </p>
-          <p v-if="qrState === 'waiting'" class="text-xs text-slate-400 mt-1">二维码有效期约 2 分钟，请尽快扫描</p>
-          <div v-if="qrUrlFallback" class="mt-3 text-xs text-slate-400 break-all font-mono bg-slate-50 dark:bg-slate-800/50 p-2 rounded">
-            {{ qrUrlFallback }}
-          </div>
+          <p v-if="qrState === 'waiting'" class="text-xs text-slate-400 mt-1">二维码有效期约 5 分钟，请尽快扫描</p>
         </div>
         <!-- Step 3: success -->
         <div v-else-if="qrState === 'success'" class="text-center py-6">
@@ -298,22 +289,24 @@
           <p class="text-sm text-slate-500 mt-1">闲鱼账号已自动添加到账号列表</p>
           <p v-if="qrAccountNick" class="text-xs text-slate-400 mt-1">{{ qrAccountNick }}</p>
         </div>
-        <!-- Step 4: verification_required (按钮新开顶部标签页完成核验, 核验通过自动续流登录) -->
+        <!-- Step 4: verification_required (服务端自动核验链, 用户手机闲鱼 App 扫人脸二维码) -->
         <div v-else-if="qrState === 'verification_required'" class="text-center">
           <div class="w-16 h-16 mx-auto rounded-full bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center text-amber-500 mb-3">
             <Icon name="alert" class="text-3xl" />
           </div>
           <p class="text-base font-semibold text-slate-800 dark:text-slate-100">登录需身份核验</p>
-          <p class="text-base text-slate-600 dark:text-slate-300 mt-2 leading-relaxed">
-            点击下方按钮<strong>在新标签页打开闲鱼官方人脸核验页</strong>，按页面提示完成核验（如页面请求摄像头请允许）
-          </p>
-          <p class="text-base font-medium text-emerald-600 dark:text-emerald-400 mt-2">
-            核验通过后本窗口自动完成登录，无需重新扫码，请勿关闭
-          </p>
-          <a v-if="qrVerifyUrl" :href="qrVerifyUrl" target="_blank" rel="noopener" class="btn-primary inline-flex items-center gap-2 mt-4">
-            <Icon name="external" /> 打开人脸核验页面
-          </a>
-          <p v-else class="text-base text-slate-500 mt-4">正在获取核验链接，请稍候…</p>
+          <div v-if="qrFaceQrUrl" class="mt-4">
+            <div class="inline-block p-3 bg-white rounded-xl border border-slate-200 dark:border-slate-700">
+              <img :src="qrFaceQrUrl" alt="人脸核验二维码" class="w-60 h-60" />
+            </div>
+            <p class="text-base text-slate-600 dark:text-slate-300 mt-3 leading-relaxed">
+              打开手机<strong>闲鱼 App</strong>，右上角扫一扫扫描上方二维码，按手机提示完成人脸核验
+            </p>
+            <p class="text-base font-medium text-emerald-600 dark:text-emerald-400 mt-2">
+              核验通过后本窗口自动完成登录，无需重新扫码，请勿关闭
+            </p>
+          </div>
+          <p v-else class="text-base text-slate-500 mt-4">正在获取人脸核验二维码，请稍候…</p>
         </div>
         <!-- Step 5: expired/error -->
         <div v-else class="text-center py-6">
@@ -393,12 +386,12 @@ type QrState = 'starting' | 'waiting' | 'scanned' | 'success' | 'expired' | 'ver
 const qrModalOpen = ref(false)
 const qrState = ref<QrState>('starting')
 const qrUrl = ref('')
-const qrUrlFallback = ref('')
 const qrSessionKey = ref('')
 const qrError = ref('')
-const qrVerifyUrl = ref('')
+const qrFaceQrUrl = ref('')
 const qrAccountNick = ref('')
-let qrPollTimer: ReturnType<typeof setInterval> | null = null
+let qrPollTimer: ReturnType<typeof setTimeout> | null = null
+let qrPollAbort: AbortController | null = null
 const verifyingIds = ref<Set<string>>(new Set())
 
 // 默认回复弹窗状态 (账号级)
@@ -650,9 +643,11 @@ function healthBarClass(level: string) {
 // ===== QR Scan Login =====
 function stopQrPoll() {
   if (qrPollTimer) {
-    clearInterval(qrPollTimer)
+    clearTimeout(qrPollTimer)
     qrPollTimer = null
   }
+  qrPollAbort?.abort()
+  qrPollAbort = null
 }
 
 async function openQrLogin() {
@@ -660,16 +655,14 @@ async function openQrLogin() {
   qrModalOpen.value = true
   qrState.value = 'starting'
   qrUrl.value = ''
-  qrUrlFallback.value = ''
   qrSessionKey.value = ''
   qrError.value = ''
-  qrVerifyUrl.value = ''
+  qrFaceQrUrl.value = ''
   qrAccountNick.value = ''
   try {
     const r = await startQrLogin()
     qrSessionKey.value = r.sessionKey
     qrUrl.value = r.qrUrl
-    qrUrlFallback.value = r.qrUrl
     qrState.value = 'waiting'
     startQrPoll()
   } catch (e: any) {
@@ -680,13 +673,13 @@ async function openQrLogin() {
 
 function startQrPoll() {
   stopQrPoll()
-  qrPollTimer = setInterval(async () => {
-    if (!qrSessionKey.value || qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') {
-      stopQrPoll()
-      return
-    }
+  const tick = async () => {
+    if (!qrSessionKey.value || qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') return
+    // 自调度串行轮询: 上一请求返回(或中止)后才排下一个 — 状态端点纯内存读,
+    // 毫秒级响应, 不堆积不乱序
+    qrPollAbort = new AbortController()
     try {
-      const r = await pollQrStatus(qrSessionKey.value)
+      const r = await pollQrStatus(qrSessionKey.value, qrPollAbort.signal)
       const st = r.status
       if (st === 'waiting') qrState.value = 'waiting'
       else if (st === 'scanned') qrState.value = 'scanned'
@@ -697,20 +690,27 @@ function startQrPoll() {
         toast.success('闲鱼账号登录成功')
         reload()
       } else if (st === 'verification_required') {
-        // 核验是伴随状态: 保存官方核验页 (ivCheckLogin.htm) 链接, 用户点按钮在新标签页 (顶部框架,
-        // 第一方 cookie 可用; iframe 内会被第三方 cookie 拦截导致官方页报过期, 故不用 iframe)
-        // 完成人脸/滑块, 通过后同一会话的 query.do 返回 CONFIRMED 自动续流登录。
-        // href 直连最新链接, 每次轮询若返回新链接则即时更新。
+        // 服务端自动核验链: 手机闲鱼 App 扫人脸二维码即可, 核验通过自动续流登录
         qrState.value = 'verification_required'
-        qrVerifyUrl.value = r.iframeRedirectUrl || qrVerifyUrl.value
+        qrFaceQrUrl.value = r.faceQrUrl || qrFaceQrUrl.value
       } else if (st === 'expired') {
         qrState.value = 'expired'
+        qrError.value = r.errorMessage || ''
         stopQrPoll()
       }
-    } catch {
+    } catch (e: any) {
+      if (e?.code === 404 || e?.code === 409) {
+        // 会话不存在/已失效 (服务重启丢内存会话等) — 永久态, 停止轮询给出重试入口
+        qrState.value = 'error'
+        qrError.value = e.message || '二维码会话已失效'
+        return
+      }
       // network hiccup — keep polling
     }
-  }, 2500)
+    if (qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') return
+    qrPollTimer = setTimeout(tick, 2000)
+  }
+  tick()
 }
 
 function onQrClose() {
@@ -719,10 +719,6 @@ function onQrClose() {
   if (qrSessionKey.value) {
     cancelQrLogin(qrSessionKey.value).catch(() => {})
   }
-}
-
-function onQrImgError() {
-  qrUrlFallback.value = qrUrl.value
 }
 
 async function verifyCookie(a: Account) {
