@@ -15,6 +15,7 @@
  *  - .refs/xianyu-auto-reply/scheduler/app/services/scheduler/polish_task.py (擦亮)
  */
 import crypto from 'node:crypto'
+import { relayMtopRequest } from './gateway'
 
 /** 闲鱼 H5 appKey (全项目硬编码值)。 */
 const APP_KEY = '34839810'
@@ -74,6 +75,38 @@ function getSetCookies(res: Response): string[] {
   } catch {
     return []
   }
+}
+
+/** mtop 响应 JSON 宽松解析 (空体/非 JSON 返空对象, 与 res.json().catch 同语义)。 */
+function parseMtopJson(text: string): any {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * mtop 单次 HTTP 传输层: 独立代理「POST 透传网关」优先。
+ *
+ * 引擎行登记了 host:port (isGatewayMode) 时, 请求原样 POST 给代理网关由可达闲鱼的
+ * 机器转发 (CF Pages 出口到 h5api 被墙, 直连必 500 超时 — 与 H5 扫码登录同一可达性
+ * 思路); 未登记/库不可用时返回 null → 本机直连 (原语义)。
+ * sign / _m_h5_tk 轮换 / token 过期重试等业务逻辑全部留在本文件, 网关零业务逻辑。
+ */
+async function mtopFetch(
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string },
+): Promise<{ status: number; text: string; setCookie: string[] }> {
+  const relayed = await relayMtopRequest(url, init)
+  if (relayed) return relayed
+  const res = await fetch(url, {
+    method: init.method,
+    headers: init.headers,
+    body: init.body,
+    signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
+  })
+  return { status: res.status, text: await res.text(), setCookie: getSetCookies(res) }
 }
 
 /**
@@ -141,16 +174,15 @@ export async function mtopCall<T = any>(
   })
   const body = `data=${encodeURIComponent(dataStr)}`
 
-  const res = await fetch(`${url}?${params.toString()}`, {
+  const res = await mtopFetch(`${url}?${params.toString()}`, {
     method,
     headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: cookieHeader(jar) },
     body: method === 'POST' ? body : undefined,
-    signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
   })
 
   // 合并轮换后的 cookie (尤其是 _m_h5_tk)
-  mergeSetCookies(jar, getSetCookies(res))
-  const raw = await res.json().catch(() => ({}))
+  mergeSetCookies(jar, res.setCookie)
+  const raw = parseMtopJson(res.text)
 
   // token 过期: FAIL_SYS_TOKEN_EXOIRED (闲鱼官方拼写错误, 含 O) 或 FAIL_SYS_TOKEN_EXPIRED
   const retStr = Array.isArray(raw?.ret) ? raw.ret[0] : ''
@@ -173,14 +205,13 @@ export async function mtopCall<T = any>(
       spm_cnt: 'a21ybx.home.0.0',
       ...opts.extraParams,
     })
-    const retryRes = await fetch(`${url}?${retryParams.toString()}`, {
+    const retryRes = await mtopFetch(`${url}?${retryParams.toString()}`, {
       method,
       headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: newCookieStr },
       body: method === 'POST' ? body : undefined,
-      signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
     })
-    mergeSetCookies(jar, getSetCookies(retryRes))
-    const retryRaw = await retryRes.json().catch(() => ({}))
+    mergeSetCookies(jar, retryRes.setCookie)
+    const retryRaw = parseMtopJson(retryRes.text)
     return {
       data: retryRaw?.data ?? ({} as T),
       cookieStr: cookieHeader(jar),
@@ -340,14 +371,15 @@ export async function polishItem(cookieStr: string, itemId: string): Promise<Pol
   let raw: any = {}
   let newCookieStr = cookieStr
   try {
-    const res = await fetch(
-      `https://h5api.m.goofish.com/h5/mtop.taobao.idle.item.polish/1.0/?${params.toString()}`,
-      { method: 'POST', headers, body: `data=${encodeURIComponent(dataStr)}` },
-    )
+    const res = await mtopFetch(`https://h5api.m.goofish.com/h5/mtop.taobao.idle.item.polish/1.0/?${params.toString()}`, {
+      method: 'POST',
+      headers,
+      body: `data=${encodeURIComponent(dataStr)}`,
+    })
     // 合并轮换后的 cookie (尤其是 _m_h5_tk)
-    mergeSetCookies(jar, getSetCookies(res))
+    mergeSetCookies(jar, res.setCookie)
     newCookieStr = cookieHeader(jar)
-    raw = await res.json().catch(() => ({}))
+    raw = parseMtopJson(res.text)
   } catch (e: any) {
     return { success: false, message: `网络请求失败: ${e.message}`, alreadyPolished: false, finalCookieStr: newCookieStr }
   }
@@ -364,13 +396,14 @@ export async function polishItem(cookieStr: string, itemId: string): Promise<Pol
       params2.set('t', t2)
       params2.set('sign', sign2)
       try {
-        const res2 = await fetch(
-          `https://h5api.m.goofish.com/h5/mtop.taobao.idle.item.polish/1.0/?${params2.toString()}`,
-          { method: 'POST', headers: { ...headers, cookie: newCookieStr }, body: `data=${encodeURIComponent(dataStr)}` },
-        )
-        mergeSetCookies(jar, getSetCookies(res2))
+        const res2 = await mtopFetch(`https://h5api.m.goofish.com/h5/mtop.taobao.idle.item.polish/1.0/?${params2.toString()}`, {
+          method: 'POST',
+          headers: { ...headers, cookie: newCookieStr },
+          body: `data=${encodeURIComponent(dataStr)}`,
+        })
+        mergeSetCookies(jar, res2.setCookie)
         newCookieStr = cookieHeader(jar)
-        raw = await res2.json().catch(() => ({}))
+        raw = parseMtopJson(res2.text)
       } catch {}
       const ret2 = Array.isArray(raw?.ret) ? raw.ret[0] : ''
       if (ret2.includes('SUCCESS')) {

@@ -15,6 +15,7 @@
 import { fetchOrderDetail, fetchSellerOrders } from '../../utils/xianyu/mtop'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
+import { isGatewayMode } from '../../utils/xianyu/gateway'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -36,22 +37,52 @@ export default defineEventHandler(
     const listErrors: string[] = []
     const MAX_LIST_PAGES = 5
 
-    /* ---- 第一步分流: 独立代理模式 → 任务通道 (CF 出口到 h5api 被墙, 直连必 500);
-     *      内置引擎 → 本机直连 (原语义) ---- */
+    /* ---- 第一步分流: 独立代理模式 → ① 透传网关优先 (引擎登记了公网 IP:端口, CF 直连代理
+     *      转发 mtop, 秒级直返) → ② 任务通道兜底 (网关未登记/不可达); 内置引擎 → 本机直连 ---- */
     const proxyMode = await isProxyEngineMode(db)
+    const gwMode = await isGatewayMode(db)
 
-    if (proxyMode) {
-      // 各账号并行下发任务, 统一等待代理回报 (每账号一任务, 代理串行逐账号执行)
-      const TIMEOUT_MS = 20_000
-      const settled = await Promise.all(
-        accounts.map(async (acct) => ({ acct, r: await fetchOrdersViaProxy(db, String(acct.id), { queryCode: 'ALL', pages: MAX_LIST_PAGES, timeoutMs: TIMEOUT_MS }) })),
-      )
-      for (const { acct, r } of settled) {
-        if (r.errors.length) listErrors.push(`${acct.id}: ${r.errors.join('; ').slice(0, 200)}`)
-        if (r.items.length) {
-          const ur = await upsertSoldOrders(db, String(acct.id), r.items)
-          listInserted += ur.inserted
-          listUpdated += ur.updated
+    if (proxyMode || gwMode) {
+      for (const acct of accounts) {
+        let done = false
+        // ① 透传网关优先: mtopFetch 内部自动把请求转发给代理网关 (sign/cookie 轮换仍在后台完成)
+        if (gwMode) {
+          try {
+            let cookieStr = String(acct.value || '')
+            let page = 1
+            while (page <= MAX_LIST_PAGES) {
+              const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
+              if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+                cookieStr = pg.finalCookieStr
+                await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, acct.id]).catch(() => {})
+              }
+              if (pg.retMsg) {
+                listErrors.push(`${acct.id}: ${pg.retMsg.slice(0, 120)}`)
+                break
+              }
+              if (pg.items.length) {
+                const r = await upsertSoldOrders(db, String(acct.id), pg.items)
+                listInserted += r.inserted
+                listUpdated += r.updated
+              }
+              if (!pg.nextPage || !pg.items.length) break
+              page++
+              await new Promise((r) => setTimeout(r, 400))
+            }
+            done = true
+          } catch (e: any) {
+            listErrors.push(`${acct.id}: 网关透传失败 → 回退任务通道 (${String(e?.message || e).slice(0, 120)})`)
+          }
+        }
+        // ② 任务通道兜底 (代理主动外呼后台, 无需公网入站; 网关未登记或不可达时唯一通路)
+        if (!done && proxyMode) {
+          const r = await fetchOrdersViaProxy(db, String(acct.id), { queryCode: 'ALL', pages: MAX_LIST_PAGES, timeoutMs: 20_000 })
+          if (r.errors.length) listErrors.push(`${acct.id}: ${r.errors.join('; ').slice(0, 200)}`)
+          if (r.items.length) {
+            const ur = await upsertSoldOrders(db, String(acct.id), r.items)
+            listInserted += ur.inserted
+            listUpdated += ur.updated
+          }
         }
       }
     } else {
@@ -81,11 +112,11 @@ export default defineEventHandler(
     }
 
     /* ---- 第二步: 非终态订单详情精修 (规格/城市等列表接口不含的字段) ----
-     * 独立代理模式跳过: 详情接口同为 h5api 直连 (CF 被墙), 逐单任务等待在请求预算内
-     * 不可能完成; 列表接口已含 状态/金额/买家/收货人 核心字段, 满足订单管理页展示 ---- */
-    const rows = proxyMode
-      ? []
-      : await db.all<any>(
+     * 透传网关已登记 (gwMode) 时照常执行: 详情接口经网关转发可达; 仅"代理模式且未登记
+     * 网关"跳过 (详情接口 CF 不可直连, 逐单任务等待在请求预算内不可能完成) ---- */
+    const refineEnabled = !proxyMode || gwMode
+    const rows = refineEnabled
+      ? await db.all<any>(
           `SELECT o.order_id, o.cookie_id, o.order_status FROM orders o
            WHERE o.order_status IN ('pending_ship', 'processing', 'refunding', 'unknown')
               OR o.order_status IS NULL OR o.order_status = ''
@@ -93,6 +124,7 @@ export default defineEventHandler(
            ORDER BY o.updated_at DESC LIMIT 200`,
           cookieFilter ? [cookieFilter] : [],
         )
+      : []
     const targets = rows.filter((r) => !statusFilter || String(r.order_status || 'unknown') === statusFilter)
 
     const cookieCache = new Map<string, string>()
@@ -173,8 +205,10 @@ export default defineEventHandler(
           updated: listUpdated,
           accounts: accounts.length,
           errors: listErrors,
-          mode: proxyMode ? 'proxy' : 'direct',
-          detail_refine: proxyMode ? 'skipped (代理模式: 详情接口 CF 不可直连, 列表字段已含核心数据)' : 'executed',
+          mode: gwMode ? 'gateway' : proxyMode ? 'proxy' : 'direct',
+          detail_refine: refineEnabled
+            ? 'executed'
+            : 'skipped (代理模式未登记网关地址: 详情接口 CF 不可直连, 列表字段已含核心数据)',
         },
       },
       listInserted || listUpdated ? `订单列表已同步: 新拉取 ${listInserted} 单, 更新 ${listUpdated} 单` : '订单列表已同步',

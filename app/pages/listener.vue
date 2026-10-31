@@ -50,7 +50,7 @@
               <td class="text-slate-500 dark:text-slate-400">
                 <template v-if="e.type === 'remote'">
                   <template v-if="e.host">{{ e.host }}<span v-if="e.port">:{{ e.port }}</span></template>
-                  <template v-else>未登记（代理主动外呼，无需公网入站）</template>
+                  <template v-else>未登记（任务模式主动外呼；透传网关必须登记公网 IP）</template>
                   <div v-if="e.remark" class="text-slate-400 mt-0.5">{{ e.remark }}</div>
                 </template>
                 <template v-else-if="e.runtime_supported === false">
@@ -222,7 +222,17 @@
           <p v-else class="text-amber-600 dark:text-amber-400">当前部署在 Cloudflare Pages（workerd 无常驻进程），内置监听引擎不可用 —— 两种远程形态任选：<b>① 自有设备 Node 版</b>（推荐，住宅 IP 风控友好）：在任意能出网的机器（你的电脑/服务器）部署单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>；<b>② Cloudflare Edge 版</b>（无常驻设备时）：<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">cloudflare/xianyu-edge-listener</code> Durable Object 监听器，wrangler 部署一次跑在边缘（需 Workers Paid，出口 IP 为数据中心段，风控面不同，详见包内 README）。代理上线后在其行内点「设为使用」即可接管监听。</p>
           <p>风控自愈：token 接口命中风控挑战时计入连败并按阶梯静默（30min → 2h，高频重试只会加深风控）；连败 ≥ 2 次后通过 SSE 实时推送全局弹窗（前端零轮询），弹窗内直接 iframe 嵌入闲鱼官方验证页（真实 h5api.m.goofish.com 页面，无代理无截图无后端浏览器），你在页面上人工拖动滑块，通过后官方页面按 addCookieToHeader 契约把 x5sec 凭证 postMessage 回本弹窗，自动合并进账号 Cookie 并重试 Token 恢复监听；弹窗打开期间引擎对该账号完全静默（不重试 token），避免并发调用作废你正在验证的挑战。</p>
           <p>引擎能力：收发闲鱼消息（关键词/AI/指定商品/默认回复四级链）、付款消息触发自动发货（卡券延时在卡券管理配置）、回复决策日志与消息过滤。</p>
-          <p>远程代理：单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>（零 npm 依赖，Node ≥ 20；Node 20 无内置 WebSocket 时同目录 npm i ws），只做消息监听与转发，所有规则/卡券/订单等业务状态都保留在本后台；代理主动外呼本后台（无需公网入站端口），部署说明点引擎行的「部署」按钮查看。</p>
+          <p>远程代理：单文件 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code>（零 npm 依赖，Node ≥ 20；Node 20 无内置 WebSocket 时同目录 npm i ws），只做消息监听与转发，所有规则/卡券/订单等业务状态都保留在本后台。同一脚本两种代理模式，区别只在是否填 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">XY_PROXY_PORT</code>，点引擎行「部署」按钮看完整步骤：</p>
+          <div class="rounded-lg border border-slate-200 dark:border-slate-700 divide-y divide-slate-200 dark:divide-slate-700">
+            <div class="p-3 space-y-1">
+              <p class="font-medium text-slate-700 dark:text-slate-200">模式一 · 任务模式（默认，无需公网 IP）</p>
+              <p class="text-slate-500 dark:text-slate-400">.env 只配 <code>XY_ADMIN_URL</code> + <code>XY_ENGINE_TOKEN</code>（不填 XY_PROXY_PORT）：代理主动外呼本后台 —— 拉账号配置 → 建闲鱼消息长连接 → 上报事件/领任务；订单拉取走任务通道（代理 3s 轮询领取 fetch_orders 本地执行后回报）。无需公网入站端口，能出网即可。</p>
+            </div>
+            <div class="p-3 space-y-1">
+              <p class="font-medium text-slate-700 dark:text-slate-200">模式二 · 任务模式 + 透传网关（推荐，需公网固定 IP）</p>
+              <p class="text-slate-500 dark:text-slate-400">模式一基础上加配 <code>XY_PROXY_PORT</code>（如 8800）：代理同端口额外开启 <code>GET /health</code> + <code>POST /gateway</code> 透传网关（Bearer 鉴权复用 XY_ENGINE_TOKEN）。在该引擎行登记公网 IP + 端口、服务器安全组/防火墙放行后，后台直连 <code>http://公网IP:端口/gateway</code> 转发闲鱼 mtop 请求（获取订单等接口秒回，解决 CF Pages 出口被墙 500 超时）；网关不可达时自动回落任务通道，监听链路不受影响。</p>
+            </div>
+          </div>
           <p class="text-slate-400">部署位置任选：能出网即入 —— 本地电脑（与浏览器同源环境风控最友好）、家里的闲置主机、任意 VPS；代理崩溃/断网自动重连与退避，Cookie 在后台重新扫码后 30s 内自动同步到代理。</p>
           <p class="text-slate-400">风控保护：设备指纹持久化、心跳/重连随机抖动、指数退避、发送人化队列（随机间隔 + 限速 12 条/分钟）、风控挑战自动冷却阶梯；后台对代理回连请求按 Bearer 令牌限速。</p>
         </div>
@@ -302,11 +312,11 @@
         <template v-if="!editing || editing.type === 'remote'">
           <div>
             <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1.5">IP 地址 / 域名（选填登记）</label>
-            <input v-model="form.host" class="input w-full" placeholder="如：123.45.67.89，代理主动外呼时可不填" />
+            <input v-model="form.host" class="input w-full" placeholder="如：47.76.132.145；透传网关必填公网 IP（不填后台连不到网关），任务模式可不填" />
           </div>
           <div>
             <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1.5">端口（选填）</label>
-            <input v-model.number="form.port" type="number" min="0" class="input w-full" placeholder="代理健康检查端口 XY_PROXY_PORT；登记后按此地址实测在线状态" />
+            <input v-model.number="form.port" type="number" min="0" class="input w-full" placeholder="透传网关端口 XY_PROXY_PORT（默认 8880）；登记后按此地址实测在线状态与转发 mtop 请求" />
           </div>
         </template>
         <div>
@@ -366,7 +376,7 @@
       <div class="space-y-4">
         <div class="text-slate-600 dark:text-slate-300 space-y-2">
           <p>1. 将项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code> 单个文件上传到任意能出网的服务器（仅需 Node ≥ 20，零 npm 依赖；Node 20 可在同目录 npm i ws）。</p>
-          <p>2. 配置 XY_ADMIN_URL / XY_ENGINE_TOKEN（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌），三种方式任选其一：① 启动命令内联环境变量；② 在脚本同目录放 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">.env</code> 文件（每行 KEY=VALUE），脚本启动时自动加载（真实环境变量优先）；③ Wispbyte 等面板的「Environment/环境变量」编辑页写入的正是这个 .env 文件，同样会被自动读取（面板 Startup/启动页的变量才是真环境变量，两处是分开的）。</p>
+          <p>2. 配置令牌与端口（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌），写在「与 xianyu-proxy.mjs 同目录的 .env」里（每行 KEY=VALUE，启动自动加载；面板部署则写在面板的环境变量页，写入的就是那个 .env）。两种代理模式任选：<b>模式一 · 任务模式</b>（默认，无需公网 IP）：只配 XY_ADMIN_URL + XY_ENGINE_TOKEN，代理主动外呼后台拉配置/监听消息/领任务（订单拉取走任务通道回报）。<b>模式二 · 任务模式 + 透传网关</b>（推荐，需公网固定 IP）：模式一基础上加配 XY_PROXY_PORT，代理同端口额外开启 POST /gateway 透传网关（鉴权复用 XY_ENGINE_TOKEN），并在本页该引擎行登记公网 IP + 端口、防火墙放行 —— 后台直连网关转发闲鱼 mtop 请求，解决 CF Pages 直连订单接口 500 超时。</p>
         </div>
         <div class="relative">
           <pre class="p-3 rounded-lg bg-slate-900 text-slate-100 overflow-x-auto leading-relaxed"><code>{{ deploySnippet }}</code></pre>
@@ -375,10 +385,10 @@
           </button>
         </div>
         <div class="text-slate-600 dark:text-slate-300 space-y-2">
-          <p>3. 启动：<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">node xianyu-proxy.mjs</code>。代理主动拉取账号配置 → 连闲鱼长连接 → 事件上报本后台，后台决策的回复/发货动作由代理人化执行；无需公网入站端口。</p>
+          <p>3. 启动：<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">node xianyu-proxy.mjs</code>。代理主动拉取账号配置 → 连闲鱼长连接 → 事件上报本后台，后台决策的回复/发货动作由代理人化执行；填了 XY_PROXY_PORT 则同端口额外开启 GET /health 健康检查 + POST /gateway 透传网关（绑定 0.0.0.0 全部网卡，公网入站须放行端口）。</p>
           <p>4. 回到本页，确认该代理显示「在线」后，点「设为使用」即可切换；原内置引擎会在 5 秒内自动停止监听，不会重复回复。令牌泄露点「重置」即时作废。</p>
           <p class="text-slate-400">提示：代理与后台共用一套风控约束（设备指纹持久化/随机抖动/冷却阶梯/人化发送队列）；本地电脑运行代理时若装有 Playwright Chromium 会自动探测真实浏览器 UA（风控更友好），无则回退内置静态 UA。</p>
-          <p class="text-slate-400">说明：XY_ADMIN_URL 必须是代理所在机器能访问到的本后台地址；XY_PROXY_PORT 为代理本地健康检查端口（选填，Bearer 鉴权）。</p>
+          <p class="text-slate-400">说明：XY_ADMIN_URL 必须是代理所在机器能访问到的本后台地址；XY_PROXY_PORT 不填 = 模式一纯任务模式（无需公网 IP），填了 = 模式二透传网关开启（后台按本行登记的公网 IP:端口 直连 /gateway；不登记或网关不可达时订单拉取自动回落任务通道，互不影响）。</p>
           <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3 space-y-1.5">
             <p class="font-medium text-slate-700 dark:text-slate-200">没有常驻设备？Cloudflare Edge 版</p>
             <p>项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">cloudflare/xianyu-edge-listener/</code> 是跑在 Cloudflare Durable Object 上的监听器（与 Edgechat 同形态：出站 WebSocket + alarm 保活），对接协议与 Node 版完全一致。<code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">wrangler deploy</code> 一次即可，无需任何自有设备在线。</p>
@@ -442,7 +452,7 @@ const switching = ref(0)
 const formOpen = ref(false)
 const saving = ref(false)
 const editing = ref<EngineRow | null>(null)
-const form = reactive({ name: '', host: '', port: 8765, remark: '', enabled: true })
+const form = reactive({ name: '', host: '', port: 8880, remark: '', enabled: true })
 
 const deployOpen = ref(false)
 const deployEngine = ref<EngineRow | null>(null)
@@ -489,10 +499,11 @@ function engineStatusMeta(e: EngineRow): { label: string; dot: string; tip: stri
 const deploySnippet = computed(() => {
   const e = deployEngine.value
   return [
+    `# 与 xianyu-proxy.mjs 同目录 .env (面板部署写在面板环境变量页)`,
     `XY_ADMIN_URL=${origin.value || 'https://你的后台域名'}`,
     `XY_ENGINE_TOKEN=${e?.token || '后台-监听服务页-复制该代理的接入令牌'}`,
-    `XY_PROXY_PORT=8765      # 选填: 本地健康检查端口`,
-    `XY_POLL_SECONDS=30      # 选填: 配置轮询间隔`,
+    `XY_PROXY_PORT=8800    # 选填: 本地健康检查端口; 开启后同端口附 POST /gateway 透传网关(推荐, 需公网固定IP)`,
+    `XY_POLL_SECONDS=30    # 选填: 配置轮询间隔`,
   ].join('\n')
 })
 
@@ -514,7 +525,7 @@ function openCreate() {
   editing.value = null
   form.name = ''
   form.host = ''
-  form.port = 8765
+  form.port = 8880
   form.remark = ''
   form.enabled = true
   formOpen.value = true
@@ -524,7 +535,7 @@ function openEdit(e: EngineRow) {
   editing.value = e
   form.name = e.name
   form.host = e.host
-  form.port = e.port || 8765
+  form.port = e.port || 8880
   form.remark = e.remark
   form.enabled = e.enabled
   formOpen.value = true

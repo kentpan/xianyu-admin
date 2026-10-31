@@ -20,6 +20,7 @@ import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-ap
 import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
+import { isGatewayMode } from './gateway'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
@@ -164,12 +165,48 @@ function isSystemNotice(content: string): boolean {
 const ORDER_TERMINAL_STATUSES = new Set(['shipped', 'closed', 'completed', 'cancelled', 'refunded'])
 
 /**
+ * 直连/网关拉单体 (共享): 内置引擎本机直连; 引擎登记了透传网关时 mtopFetch 内部自动
+ * 把请求转发给代理网关 (CF 不可直连环境同样可达)。返回 orderId 为空时 source 携带落空
+ * 原因 (透出到决策日志排查); 网关不可达时抛错, 由 pickOrderIdFromRemote 分流兜底。
+ */
+async function pickOrderIdDirect(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId: string,
+  buyerId: string,
+): Promise<{ orderId: string; source: string }> {
+  const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
+  const cookieStr = String(acct?.value || '')
+  if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }
+  const pg = await fetchSellerOrders(cookieStr, 1, 'NOT_SHIP')
+  if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+    await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, cookieId]).catch(() => {})
+  }
+  if (pg.retMsg) return { orderId: '', source: `远程拉单失败: ${pg.retMsg.slice(0, 80)}` }
+  if (!pg.items.length) return { orderId: '', source: '远程待发货列表为空' }
+  await upsertSoldOrders(db, cookieId, pg.items).catch(() => {})
+  const pending = pg.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
+  const hit =
+    (itemId && buyerId && pending.find((o) => o.item_id === itemId && o.buyer_id === buyerId)) ||
+    (itemId ? pending.find((o) => o.item_id === itemId) : null) ||
+    null
+  if (!hit) {
+    return {
+      orderId: '',
+      source: `远程待发货 ${pg.items.length} 单中无 商品${itemId || '未知'}/买家${buyerId || '未知'} 匹配`,
+    }
+  }
+  return { orderId: String(hit.order_id), source: '远程待发货列表' }
+}
+
+/**
  * 远程拉单兜底 (订单号第三重来源): 交易卡片只带商品ID不带订单号、且本地库查不到
- * 可发货订单时 (引擎订单同步是 5min 门控, 刚付款的单可能尚未落库), 实时调卖家订单
- * 接口拉「待发货」列表 (mtop.taobao.idle.trade.merchant.sold.get, queryCode=NOT_SHIP,
- * 与引擎定时同步/一键同步同源接口), 按 商品+买家 → 商品 两级匹配最新一单;
- * 命中后整页 upsert 入库 (订单管理页顺带补全待发货数据)。
- * 返回 { orderId, source }: orderId 为空时 source 携带落空原因 (透出到决策日志排查)。
+ * 可发货订单时 (引擎订单同步是 5min 门控, 刚付款的单可能尚未落库), 实时拉「待发货」
+ * 列表 (mtop.taobao.idle.trade.merchant.sold.get, queryCode=NOT_SHIP, 与引擎定时
+ * 同步/一键同步同源接口), 按 商品+买家 → 商品 两级匹配最新一单; 命中后整页 upsert
+ * 入库 (订单管理页顺带补全待发货数据)。
+ * 通道优先级: 透传网关 (引擎登记 host:port, 秒级直返) → 任务通道 (代理主动外呼) →
+ * 直连 (内置引擎原语义)。
  */
 async function pickOrderIdFromRemote(
   db: Awaited<ReturnType<typeof getDb>>,
@@ -178,9 +215,16 @@ async function pickOrderIdFromRemote(
   buyerId: string,
 ): Promise<{ orderId: string; source: string }> {
   try {
-    // 引擎模式分流: 独立代理模式 (CF 等闲鱼 mtop 不可直连环境) → 任务通道借代理拉单;
-    // 内置引擎 → 本机直连 (原语义)
+    // 引擎模式分流: ① 透传网关优先 (引擎登记了公网 IP:端口 — CF 直连代理转发 mtop,
+    // 秒级直返); ② 任务通道兜底 (代理主动外呼后台, 无需公网入站); 内置引擎 → 本机直连
     if (await isProxyEngineMode(db)) {
+      if (await isGatewayMode(db)) {
+        try {
+          return await pickOrderIdDirect(db, cookieId, itemId, buyerId)
+        } catch {
+          // 网关不可达/鉴权失败 → 落到任务通道兜底
+        }
+      }
       const pr = await fetchOrdersViaProxy(db, cookieId, { queryCode: 'NOT_SHIP', pages: 1, timeoutMs: 12_000 })
       if (pr.errors.length && !pr.items.length) return { orderId: '', source: `代理拉单失败: ${pr.errors.join('; ').slice(0, 120)}` }
       await upsertSoldOrders(db, cookieId, pr.items).catch(() => {})
@@ -197,28 +241,7 @@ async function pickOrderIdFromRemote(
       }
       return { orderId: String(hit.order_id), source: '代理待发货列表' }
     }
-    const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
-    const cookieStr = String(acct?.value || '')
-    if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }
-    const pg = await fetchSellerOrders(cookieStr, 1, 'NOT_SHIP')
-    if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
-      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, cookieId]).catch(() => {})
-    }
-    if (pg.retMsg) return { orderId: '', source: `远程拉单失败: ${pg.retMsg.slice(0, 80)}` }
-    if (!pg.items.length) return { orderId: '', source: '远程待发货列表为空' }
-    await upsertSoldOrders(db, cookieId, pg.items).catch(() => {})
-    const pending = pg.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
-    const hit =
-      (itemId && buyerId && pending.find((o) => o.item_id === itemId && o.buyer_id === buyerId)) ||
-      (itemId ? pending.find((o) => o.item_id === itemId) : null) ||
-      null
-    if (!hit) {
-      return {
-        orderId: '',
-        source: `远程待发货 ${pg.items.length} 单中无 商品${itemId || '未知'}/买家${buyerId || '未知'} 匹配`,
-      }
-    }
-    return { orderId: String(hit.order_id), source: '远程待发货列表' }
+    return await pickOrderIdDirect(db, cookieId, itemId, buyerId)
   } catch (e: any) {
     return { orderId: '', source: `远程拉单异常: ${String(e?.message || e).slice(0, 80)}` }
   }

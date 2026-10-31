@@ -15,10 +15,19 @@
  * 请在同目录 `npm i ws`), 配好环境变量后 `node xianyu-proxy.mjs`。
  * 代理主动外呼后台, 无需公网入站端口。
  *
+ * 两种用法 (同一脚本, 区别只在是否填 XY_PROXY_PORT):
+ *   ① 任务模式 (默认, 不填 XY_PROXY_PORT): 代理主动外呼后台 — 配置轮询 + WS 消息监听
+ *      + 任务通道 (订单拉取 fetch_orders 走任务领取/回报), 无需公网入站端口。
+ *   ② 任务模式 + 透传网关 (填 XY_PROXY_PORT): 在 ① 基础上, 同端口额外开启
+ *      POST /gateway 透传网关 — 后台 (CF Pages) 直连本机转发 mtop 请求 (解决 CF 出口
+ *      到 h5api 被墙 500 超时), 需服务器公网固定 IP + 防火墙放行端口, 引擎行登记该地址。
+ *
  * 环境变量:
  *   XY_ADMIN_URL     后台地址 (必填, 如 https://xianyu-admin.pages.dev)
- *   XY_ENGINE_TOKEN  引擎接入令牌 (必填, 后台「监听服务」页该代理行的接入令牌)
- *   XY_PROXY_PORT    本地健康检查端口 (选填, 默认关闭; 绑定全部网卡, /health 返回运行状态 JSON, Bearer 鉴权)
+ *   XY_ENGINE_TOKEN  引擎接入令牌 (必填, 后台「监听服务」页该代理行的接入令牌;
+ *                    透传网关鉴权复用同一令牌, Bearer XY_ENGINE_TOKEN)
+ *   XY_PROXY_PORT    本地健康检查端口 (选填, 默认关闭; 绑定全部网卡, 开启后同端口提供
+ *                    GET /health 运行状态 + POST /gateway mtop 透传网关, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
  *
@@ -1791,27 +1800,96 @@ async function statusHeartbeatLoop() {
   }
 }
 
-/* --------------------- 健康检查 (选填) --------------------- */
+/* --------------------- 健康检查 + POST 透传网关 (选填, XY_PROXY_PORT) --------------------- */
 
 if (PROXY_PORT > 0) {
-  const server = http.createServer((req, res) => {
+  // 透传网关目标白名单: 仅闲鱼/淘系域名, 不做开放代理
+  const GATEWAY_ALLOWED_HOSTS = [
+    'h5api.m.goofish.com',
+    'goofish.com',
+    'fishy.m.taobao.com',
+    'wuliao.m.taobao.com',
+    'taobao.com',
+    'tmall.com',
+  ]
+  const gwAllowed = (h) => GATEWAY_ALLOWED_HOSTS.some((d) => h === d || h.endsWith('.' + d))
+  // 逐跳头/鉴权头不透传 (由 Node fetch 自行生成)
+  const GATEWAY_SKIP_HEADERS = new Set(['host', 'connection', 'content-length', 'keep-alive', 'transfer-encoding', 'upgrade', 'accept-encoding', 'authorization'])
+  const GATEWAY_TIMEOUT_MS = 25_000
+  const readGatewayBody = (req, max = 512 * 1024) =>
+    new Promise((resolve, reject) => {
+      const chunks = []
+      let size = 0
+      req.on('data', (c) => {
+        size += c.length
+        if (size > max) {
+          reject(new Error('body too large'))
+          req.destroy()
+          return
+        }
+        chunks.push(c)
+      })
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+      req.on('error', reject)
+    })
+
+  const server = http.createServer(async (req, res) => {
     if (req.url === '/health' || req.url === '/') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
       res.end(
         JSON.stringify({
           ok: true,
-          script_version: 'v2.1.0',
+          script_version: 'v2.1.4',
           engine_active: engineActive,
+          gateway: true,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),
           uptime_seconds: Math.round(process.uptime()),
         }),
       )
       return
     }
+    if (req.url === '/gateway' && req.method === 'POST') {
+      const json = (code, obj) => {
+        res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify(obj))
+      }
+      try {
+        if (!ENGINE_TOKEN) {
+          json(403, { ok: false, error: '网关未配置鉴权令牌 (XY_ENGINE_TOKEN), 已禁用透传' })
+          return
+        }
+        if (req.headers.authorization !== `Bearer ${ENGINE_TOKEN}`) {
+          json(401, { ok: false, error: '鉴权失败: Bearer 令牌须与本代理 XY_ENGINE_TOKEN (后台「监听服务」页引擎行接入令牌) 一致' })
+          return
+        }
+        const payload = JSON.parse(await readGatewayBody(req))
+        const target = new URL(String(payload?.url || ''))
+        if (!/^https?:$/.test(target.protocol) || !gwAllowed(target.hostname)) {
+          json(403, { ok: false, error: `目标不在透传白名单 (仅闲鱼/淘系域名): ${target.hostname.slice(0, 80)}` })
+          return
+        }
+        const headers = {}
+        for (const [k, v] of Object.entries(payload?.headers || {})) if (v && !GATEWAY_SKIP_HEADERS.has(String(k).toLowerCase())) headers[k] = String(v)
+        const method = String(payload?.method || 'GET').toUpperCase()
+        const body = method === 'GET' || method === 'HEAD' ? undefined : String(payload?.body || '')
+        const timeoutMs = Math.min(Math.max(Math.round(Number(payload?.timeout_ms) || 20_000), 3_000), GATEWAY_TIMEOUT_MS)
+        const started = Date.now()
+        const upstream = await fetch(target, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
+        const text = (await upstream.text()).slice(0, 4 * 1024 * 1024)
+        json(200, { ok: true, status: upstream.status, text, set_cookie: upstream.headers.getSetCookie ? upstream.headers.getSetCookie() : [] })
+        log(`透传网关: ${method} ${target.host}${target.pathname.slice(0, 64)} → ${upstream.status} (${Date.now() - started}ms)`)
+      } catch (e) {
+        json(502, { ok: false, error: `透传转发失败: ${String(e?.message || e).slice(0, 160)}` })
+        log(`透传网关转发失败: ${String(e?.message || e).slice(0, 140)}`)
+      }
+      return
+    }
     res.writeHead(404)
     res.end()
   })
-  server.listen(PROXY_PORT, () => log(`健康检查端口已监听: http://0.0.0.0:${PROXY_PORT}/health (绑定全部网卡, 容器外可访问)`))
+  server.listen(PROXY_PORT, () =>
+    log(`HTTP 服务已监听: http://0.0.0.0:${PROXY_PORT} (GET /health 健康检查 + POST /gateway mtop 透传网关, Bearer 鉴权=XY_ENGINE_TOKEN, 绑定全部网卡 — 公网入站须放行端口)`),
+  )
 }
 
 /* --------------------- 启动 --------------------- */
@@ -1825,7 +1903,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   })
 }
 
-log(`独立代理已启动 → 后台 ${ADMIN_URL}`)
+log(`独立代理已启动 → 后台 ${ADMIN_URL}${PROXY_PORT > 0 ? ` (透传网关已开启 :${PROXY_PORT}/gateway)` : ''}`)
 log(`配置轮询 ${DEFAULT_POLL_SECONDS}s (以后台下发的 intervals 为准), 事件上报合并窗口 250ms, 任务轮询 ${DEFAULT_TASK_POLL_SECONDS}s`)
 configLoop().catch((e) => {
   log(`主循环异常退出: ${e?.message}`)
