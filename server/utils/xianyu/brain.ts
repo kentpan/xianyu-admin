@@ -17,7 +17,8 @@ import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
 import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
-import { fetchItemDetail, confirmOrderShipped, freeshippingOrder } from './mtop'
+import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders } from './mtop'
+import { upsertSoldOrders } from './order-sync'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
@@ -158,6 +159,51 @@ function isSystemNotice(content: string): boolean {
   return SYSTEM_NOTICE_TEXTS.has(String(content || '').trim())
 }
 
+/** 订单终态集合 (远程拉单匹配时排除)。 */
+const ORDER_TERMINAL_STATUSES = new Set(['shipped', 'closed', 'completed', 'cancelled', 'refunded'])
+
+/**
+ * 远程拉单兜底 (订单号第三重来源): 交易卡片只带商品ID不带订单号、且本地库查不到
+ * 可发货订单时 (引擎订单同步是 5min 门控, 刚付款的单可能尚未落库), 实时调卖家订单
+ * 接口拉「待发货」列表 (mtop.taobao.idle.trade.merchant.sold.get, queryCode=NOT_SHIP,
+ * 与引擎定时同步/一键同步同源接口), 按 商品+买家 → 商品 两级匹配最新一单;
+ * 命中后整页 upsert 入库 (订单管理页顺带补全待发货数据)。
+ * 返回 { orderId, source }: orderId 为空时 source 携带落空原因 (透出到决策日志排查)。
+ */
+async function pickOrderIdFromRemote(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId: string,
+  buyerId: string,
+): Promise<{ orderId: string; source: string }> {
+  try {
+    const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
+    const cookieStr = String(acct?.value || '')
+    if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }
+    const pg = await fetchSellerOrders(cookieStr, 1, 'NOT_SHIP')
+    if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, cookieId]).catch(() => {})
+    }
+    if (pg.retMsg) return { orderId: '', source: `远程拉单失败: ${pg.retMsg.slice(0, 80)}` }
+    if (!pg.items.length) return { orderId: '', source: '远程待发货列表为空' }
+    await upsertSoldOrders(db, cookieId, pg.items).catch(() => {})
+    const pending = pg.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
+    const hit =
+      (itemId && buyerId && pending.find((o) => o.item_id === itemId && o.buyer_id === buyerId)) ||
+      (itemId ? pending.find((o) => o.item_id === itemId) : null) ||
+      null
+    if (!hit) {
+      return {
+        orderId: '',
+        source: `远程待发货 ${pg.items.length} 单中无 商品${itemId || '未知'}/买家${buyerId || '未知'} 匹配`,
+      }
+    }
+    return { orderId: String(hit.order_id), source: '远程待发货列表' }
+  } catch (e: any) {
+    return { orderId: '', source: `远程拉单异常: ${String(e?.message || e).slice(0, 80)}` }
+  }
+}
+
 /** 交易完成文本 (买家/卖家确认收货): 触发未发货订单的兜底自动发货 (资金已锁定的最后补发窗口)。 */
 function isTradeCompleteContent(content: string): boolean {
   const text = String(content || '').trim()
@@ -240,16 +286,23 @@ export async function handleChatEvent(
       }
     }
     if (!orderId) {
-      logWarn(`[${cookieId}] 检测到付款触发消息但未提取到订单号, 跳过自动发货`)
-      // 决策日志可见: 付款卡片丢失订单号是漏发的直接证据; 附卡片原文摘要供排查结构变体
-      await addLog(db, cookieId, msg, opts, {
-        process_status: 'skipped',
-        decision_reason: 'delivery_failed',
-        reply_strategy: 'none',
-        reply_text: '付款卡片未提取到订单号, 无法自动发货',
-        error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
-      })
-      return []
+      // 第三重兜底: 远程拉待发货列表按 商品/买家 匹配 (卡片无订单号 + 本地库未落库的最后防线)
+      const remote = await pickOrderIdFromRemote(db, cookieId, msg.itemId, msg.senderUserId)
+      if (remote.orderId) {
+        orderId = remote.orderId
+        logWarn(`[${cookieId}] 付款卡片未含订单号, 远程拉单命中 ${orderId} (${remote.source}) 触发发货`)
+      } else {
+        logWarn(`[${cookieId}] 付款触发订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
+        // 决策日志可见: 付款卡片丢失订单号是漏发的直接证据; 附卡片原文摘要 + 远程拉单原因供排查
+        await addLog(db, cookieId, msg, opts, {
+          process_status: 'skipped',
+          decision_reason: 'delivery_failed',
+          reply_strategy: 'none',
+          reply_text: '付款卡片未提取到订单号, 无法自动发货',
+          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
+        })
+        return []
+      }
     }
     logWarn(`[${cookieId}] 付款触发: 订单 ${orderId} 商品 ${msg.itemId} → 自动发货`)
     await upsertOrderPending(db, cookieId, {
@@ -581,15 +634,22 @@ export async function handleSystemEvent(
         .catch(() => null)
     }
     if (!fallbackRow) {
-      logWarn(`[${cookieId}] 检测到付款事件但未提取到订单号, 跳过自动发货`)
-      await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-        process_status: 'skipped',
-        decision_reason: 'delivery_failed',
-        reply_strategy: 'none',
-        reply_text: '付款事件未提取到订单号, 无法自动发货',
-        error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
-      })
-      return []
+      // 第三重兜底: 远程拉待发货列表按 商品/买家 匹配 (与聊天付款卡片路径同款防线)
+      const remote = await pickOrderIdFromRemote(db, cookieId, msg.itemId, msg.buyerId)
+      if (remote.orderId) {
+        fallbackRow = { order_id: remote.orderId }
+        logWarn(`[${cookieId}] 系统卡片未含订单号, 远程拉单命中 ${remote.orderId} (${remote.source}) 触发发货`)
+      } else {
+        logWarn(`[${cookieId}] 付款事件订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
+        await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
+          process_status: 'skipped',
+          decision_reason: 'delivery_failed',
+          reply_strategy: 'none',
+          reply_text: '付款事件未提取到订单号, 无法自动发货',
+          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
+        })
+        return []
+      }
     }
     orderId = String(fallbackRow.order_id)
     logWarn(`[${cookieId}] 系统卡片未含订单号, 回退商品/买家维度最近可发货订单 ${orderId} 触发发货`)
