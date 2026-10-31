@@ -607,10 +607,6 @@ jobs:
           # NEXT_PUBLIC_* 是构建期内联: 浏览器直连 WS 地址在这里注入(可选)
           NEXT_PUBLIC_WS_URL: "${{ vars.NEXT_PUBLIC_WS_URL }}"
           REMOTE_WS_URL: "${{ env.REMOTE_WS_URL }}"
-          # v8.3.1 需求6/7: 代理透传开关(rewrites 在配置求值期读取) + 存储平台开关
-          #   PLATFORM=server 时服务端运行时自动检测 Node / Cloudflare edge 环境
-          # v8.8.7 需求2: LANGUAGE 站点语言模式(repo Variable 覆盖 .env, 空回落 auto)
-          # v8.9.1 需求4: PROXY_MODE / LANGUAGE 同时在运行期注入(Pages API / wrangler secret)
           PROXY_MODE: "${{ env.PROXY_MODE_RAW }}"
           LANGUAGE: "${{ env.LANGUAGE_RAW }}"
           PLATFORM: "${{ vars.PLATFORM }}"
@@ -1258,7 +1254,7 @@ jobs:
               console.error('::error::缺少 CLOUDFLARE_ACCOUNT_ID / PROJECT_NAME / CLOUDFLARE_API_TOKEN');
               process.exit(1);
             }
-            const NEED = ['NODE_ENV', 'LANGUAGE', 'PROXY_MODE', 'ADMIN_SECRET', 'JWT_SECRET'];
+            const NEED = ['NODE_ENV', 'ADMIN_SECRET', 'JWT_SECRET'];
             const mask = (v) => {
               const s = String(v == null ? '' : v);
               const at = s.indexOf('@');
