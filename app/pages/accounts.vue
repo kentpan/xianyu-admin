@@ -273,7 +273,7 @@
               <div class="w-14 h-14 rounded-full bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center text-emerald-500 mb-2">
                 <Icon name="check" class="text-2xl" />
               </div>
-              <p class="text-sm font-medium text-emerald-600 dark:text-emerald-400">已扫描，请在手机上确认</p>
+              <p class="text-sm font-medium text-emerald-600 dark:text-emerald-400">已扫描，请按手机提示继续操作</p>
             </div>
           </div>
           <p class="text-sm text-slate-500 dark:text-slate-400 mt-4">
@@ -308,13 +308,14 @@
             </p>
           </div>
           <p v-else class="text-base text-slate-500 mt-4">正在获取人脸核验二维码，请稍候…</p>
+          <p v-if="!qrFaceQrUrl && qrError" class="text-sm text-amber-600 dark:text-amber-500 mt-2">{{ qrError }}</p>
         </div>
         <!-- Step 5: expired/error -->
         <div v-else class="text-center py-6">
           <div class="w-16 h-16 mx-auto rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 mb-3">
             <Icon name="alert" class="text-3xl" />
           </div>
-          <p class="text-base font-semibold text-slate-800 dark:text-slate-100">{{ qrState === 'expired' ? '二维码已过期' : '登录失败' }}</p>
+          <p class="text-base font-semibold text-slate-800 dark:text-slate-100">{{ qrState === 'expired' ? (qrError ? '登录未完成' : '二维码已过期') : '登录失败' }}</p>
           <p v-if="qrError" class="text-sm text-slate-500 mt-1">{{ qrError }}</p>
         </div>
       </div>
@@ -691,11 +692,14 @@ async function openQrLogin() {
 
 function startQrPoll() {
   stopQrPoll()
+  // 自调度串行轮询（setTimeout 完成后自调用，非定时器盲发）：
+  // 上一请求完全返回（或中止）之后才排下一轮 — 任何时刻至多一个在途请求；
+  // 上游跳转慢（CF 出口确认→人脸核验 10~20s+）时下一轮自动顺延，绝不并发轰炸状态机。
+  // 间隔按状态自适应：waiting 2s / scanned·核验中 3s（跳转窗口内降频）/ 出错退避 5s。
   const tick = async () => {
     if (!qrSessionKey.value || qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') return
-    // 自调度串行轮询: 上一请求返回(或中止)后才排下一个 — 状态端点纯内存读,
-    // 毫秒级响应, 不堆积不乱序
     qrPollAbort = new AbortController()
+    let hadError = false
     try {
       const r = await pollQrStatus(qrSessionKey.value, qrPollAbort.signal)
       const st = r.status
@@ -709,13 +713,21 @@ function startQrPoll() {
         reload()
       } else if (st === 'verification_required') {
         // 服务端自动核验链: 手机闲鱼 App 扫人脸二维码即可, 核验通过自动续流登录
+        // faceQrUrl 未到时 (服务端提取链重试中) 展示等待态 + 实时失败原因
         qrState.value = 'verification_required'
         qrFaceQrUrl.value = r.faceQrUrl || qrFaceQrUrl.value
+        qrError.value = r.errorMessage || ''
       } else if (st === 'expired') {
         qrState.value = 'expired'
         qrError.value = r.errorMessage || ''
         stopQrPoll()
+      } else if (st === 'cancelled') {
+        qrState.value = 'error'
+        qrError.value = r.errorMessage || '登录已取消'
+        stopQrPoll()
       }
+      // scanned 态收到上游 EXPIRED 时服务端保持 scanned (跳转宽限期),
+      // 前端只需继续轮询等 CONFIRMED，绝不因单次 EXPIRED 终止
     } catch (e: any) {
       if (e?.code === 404 || e?.code === 409) {
         // 会话不存在/已失效 (服务重启丢内存会话等) — 永久态, 停止轮询给出重试入口
@@ -723,10 +735,12 @@ function startQrPoll() {
         qrError.value = e.message || '二维码会话已失效'
         return
       }
-      // network hiccup — keep polling
+      // 网络抖动 — 退避后继续轮询，绝不中断
+      hadError = true
     }
     if (qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') return
-    qrPollTimer = setTimeout(tick, 2000)
+    const delay = hadError ? 5000 : qrState.value === 'waiting' ? 2000 : 3000
+    qrPollTimer = setTimeout(tick, delay)
   }
   tick()
 }

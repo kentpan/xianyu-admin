@@ -54,6 +54,13 @@ const FALLBACK_TIMEOUT_MS = 4_000
 const SESSION_EXPIRE_MS = 300_000
 /** 人脸核验有效期 (进入核验态起 5 分钟, 对齐参考项目核验窗口重置) */
 const VERIFY_EXPIRE_MS = 300_000
+/**
+ * 已扫码 (scanned) 后的跳转宽限期: 用户确认后, 上游「确认→CONFIRMED+iframeRedirect」
+ * 的风控跳转在 CF Pages 出口下可达 10~20s 甚至更久, 期间 query.do 会持续回 EXPIRED
+ * (二维码已被确认动作消费), 跳转完成后才回 CONFIRMED。此窗口内绝不能因上游 EXPIRED
+ * 杀会话 — 给 3 分钟宽限, 由 TTL 顶部检查双保险。
+ */
+const SCANNED_GRACE_MS = 180_000
 
 export type QrStatus =
   | 'waiting'
@@ -407,6 +414,7 @@ function completeLogin(s: QrSessionRow, note: string): void {
  * 驱动 (每步一跳), 通过后跟 ivCheckLogin 收全量登录 cookie。
  */
 async function runFaceVerificationChain(s: QrSessionRow, iframeUrl: string): Promise<void> {
+  if (!iframeUrl) throw new Error('上游未返回核验入口链接')
   // 步骤1: 跟随风控跳转落到 normal_validate.htm
   const normalRes = await fetchRedirectJar(iframeUrl, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, s.jar)
   const normalHtml = await normalRes.text().catch(() => '')
@@ -495,11 +503,12 @@ export async function getSessionStatus(sessionKey: string): Promise<QrPollResult
 
   const now = Date.now()
   if (s.status !== 'success') {
-    const expireMs = s.status === 'verification_required' ? VERIFY_EXPIRE_MS : SESSION_EXPIRE_MS
-    const sinceMs = s.status === 'verification_required' ? s.updatedAtMs : s.createdAtMs
+    const wasVerification = s.status === 'verification_required'
+    const expireMs = wasVerification ? VERIFY_EXPIRE_MS : SESSION_EXPIRE_MS
+    const sinceMs = wasVerification ? s.updatedAtMs : s.createdAtMs
     if (sinceMs && now - sinceMs > expireMs) {
       s.status = 'expired'
-      s.errorMessage = s.errorMessage || '二维码已过期'
+      s.errorMessage = s.errorMessage || (wasVerification ? '人脸核验已超时, 请重新扫码登录' : '二维码已过期')
     }
   }
 
@@ -520,11 +529,22 @@ export async function getSessionStatus(sessionKey: string): Promise<QrPollResult
 
       if (qrStatus === 'CONFIRMED') {
         if (qdata.iframeRedirect === true || qdata.iframeRedirect === 'true') {
-          // 风控/人脸核验: 保留本响应 cookie (身份锚点), 交给服务端核验链
+          // 风控/人脸核验: 先把核验态 + 核验入口 URL 落库, 再跑提取链。
+          // 必须先落库: 否则提取链中途失败时会话仍停留在 scanned, 下次轮询
+          // 拿已被消费的 t/ck 重驱 query.do → 上游 EXPIRED → 前端误报
+          // 「二维码已过期」(v2.1.2 线上实证)。
           s.status = 'verification_required'
+          s.verificationUrl = String(qdata.iframeRedirectUrl || '')
+          await saveSession(db, s, { status: true, result: true })
           console.log(`[qr-login] 触发身份核验, 服务端自动处理: ${s.sessionKey}`)
-          await runFaceVerificationChain(s, String(qdata.iframeRedirectUrl || ''))
-          await saveSession(db, s, { status: true, result: true, face: true })
+          try {
+            await runFaceVerificationChain(s, s.verificationUrl)
+            await saveSession(db, s, { face: true })
+          } catch (e: any) {
+            // 提取链失败: 核验态已落库, 下次轮询走 verification_required 重试分支,
+            // 不再回退 scanned 重驱 query.do
+            console.error(`[qr-login] 人脸核验链失败 (下次轮询自动重试): ${s.sessionKey}: ${e?.message}`)
+          }
         } else {
           completeLogin(s, '扫码登录成功')
           await saveSession(db, s, { status: true, result: true })
@@ -532,17 +552,53 @@ export async function getSessionStatus(sessionKey: string): Promise<QrPollResult
       } else if (qrStatus === 'SCANED' && s.status === 'waiting') {
         s.status = 'scanned'
         await saveSession(db, s, { status: true })
-      } else if (qrStatus === 'EXPIRED') {
-        s.status = 'expired'
-        await saveSession(db, s, { status: true, result: true })
-      } else if (qrStatus !== 'NEW' && qrStatus !== 'SCANED') {
-        s.status = 'cancelled'
-        await saveSession(db, s, { status: true })
+      } else if (qrStatus === 'EXPIRED' || (qrStatus !== 'NEW' && qrStatus !== 'SCANED')) {
+        // EXPIRED / 未知空状态统一按「非推进响应」处理:
+        //   scanned 态 = 二维码已被用户确认动作消费, 登录转入风控/人脸核验通道。
+        //   CF 出口下跳转窗口 10~20s+ 内 query.do 持续回 EXPIRED 或错误态,
+        //   跳转完成后才回 CONFIRMED — 宽限期内 (进入 scanned 起 3min) 保持
+        //   scanned 继续轮询, 绝不杀会话 (v2.1.2 线上实证: 跳转等待中被误报
+        //   「二维码已过期」); 超出宽限期才判「确认跳转超时」。TTL 顶部检查
+        //   (建码起 5min) 双保险。
+        //   waiting 态 = EXPIRED 真没人扫 (上游码生命周期结束) / 未知状态按用户取消。
+        if (s.status === 'scanned') {
+          const graceOk = !s.updatedAtMs || now - s.updatedAtMs < SCANNED_GRACE_MS
+          if (graceOk) {
+            console.warn(`[qr-login] scanned 态上游非推进响应 (qrStatus=${qrStatus || '空'}, 确认跳转处理中, 宽限等待): ${s.sessionKey}`)
+          } else {
+            s.status = 'expired'
+            s.errorMessage = '确认跳转超时, 请重新扫码登录'
+            await saveSession(db, s, { status: true, result: true })
+          }
+        } else if (qrStatus === 'EXPIRED') {
+          s.status = 'expired'
+          await saveSession(db, s, { status: true, result: true })
+        } else {
+          s.status = 'cancelled'
+          await saveSession(db, s, { status: true })
+        }
       }
     } else if (s.status === 'verification_required') {
-      await driveFaceVerification(s)
-      if (s.status !== 'verification_required') {
+      if (!s.params.htoken && s.verificationUrl) {
+        // 上次提取链中途失败 (网络/上游抖动) — 用已落库的核验入口 URL 重试,
+        // 无需上游重放 CONFIRMED
+        try {
+          await runFaceVerificationChain(s, s.verificationUrl)
+          await saveSession(db, s, { face: true })
+        } catch (e: any) {
+          console.error(`[qr-login] 人脸核验链重试失败: ${s.sessionKey}: ${e?.message}`)
+          s.errorMessage = `人脸核验二维码获取失败, 正在自动重试: ${e?.message || '未知原因'}`
+        }
+      } else if (!s.params.htoken) {
+        // 无 htoken 且无核验入口 — 明确失败, 不再无限空转
+        s.status = 'expired'
+        s.errorMessage = s.errorMessage || '人脸核验会话异常, 请关闭后重新扫码登录'
         await saveSession(db, s, { status: true, result: true })
+      } else {
+        await driveFaceVerification(s)
+        if (s.status !== 'verification_required') {
+          await saveSession(db, s, { status: true, result: true })
+        }
       }
     }
   } catch (e: any) {
