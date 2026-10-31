@@ -1125,6 +1125,9 @@ async function apiCall(url, body, timeoutMs = 30_000) {
     headers: {
       Authorization: `Bearer ${ENGINE_TOKEN}`,
       'Content-Type': 'application/json',
+      // 后台接口必须带浏览器 UA: 空 UA 的数据中心请求会被 CF 边缘 bot 防护拖入慢路径
+      // (实测无 UA 的 POST 20s+ 无响应, Chrome UA 2~6s 返回) — 上报超时直接原因之一
+      'User-Agent': resolveChromeUA().ua,
       // 声明拉取能力: 后台对聊天/交易事件快速 ACK (占位后挂后台决策), 本代理按 event_id 轮询回收
       // 决策不再阻塞上报响应, 消灭「AI 慢 → 上报超时 → 回队重试 → 重复决策」风暴
       'x-engine-pull': '1',
@@ -1174,9 +1177,10 @@ async function flushReports() {
     accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state, detail: s.detail || '' })),
   }
   try {
-    // 15s 超时 (仅防链路异常); 快速 ACK 模式下后台秒回, 决策 (AI 可达 20~30s) 由 pullActions 异步回收;
-    // 旧版后台无拉取协议时同步返回动作, 本函数同样兼容 (响应无 pending 即完事)
-    const resp = await apiCall(EVENTS_URL, { status, events }, 15_000)
+    // 30s 超时 + 失败换新连接重试一次 (与配置轮询同款链路加固, 高丢包链路实测半数请求超时);
+    // 快速 ACK 模式下后台秒回, 决策 (AI 可达 20~30s) 由 pullActions 异步回收; 重报因
+    // event_id 去重安全 (服务端原样重放不重算)。旧版后台无拉取协议时同步返回动作, 同样兼容
+    const resp = await apiCallWithRetry(EVENTS_URL, { status, events }, 30_000)
     const actions = Array.isArray(resp?.actions) ? resp.actions : []
     await executeActions(actions)
     const pullIds = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
@@ -1209,7 +1213,7 @@ async function pullActions(ids, originEvents) {
     await sleep(attempt === 0 ? 1200 : 2500)
     let resp
     try {
-      resp = await apiCall(EVENTS_URL, { pull: remaining }, 15_000)
+      resp = await apiCallWithRetry(EVENTS_URL, { pull: remaining }, 30_000)
     } catch (e) {
       if (e?.fatal) throw e
       continue // 网络抖动继续拉, 拉取上限兜底
@@ -1382,19 +1386,23 @@ async function stopClient(id) {
 }
 
 /**
- * 配置拉取(带快速重试): 后台域名(pages.dev 等)在公网链路存在间歇性丢包/限速
+ * 后台请求(带快速重试): 后台域名(pages.dev 等)在公网链路存在间歇性丢包/限速
  * (实测同域名静态与接口均 ~半数请求超时, 而 TCP/边缘 trace 全通), 单次失败不
- * 代表不可达 —— 同一轮询内 3s 后立即重试一次, 把高丢包链路下的轮空率压到最低。
- * 致命(鉴权)与限速错误不重试, 原样上抛。
+ * 代表不可达 —— 3s 后立即换新连接重试一次, 把高丢包链路下的轮空率压到最低。
+ * 致命(鉴权)与限速错误不重试, 原样上抛。配置轮询/事件上报/决策拉取共用。
  */
-async function fetchConfigWithRetry() {
+async function apiCallWithRetry(url, body, timeoutMs = 30_000) {
   try {
-    return await apiCall(CONFIG_URL)
+    return await apiCall(url, body, timeoutMs)
   } catch (e) {
     if (e?.fatal || e?.rateLimited) throw e
     await sleep(3000)
-    return await apiCall(CONFIG_URL)
+    return await apiCall(url, body, timeoutMs)
   }
+}
+
+async function fetchConfigWithRetry() {
+  return apiCallWithRetry(CONFIG_URL)
 }
 
 async function pollConfigOnce() {

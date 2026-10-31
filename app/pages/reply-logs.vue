@@ -22,6 +22,7 @@
           <label class="text-sm text-slate-500 dark:text-slate-400">策略</label>
           <select v-model="filterStrategy" class="input !w-auto min-w-[140px]" @change="load">
             <option value="">全部策略</option>
+            <option value="delivery">自动发货</option>
             <option value="keyword">关键词回复</option>
             <option value="ai">AI 回复</option>
             <option value="default">默认回复</option>
@@ -151,10 +152,12 @@ function strategyMeta(log: ReplyLog) {
       case 'reply_cooldown': return { label: '冷却跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'system_notice': return { label: '系统通知', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'skip_reply_filter': return { label: '过滤规则', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'delivery_failed': return { label: '发货失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
       default: return { label: '跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
     }
   }
   switch (log.reply_strategy) {
+    case 'delivery': return { label: '自动发货', cls: 'bg-teal-50 text-teal-600 dark:bg-teal-900/30 dark:text-teal-400' }
     case 'keyword': return { label: '关键词', cls: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400' }
     case 'ai': return { label: 'AI', cls: 'bg-violet-50 text-violet-600 dark:bg-violet-900/30 dark:text-violet-400' }
     case 'default': return { label: '默认回复', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
