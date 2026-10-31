@@ -84,6 +84,37 @@ export interface QrSession {
 /** In-memory sessions — survives across requests in single-process Nitro. */
 const sessions = new Map<string, QrSession>()
 
+/**
+ * 持久化登录设备指纹 (cna, 存 system_settings)。
+ * 真实浏览器的 cna 长期不变; 每次登录都现取新 cna = 每次都是「陌生设备」发起登录,
+ * 闲鱼风控会升级为 ivCheckLogin 人脸二次核验。复用同一设备标识从源头降低核验触发率。
+ */
+async function loadPersistentCna(): Promise<string> {
+  try {
+    const db = await getDb()
+    const row = await db.get<{ value: string }>(
+      "SELECT value FROM system_settings WHERE key_name = 'qr_login_cna'",
+    )
+    return String(row?.value || '')
+  } catch {
+    return ''
+  }
+}
+
+async function savePersistentCna(cna: string): Promise<void> {
+  if (!cna) return
+  try {
+    const db = await getDb()
+    await db.run(
+      `INSERT INTO system_settings (key_name, value) VALUES ('qr_login_cna', ?)
+       ON CONFLICT(key_name) DO UPDATE SET value = excluded.value`,
+      [cna],
+    )
+  } catch {
+    // 设置表不可用时退回每次新 cna (仅影响风控友好度, 不影响登录功能)
+  }
+}
+
 /** Generate a random session key. */
 function newSessionKey(): string {
   return 'qr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
@@ -209,17 +240,24 @@ export async function startQrLogin(
   const jar = new Map<string, string>()
   const sessionKey = newSessionKey()
 
-  // (1) cna from mmstat
-  try {
-    const { setCookies } = await fetchSetCookies('https://log.mmstat.com/eg.js', {
-      method: 'GET',
-      headers: { 'User-Agent': UA, Accept: '*/*' },
-    })
-    mergeSetCookies(jar, setCookies)
-  } catch (e) {
-    console.error('[qr-login] cna fetch error:', e)
+  // (1) 设备指纹 cna: 优先复用持久化值 (同设备反复登录是正常浏览器形态, 风控友好);
+  //     首次登录才从 mmstat 现取并回写持久化, 此后所有扫码都携带同一设备标识
+  let cna = await loadPersistentCna()
+  if (cna) {
+    jar.set('cna', cna)
+  } else {
+    try {
+      const { setCookies } = await fetchSetCookies('https://log.mmstat.com/eg.js', {
+        method: 'GET',
+        headers: { 'User-Agent': UA, Accept: '*/*' },
+      })
+      mergeSetCookies(jar, setCookies)
+    } catch (e) {
+      console.error('[qr-login] cna fetch error:', e)
+    }
+    cna = jar.get('cna') || ''
+    await savePersistentCna(cna)
   }
-  const cna = jar.get('cna') || ''
   // cna is mirrored onto .goofish.com by the browser — the jar is flat, so we already have it.
 
   // (2) warm mtop feed → _m_h5_tk, _m_h5_tk_enc, cookie2
@@ -427,9 +465,8 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
   if (session.status === 'expired') {
     return { status: 'expired', errorMessage: session.errorMessage }
   }
-  if (session.status === 'verification_required') {
-    return { status: 'verification_required', iframeRedirectUrl: session.iframeRedirectUrl }
-  }
+  // verification_required 不是终态: 继续轮询同一二维码会话, 用户在闲鱼 App 内
+  // 完成核验后 query.do 会自动返回 CONFIRMED 完成登录, 无需重新扫码
 
   // Build the query.do body — base fields + t/ck
   const baseBody: Record<string, string> = {
@@ -491,11 +528,17 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
   const iframeRedirect =
     qdata.iframeRedirect === true || qdata.iframeRedirect === 'true'
 
-  // Risk-control / face verification branch
+  // Risk-control / face verification branch — 伴随状态而非终态:
+  // 前端把核验页 (ivCheckLogin.htm) 直接 iframe 嵌入弹窗, 用户在页面内完成人脸/滑块
+  // (官方无 X-Frame-Options 限制且字段名即 iframeRedirectUrl, 本就是 iframe 嵌入设计),
+  // 核验通过后同一会话 (t/ck) 的 query.do 会返回 CONFIRMED, 在此直接继续正常轮询即可自动完成登录。
   if (iframeRedirect) {
+    const isFirstVerify = session.status !== 'verification_required'
     session.status = 'verification_required'
     session.iframeRedirectUrl = qdata.iframeRedirectUrl || undefined
-    await persistSessionUpdate(sessionKey, { status: 'verification_required' })
+    if (isFirstVerify) {
+      await persistSessionUpdate(sessionKey, { status: 'verification_required' })
+    }
     return {
       status: 'verification_required',
       iframeRedirectUrl: session.iframeRedirectUrl,

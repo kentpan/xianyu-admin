@@ -16,6 +16,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { path: '/dashboard', label: '工作台', icon: 'dashboard', group: 'main' },
   { path: '/accounts', label: '账号管理', icon: 'accounts', group: 'main' },
+  { path: '/listener', label: '监听服务', icon: 'server', group: 'main' },
   { path: '/items', label: '商品管理', icon: 'items', group: 'main' },
   { path: '/orders', label: '订单管理', icon: 'orders', group: 'main' },
   { path: '/messages', label: '消息管理', icon: 'message', group: 'main' },
@@ -24,7 +25,6 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/item-replies', label: '指定商品回复', icon: 'itemReply', group: 'main' },
   { path: '/cards', label: '卡券管理', icon: 'cards', group: 'main' },
   { path: '/delivery', label: '自动发货', icon: 'delivery', group: 'main' },
-  { path: '/listener', label: '监听服务', icon: 'server', group: 'main' },
   { path: '/reply-logs', label: '回复决策日志', icon: 'activity', group: 'main' },
   { path: '/filters', label: '消息过滤', icon: 'filter', group: 'main' },
   { path: '/notification-channels', label: '通知渠道', icon: 'channels', group: 'main' },

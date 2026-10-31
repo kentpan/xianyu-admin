@@ -257,7 +257,7 @@
     </ModalBase>
 
     <!-- QR Scan Login modal -->
-    <ModalBase v-model="qrModalOpen" title="扫码登录闲鱼" size="md" @close="onQrClose">
+    <ModalBase v-model="qrModalOpen" title="扫码登录闲鱼" size="lg" @close="onQrClose">
       <div class="py-2">
         <!-- Step 1: starting -->
         <div v-if="qrState === 'starting'" class="text-center py-10 text-slate-400">
@@ -298,31 +298,28 @@
           <p class="text-sm text-slate-500 mt-1">闲鱼账号已自动添加到账号列表</p>
           <p v-if="qrAccountNick" class="text-xs text-slate-400 mt-1">{{ qrAccountNick }}</p>
         </div>
-        <!-- Step 4: verification_required -->
-        <div v-else-if="qrState === 'verification_required'" class="text-center">
-          <div class="w-16 h-16 mx-auto rounded-full bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center text-amber-500 mb-3">
-            <Icon name="alert" class="text-3xl" />
-          </div>
-          <p class="text-base font-semibold text-slate-800 dark:text-slate-100">登录需身份核验</p>
-          <p class="text-sm text-slate-500 mt-1">账号已通过实人认证（一次性资质无法重复发起），当前是登录风控的二次核验</p>
-          <template v-if="qrVerifyUrl">
-            <div class="mt-4 inline-block p-3 bg-white rounded-xl border border-slate-200 dark:border-slate-700">
-              <img
-                :src="`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(qrVerifyUrl)}`"
-                alt="身份核验二维码"
-                class="w-56 h-56"
-              />
+        <!-- Step 4: verification_required (官方核验页 iframe 直嵌, 核验通过自动续流登录) -->
+        <div v-else-if="qrState === 'verification_required'">
+          <p class="text-base text-slate-600 dark:text-slate-300 leading-relaxed text-center">
+            下方是<strong>闲鱼官方身份核验页</strong>（passport.goofish.com 原样加载），请直接在页面内按提示完成<strong>人脸核验</strong>（如页面请求摄像头请允许）
+          </p>
+          <p class="text-base font-medium text-emerald-600 dark:text-emerald-400 mt-2 text-center">
+            核验通过后本窗口自动完成登录，无需重新扫码，请勿关闭
+          </p>
+          <template v-if="qrVerifyIframeSrc">
+            <div class="mt-3 rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-900">
+              <iframe
+                :key="qrVerifyIframeKey"
+                :src="qrVerifyIframeSrc"
+                class="block w-full border-0"
+                style="height: 520px"
+                allow="camera; microphone; autoplay"
+                title="闲鱼官方身份核验页"
+              ></iframe>
             </div>
-            <p class="text-sm text-slate-500 dark:text-slate-400 mt-3">
-              请用 <span class="font-medium text-slate-700 dark:text-slate-200">闲鱼 App</span> 扫描上方二维码，在 App 内按页面提示完成核验（滑块/人脸以页面实际展示为准）
-            </p>
-            <p class="text-sm text-slate-400 mt-1">核验链接有时效请尽快完成；完成后点「重新生成」再扫登录码</p>
-            <div class="mt-3 flex items-center gap-2 max-w-md mx-auto">
-              <div class="flex-1 text-xs text-slate-400 break-all font-mono bg-slate-50 dark:bg-slate-800/50 p-2 rounded text-left">{{ qrVerifyUrl }}</div>
-              <button class="btn-secondary shrink-0" @click="copyVerifyUrl">复制链接</button>
-            </div>
+            <p class="text-base text-slate-400 mt-2 text-center">若页面提示过期或加载异常，点「重载核验页」加载最新核验链接</p>
           </template>
-          <p v-else class="text-sm text-slate-500 mt-1">本次未拿到核验链接；可稍后重试，或改用「修改密码」流程触发强身份核验后重新扫码</p>
+          <p v-else class="text-base text-slate-500 mt-2 text-center">正在等待核验链接，请稍候…</p>
         </div>
         <!-- Step 5: expired/error -->
         <div v-else class="text-center py-6">
@@ -335,7 +332,10 @@
       </div>
       <template #footer>
         <button class="btn-secondary flex-1" @click="onQrClose">关闭</button>
-        <button v-if="qrState === 'expired' || qrState === 'error' || qrState === 'verification_required'" class="btn-primary flex-1" @click="openQrLogin">
+        <button v-if="qrState === 'verification_required'" class="btn-primary flex-1" @click="reloadVerifyIframe">
+          <Icon name="refresh" /> 重载核验页
+        </button>
+        <button v-else-if="qrState === 'expired' || qrState === 'error'" class="btn-primary flex-1" @click="openQrLogin">
           <Icon name="refresh" /> 重新生成
         </button>
       </template>
@@ -406,6 +406,8 @@ const qrUrlFallback = ref('')
 const qrSessionKey = ref('')
 const qrError = ref('')
 const qrVerifyUrl = ref('')
+const qrVerifyIframeSrc = ref('')
+const qrVerifyIframeKey = ref(0)
 const qrAccountNick = ref('')
 let qrPollTimer: ReturnType<typeof setInterval> | null = null
 const verifyingIds = ref<Set<string>>(new Set())
@@ -673,6 +675,8 @@ async function openQrLogin() {
   qrSessionKey.value = ''
   qrError.value = ''
   qrVerifyUrl.value = ''
+  qrVerifyIframeSrc.value = ''
+  qrVerifyIframeKey.value = 0
   qrAccountNick.value = ''
   try {
     const r = await startQrLogin()
@@ -690,7 +694,7 @@ async function openQrLogin() {
 function startQrPoll() {
   stopQrPoll()
   qrPollTimer = setInterval(async () => {
-    if (!qrSessionKey.value || qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error' || qrState.value === 'verification_required') {
+    if (!qrSessionKey.value || qrState.value === 'success' || qrState.value === 'expired' || qrState.value === 'error') {
       stopQrPoll()
       return
     }
@@ -706,9 +710,13 @@ function startQrPoll() {
         toast.success('闲鱼账号登录成功')
         reload()
       } else if (st === 'verification_required') {
+        // 核验是伴随状态: 首次进入时把官方核验页 (ivCheckLogin.htm) 装进 iframe,
+        // 用户在页面内完成人脸/滑块, 通过后同一会话的 query.do 返回 CONFIRMED 自动续流登录。
+        // 轮询返回的最新核验链接存 qrVerifyUrl, 已装载的 iframe 不随轮询自动刷新 (防闪烁),
+        // 链接过期时由用户点「重载核验页」取最新链接。
         qrState.value = 'verification_required'
-        qrVerifyUrl.value = r.iframeRedirectUrl || ''
-        stopQrPoll()
+        qrVerifyUrl.value = r.iframeRedirectUrl || qrVerifyUrl.value
+        if (!qrVerifyIframeSrc.value && qrVerifyUrl.value) qrVerifyIframeSrc.value = qrVerifyUrl.value
       } else if (st === 'expired') {
         qrState.value = 'expired'
         stopQrPoll()
@@ -731,13 +739,10 @@ function onQrImgError() {
   qrUrlFallback.value = qrUrl.value
 }
 
-async function copyVerifyUrl() {
-  if (!qrVerifyUrl.value) return
-  try {
-    await navigator.clipboard.writeText(qrVerifyUrl.value)
-    toast.success('核验链接已复制，可在手机浏览器打开完成核验')
-  } catch {
-    toast.error('复制失败，请手动长按选择链接复制')
+function reloadVerifyIframe() {
+  if (qrVerifyUrl.value) {
+    qrVerifyIframeSrc.value = qrVerifyUrl.value
+    qrVerifyIframeKey.value++
   }
 }
 
