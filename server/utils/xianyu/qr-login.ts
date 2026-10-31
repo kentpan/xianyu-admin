@@ -51,6 +51,13 @@ const MTOP_HEADERS: Record<string, string> = {
 
 const BIZ_PARAMS = 'taobaoBizLoginFrom=web&renderRefer=https%3A%2F%2Fwww.goofish.com%2F'
 
+/** 核验等待上限: 人脸/滑块核验期间会话不降级, 超过此时长才判超时 */
+const VERIFY_WAIT_MS = 15 * 60 * 1000
+/** 核验等待期内用 loginToken 重试换 cookie 的最小间隔 (过频会加重风控) */
+const LOGIN_RETRY_MS = 10 * 1000
+/** 连续轮询失败判死阈值 (瞬断不杀会话, 连续失败才判) */
+const MAX_POLL_ERRORS = 8
+
 export type QrStatus =
   | 'waiting'
   | 'scanned'
@@ -79,6 +86,14 @@ export interface QrSession {
   cookieValue?: string
   /** Populated when status === 'verification_required' */
   iframeRedirectUrl?: string
+  /** CONFIRMED 时 passport 下发的登录令牌 (核验通过后靠它换 cookie) */
+  loginToken?: string
+  /** 进入核验等待的时间戳 (超时判定) */
+  verificationSince?: number
+  /** 上次用 loginToken 换 cookie 的时间戳 (节流) */
+  lastLoginAttempt?: number
+  /** query.do 连续失败计数 (成功响应归零) */
+  pollErrors?: number
 }
 
 /** In-memory sessions — survives across requests in single-process Nitro. */
@@ -404,6 +419,86 @@ export async function startQrLogin(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// tryCompleteLogin — CONFIRMED 后用登录令牌换取正式 cookie (正常路径与核验等待期重试共用)
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * 用 loginToken 换取正式 cookie (login_token/login.do → 刷新 _m_h5_tk → unb 校验)。
+ * 成功回 true (会话已置 success 并落库); 失败回 false (不改会话状态, 由调用方决定)。
+ * 核验等待期内登录令牌保留在会话中, 用户完成人脸/滑块后由本函数的节流重试自动完成登录。
+ */
+async function tryCompleteLogin(session: QrSession): Promise<boolean> {
+  if (!session.loginToken) return false
+  // (1) login_token/login.do — 用令牌换正式登录 cookie
+  try {
+    const loginUrl =
+      `https://passport.goofish.com/login_token/login.do` +
+      `?token=${encodeURIComponent(session.loginToken)}` +
+      `&subFlow=DIALOG_CHECK_LOGIN_RPC&nextCode=0018&bizScene=qrcode&confirm=true`
+    const { setCookies } = await fetchSetCookies(loginUrl, {
+      method: 'POST',
+      headers: withCookieHeader(
+        {
+          ...PASSPORT_HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: 'https://passport.goofish.com',
+          Referer: 'https://passport.goofish.com/mini_login.htm',
+        },
+        session.jar,
+      ),
+      body: `deviceId=${encodeURIComponent(session.cna)}`,
+    })
+    mergeSetCookies(session.jar, setCookies)
+  } catch (e) {
+    console.error('[qr-login] login_token exchange error:', e)
+    // 继续 — cookie 可能已随 query.do 落袋
+  }
+
+  // (2) 刷新 _m_h5_tk (登录后令牌轮换)
+  try {
+    const t2 = Date.now().toString()
+    const navUrl =
+      `https://h5api.m.goofish.com/h5/mtop.idle.web.user.page.nav/1.0/` +
+      `?jsv=2.7.2&appKey=34839810&t=${t2}&sign=&v=1.0&type=originaljson` +
+      `&dataType=json&timeout=20000&api=mtop.idle.web.user.page.nav` +
+      `&sessionOption=AutoLoginOnly&spm_cnt=a21ybx.home.0.0`
+    const { res, setCookies } = await fetchSetCookies(navUrl, {
+      method: 'POST',
+      headers: withCookieHeader(MTOP_HEADERS, session.jar),
+      body: 'data=%7B%7D',
+    })
+    mergeSetCookies(session.jar, setCookies)
+    await res.text().catch(() => {})
+  } catch (e) {
+    console.error('[qr-login] nav refresh error:', e)
+  }
+
+  // (3) unb cookie 是登录完成的唯一标志
+  const unb = session.jar.get('unb') || ''
+  if (!unb) return false
+
+  const cookieValue = cookieHeader(session.jar)
+  const tracknickRaw = session.jar.get('tracknick') || ''
+  let xianyuNick = ''
+  try {
+    xianyuNick = tracknickRaw ? decodeURIComponent(tracknickRaw) : ''
+  } catch {
+    xianyuNick = tracknickRaw
+  }
+
+  session.status = 'success'
+  session.xianyuUid = unb
+  session.xianyuNick = xianyuNick
+  session.cookieValue = cookieValue
+  await persistSessionUpdate(session.sessionKey, {
+    status: 'success',
+    cookieValue,
+    xianyuUid: unb,
+    xianyuNick,
+  })
+  return true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 2. pollQrStatus
 // ─────────────────────────────────────────────────────────────────────────────
 export interface QrPollResult {
@@ -431,8 +526,9 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
       cookie_value: string | null
       xianyu_uid: string | null
       xianyu_nick: string | null
+      updated_at: string | null
     }>(
-      'SELECT session_key, user_id, status, qr_url, cookie_value, xianyu_uid, xianyu_nick FROM qr_login_sessions WHERE session_key = ?',
+      'SELECT session_key, user_id, status, qr_url, cookie_value, xianyu_uid, xianyu_nick, updated_at FROM qr_login_sessions WHERE session_key = ?',
       [sessionKey],
     )
     if (!row) throw new ApiError(404, '二维码会话不存在')
@@ -447,7 +543,14 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
     }
     if (row.status === 'cancelled') return { status: 'cancelled' }
     if (row.status === 'expired') return { status: 'expired' }
-    if (row.status === 'verification_required') return { status: 'verification_required' }
+    if (row.status === 'verification_required') {
+      // 重启后 cookie jar 已丢, 核验无法完成 — 超过等待上限只报过期, 不无限悬挂
+      const updated = Date.parse((row.updated_at || '').replace(' ', 'T') + 'Z')
+      if (Number.isFinite(updated) && Date.now() - updated > VERIFY_WAIT_MS) {
+        return { status: 'expired', errorMessage: '核验等待超时，请重新扫码' }
+      }
+      return { status: 'verification_required' }
+    }
     // waiting/scanned but jar is gone — cannot continue polling
     throw new ApiError(409, '二维码会话已失效，请重新生成')
   }
@@ -465,8 +568,20 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
   if (session.status === 'expired') {
     return { status: 'expired', errorMessage: session.errorMessage }
   }
-  // verification_required 不是终态: 继续轮询同一二维码会话, 用户在闲鱼 App 内
-  // 完成核验后 query.do 会自动返回 CONFIRMED 完成登录, 无需重新扫码
+
+  // 核验等待期: 会话状态绝不降级 — 唯一出口是换 cookie 成功 (success)、等待超时或用户主动关闭/重生成。
+  // 手机端确认后 passport 会在核验通过前持续返回无令牌的 CONFIRMED 甚至 EXPIRED,
+  // 这些响应都不得把会话打成 expired 杀掉 (用户正在新标签页做人脸核验)。
+  const verifying = session.status === 'verification_required'
+  if (verifying && session.verificationSince && Date.now() - session.verificationSince > VERIFY_WAIT_MS) {
+    session.status = 'expired'
+    session.errorMessage = '核验等待超时，请重新扫码'
+    await persistSessionUpdate(sessionKey, {
+      status: 'expired',
+      errorMessage: session.errorMessage,
+    })
+    return { status: 'expired', errorMessage: session.errorMessage }
+  }
 
   // Build the query.do body — base fields + t/ck
   const baseBody: Record<string, string> = {
@@ -515,28 +630,62 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
     const json = (await res.json().catch(() => ({}))) as any
     qdata = json?.content?.data || {}
   } catch (e: any) {
-    session.status = 'expired'
-    session.errorMessage = e?.message || String(e)
-    await persistSessionUpdate(sessionKey, {
-      status: 'expired',
-      errorMessage: session.errorMessage,
-    })
-    return { status: 'expired', errorMessage: session.errorMessage }
+    // 瞬断不杀会话: 单次失败保持最后已知状态, 连续失败达到阈值才判死
+    session.pollErrors = (session.pollErrors || 0) + 1
+    if (session.pollErrors >= MAX_POLL_ERRORS) {
+      session.status = 'expired'
+      session.errorMessage = e?.message || String(e)
+      await persistSessionUpdate(sessionKey, {
+        status: 'expired',
+        errorMessage: session.errorMessage,
+      })
+      return { status: 'expired', errorMessage: session.errorMessage }
+    }
+    return verifying
+      ? { status: 'verification_required', iframeRedirectUrl: session.iframeRedirectUrl }
+      : { status: session.status, qrUrl: session.qrUrl }
   }
+  session.pollErrors = 0
 
   const rawStatus = String(qdata.qrCodeStatus || '').toUpperCase()
   const iframeRedirect =
     qdata.iframeRedirect === true || qdata.iframeRedirect === 'true'
 
+  // 登录令牌与核验链接: 每次响应都捕获 — 这是核验等待期完成登录的原料
+  // (手机端确认+风控时 CONFIRMED 与 iframeRedirect 同帧下发, 令牌在核验通过前不可换 cookie)
+  const incomingToken = String(qdata.token || qdata.lgToken || '')
+  const tokenIsNew = !!incomingToken && incomingToken !== session.loginToken
+  if (incomingToken) session.loginToken = incomingToken
+  if (qdata.iframeRedirectUrl) session.iframeRedirectUrl = String(qdata.iframeRedirectUrl)
+
+  // 核验等待期: 任何轮询响应 (CONFIRMED/EXPIRED/等待/未知) 都不改变会话状态;
+  // 只按节流重试 (新令牌立即重试) 用保留的 loginToken 换 cookie — 用户完成人脸后下一次重试即成功
+  if (verifying) {
+    if (
+      session.loginToken &&
+      (tokenIsNew || !session.lastLoginAttempt || Date.now() - session.lastLoginAttempt >= LOGIN_RETRY_MS)
+    ) {
+      session.lastLoginAttempt = Date.now()
+      if (await tryCompleteLogin(session)) {
+        return {
+          status: 'success',
+          xianyuUid: session.xianyuUid,
+          xianyuNick: session.xianyuNick,
+          cookieValue: session.cookieValue,
+        }
+      }
+    }
+    return { status: 'verification_required', iframeRedirectUrl: session.iframeRedirectUrl }
+  }
+
   // Risk-control / face verification branch — 伴随状态而非终态:
   // 前端把核验页 (ivCheckLogin.htm) 链接做成按钮, 用户点击在新标签页 (顶部框架, 第一方
   // cookie 可用; iframe 内第三方 cookie 被拦截会导致官方页报过期, 故不用 iframe)
-  // 完成人脸/滑块, 核验通过后同一会话 (t/ck) 的 query.do 会返回 CONFIRMED,
-  // 在此直接继续正常轮询即可自动完成登录。
+  // 完成人脸/滑块; 会话进入核验等待, 由上方 verifying 分支节流重试换 cookie 自动完成登录
   if (iframeRedirect) {
     const isFirstVerify = session.status !== 'verification_required'
+    if (isFirstVerify) session.verificationSince = Date.now()
     session.status = 'verification_required'
-    session.iframeRedirectUrl = qdata.iframeRedirectUrl || undefined
     if (isFirstVerify) {
       await persistSessionUpdate(sessionKey, { status: 'verification_required' })
     }
@@ -569,92 +718,30 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
     return { status: 'waiting', qrUrl: session.qrUrl }
   }
 
-  // CONFIRMED — exchange token, refresh _m_h5_tk, collect cookies
-  const loginToken = qdata.token || qdata.lgToken || ''
-  if (loginToken) {
-    try {
-      const loginUrl =
-        `https://passport.goofish.com/login_token/login.do` +
-        `?token=${encodeURIComponent(loginToken)}` +
-        `&subFlow=DIALOG_CHECK_LOGIN_RPC&nextCode=0018&bizScene=qrcode&confirm=true`
-      const { res, setCookies } = await fetchSetCookies(loginUrl, {
-        method: 'POST',
-        headers: withCookieHeader(
-          {
-            ...PASSPORT_HEADERS,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Origin: 'https://passport.goofish.com',
-            Referer: 'https://passport.goofish.com/mini_login.htm',
-          },
-          session.jar,
-        ),
-        body: `deviceId=${encodeURIComponent(session.cna)}`,
-      })
-      mergeSetCookies(session.jar, setCookies)
-      await res.text().catch(() => {})
-    } catch (e) {
-      console.error('[qr-login] login_token exchange error:', e)
-      // proceed — cookies may already have landed on query.do
+  // CONFIRMED — 用令牌换正式 cookie (login.do → 刷新 _m_h5_tk → unb 校验)
+  if (await tryCompleteLogin(session)) {
+    return {
+      status: 'success',
+      xianyuUid: session.xianyuUid,
+      xianyuNick: session.xianyuNick,
+      cookieValue: session.cookieValue,
     }
   }
 
-  // Refresh _m_h5_tk (post-login token rotates)
-  try {
-    const t2 = Date.now().toString()
-    const navUrl =
-      `https://h5api.m.goofish.com/h5/mtop.idle.web.user.page.nav/1.0/` +
-      `?jsv=2.7.2&appKey=34839810&t=${t2}&sign=&v=1.0&type=originaljson` +
-      `&dataType=json&timeout=20000&api=mtop.idle.web.user.page.nav` +
-      `&sessionOption=AutoLoginOnly&spm_cnt=a21ybx.home.0.0`
-    const { res, setCookies } = await fetchSetCookies(navUrl, {
-      method: 'POST',
-      headers: withCookieHeader(MTOP_HEADERS, session.jar),
-      body: 'data=%7B%7D',
-    })
-    mergeSetCookies(session.jar, setCookies)
-    await res.text().catch(() => {})
-  } catch (e) {
-    console.error('[qr-login] nav refresh error:', e)
+  // 换 cookie 未成功: 若已持有核验链接则进入核验等待 (用户需要人脸/滑块), 完全无链接才判过期
+  if (session.iframeRedirectUrl) {
+    session.verificationSince = Date.now()
+    session.status = 'verification_required'
+    await persistSessionUpdate(sessionKey, { status: 'verification_required' })
+    return { status: 'verification_required', iframeRedirectUrl: session.iframeRedirectUrl }
   }
-
-  // Build final cookie string + extract account identifiers
-  const cookieValue = cookieHeader(session.jar)
-  const unb = session.jar.get('unb') || ''
-  const tracknickRaw = session.jar.get('tracknick') || ''
-  let xianyuNick = ''
-  try {
-    xianyuNick = tracknickRaw ? decodeURIComponent(tracknickRaw) : ''
-  } catch {
-    xianyuNick = tracknickRaw
-  }
-
-  if (!unb) {
-    session.status = 'expired'
-    session.errorMessage = '登录链路完成但未拿到 unb cookie'
-    await persistSessionUpdate(sessionKey, {
-      status: 'expired',
-      errorMessage: session.errorMessage,
-    })
-    return { status: 'expired', errorMessage: session.errorMessage }
-  }
-
-  session.status = 'success'
-  session.xianyuUid = unb
-  session.xianyuNick = xianyuNick
-  session.cookieValue = cookieValue
+  session.status = 'expired'
+  session.errorMessage = '登录链路完成但未拿到 unb cookie'
   await persistSessionUpdate(sessionKey, {
-    status: 'success',
-    cookieValue,
-    xianyuUid: unb,
-    xianyuNick,
+    status: 'expired',
+    errorMessage: session.errorMessage,
   })
-
-  return {
-    status: 'success',
-    xianyuUid: unb,
-    xianyuNick,
-    cookieValue,
-  }
+  return { status: 'expired', errorMessage: session.errorMessage }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
