@@ -500,14 +500,22 @@ async function refreshOne(o: Order) {
 async function syncAll() {
   syncing.value = true
   try {
-    // 批量实查闲鱼订单详情 (服务端限速 300ms/单 + Cookie 复用, 终态订单自动跳过)
+    // 一键同步: 先拉闲鱼卖家订单列表 (全部状态, 含已付款待发货) 入库, 再精修非终态详情
     const r = await refreshAllOrders({ cookie_id: filters.cookie_id || undefined })
-    const parts = [`共 ${r.total} 单待刷新`]
-    if (r.updated) parts.push(`状态更新 ${r.updated}`)
-    if (r.no_change) parts.push(`无变化 ${r.no_change}`)
-    if (r.failed) parts.push(`失败 ${r.failed}`)
-    if (!r.total) toast.info('没有需要刷新的订单 (终态订单自动跳过)')
-    else toast.success(parts.join(', '))
+    const parts: string[] = []
+    if (r.list_sync) {
+      if (r.list_sync.inserted) parts.push(`新拉取 ${r.list_sync.inserted} 单`)
+      if (r.list_sync.updated) parts.push(`列表更新 ${r.list_sync.updated} 单`)
+      if (r.list_sync.errors?.length) parts.push(`列表拉取异常 ${r.list_sync.errors.length} 账号`)
+    }
+    if (r.total) parts.push(`详情精修 ${r.total} 单 (状态更新 ${r.updated}, 无变化 ${r.no_change}${r.failed ? `, 失败 ${r.failed}` : ''})`)
+    if (r.list_sync?.errors?.length && !r.total && !r.list_sync.inserted) {
+      toast.error(`同步失败: ${r.list_sync.errors[0]}`)
+    } else if (!parts.length) {
+      toast.info('暂无订单可同步')
+    } else {
+      toast.success(parts.join(', '))
+    }
   } catch (e: any) {
     toast.error(e.message || '同步失败')
   } finally {

@@ -114,7 +114,7 @@ export async function mtopCall<T = any>(
   api: string,
   data: object,
   cookieStr: string,
-  opts: { v?: string; method?: string } = {},
+  opts: { v?: string; method?: string; headers?: Record<string, string>; extraParams?: Record<string, string> } = {},
 ): Promise<MtopResult<T>> {
   const v = opts.v || '1.0'
   const method = opts.method || 'POST'
@@ -137,12 +137,13 @@ export async function mtopCall<T = any>(
     api,
     sessionOption: 'AutoLoginOnly',
     spm_cnt: 'a21ybx.home.0.0',
+    ...opts.extraParams,
   })
   const body = `data=${encodeURIComponent(dataStr)}`
 
   const res = await fetch(`${url}?${params.toString()}`, {
     method,
-    headers: { ...MTOP_HEADERS, Cookie: cookieHeader(jar) },
+    headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: cookieHeader(jar) },
     body: method === 'POST' ? body : undefined,
     signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
   })
@@ -170,10 +171,11 @@ export async function mtopCall<T = any>(
       api,
       sessionOption: 'AutoLoginOnly',
       spm_cnt: 'a21ybx.home.0.0',
+      ...opts.extraParams,
     })
     const retryRes = await fetch(`${url}?${retryParams.toString()}`, {
       method,
-      headers: { ...MTOP_HEADERS, Cookie: newCookieStr },
+      headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: newCookieStr },
       body: method === 'POST' ? body : undefined,
       signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
     })
@@ -605,4 +607,111 @@ export async function fetchOrderDetail(
     return { detail: null, retMsg: retStr || '订单详情响应无有效数据', finalCookieStr: r.cookieStr }
   }
   return { detail: out, retMsg: '', finalCookieStr: r.cookieStr }
+}
+
+/* ---------------------------------- 卖家订单列表 (mtop.taobao.idle.trade.merchant.sold.get) ---------------------------------- */
+
+/** 卖家订单列表单条标准化结果。 */
+export interface SellerOrderItem {
+  order_id: string
+  order_status: string
+  item_id: string
+  buyer_id: string
+  buyer_nick: string
+  receiver_name: string
+  receiver_phone: string
+  receiver_address: string
+  amount: string
+  quantity: string
+  is_bargain: boolean
+  created_at_text: string
+}
+
+/** 闲鱼订单中文状态 → 本库状态码 (语义对齐 butler _XIANYU_STATUS_MAP)。 */
+export const SELLER_ORDER_STATUS_MAP: Record<string, string> = {
+  待付款: 'pending_payment',
+  待发货: 'pending_ship',
+  已发货: 'shipped',
+  交易成功: 'completed',
+  交易关闭: 'cancelled',
+  退款中: 'refunding',
+  退款成功: 'refunded',
+  已退款: 'refunded',
+  退款关闭: 'cancelled',
+}
+
+/** 卖家订单列表单页结果。 */
+export interface SellerOrdersPage {
+  items: SellerOrderItem[]
+  nextPage: boolean
+  totalCount: number
+  retMsg: string
+  finalCookieStr: string
+}
+
+/** 解析卖家订单列表单条 item (语义对齐 butler _parse_sold_order_item)。 */
+export function parseSoldOrderItem(item: any): SellerOrderItem | null {
+  const common = item?.commonData || {}
+  const orderId = String(common.orderId || '')
+  if (!orderId) return null
+  const buyer = item?.buyerInfoVO || {}
+  const priceVo = item?.priceVO || {}
+  const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
+  const rawStatus = String(common.orderStatus || '')
+  return {
+    order_id: orderId,
+    order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
+    item_id: String(common.itemId || ''),
+    buyer_id: String(buyer.buyerId || ''),
+    buyer_nick: String(buyer.userNick || ''),
+    receiver_name: String(buyer.name || ''),
+    receiver_phone: String(buyer.phone || ''),
+    receiver_address: String(buyer.address || ''),
+    amount: String(priceVo.totalPrice ?? ''),
+    quantity: String(priceVo.buyNum ?? '1'),
+    is_bargain: btnList.some((b: any) => b?.tradeAction === 'SKIP_PIN'),
+    created_at_text: String(common.createTime || ''),
+  }
+}
+
+/**
+ * 拉取闲鱼卖家已售订单列表单页 (语义对齐 butler _fetch_sold_orders_page)。
+ * api = mtop.taobao.idle.trade.merchant.sold.get; 卖家端接口会校验来源,
+ * Origin/Referer 必须为 seller.goofish.com, 且 query 参数需带 valueType=string。
+ *
+ * @param queryCode "ALL"=全部订单, "NOT_SHIP"=待发货订单
+ */
+export async function fetchSellerOrders(
+  cookieStr: string,
+  page: number,
+  queryCode: 'ALL' | 'NOT_SHIP' = 'ALL',
+): Promise<SellerOrdersPage> {
+  const empty: SellerOrdersPage = { items: [], nextPage: false, totalCount: 0, retMsg: '', finalCookieStr: cookieStr }
+  if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
+  const r = await mtopCall<any>(
+    'mtop.taobao.idle.trade.merchant.sold.get',
+    { pageNumber: page, rowsPerPage: 30, orderIds: '', queryCode, orderSearchParam: '{}' },
+    cookieStr,
+    {
+      headers: {
+        Origin: 'https://seller.goofish.com',
+        Referer: 'https://seller.goofish.com/',
+      },
+      extraParams: { valueType: 'string', spm_cnt: 'a21107h.42826273.0.0' },
+    },
+  )
+  const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
+  if (!retStr.includes('SUCCESS')) {
+    return { ...empty, retMsg: retStr || '卖家订单列表查询失败', finalCookieStr: r.cookieStr }
+  }
+  const module = r.data?.module || {}
+  const rawItems = Array.isArray(module.items) ? module.items : []
+  const items = rawItems.map(parseSoldOrderItem).filter((x: SellerOrderItem | null): x is SellerOrderItem => !!x)
+  return {
+    items,
+    nextPage: String(module.nextPage ?? 'false') === 'true',
+    totalCount: parseInt(String(module.totalCount ?? '0'), 10) || 0,
+    retMsg: '',
+    finalCookieStr: r.cookieStr,
+  }
 }

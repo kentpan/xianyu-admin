@@ -208,15 +208,46 @@ export async function handleChatEvent(
 
   // 付款触发卡片 (先于暂停与回复链 — butler 自动发货独立于 pause_manager, 人工接入不阻断发货)
   if (isPaymentTrigger(msg.content)) {
-    const orderId = extractOrderId(msg.raw)
+    let orderId = extractOrderId(msg.raw)
+    if (!orderId) {
+      // 自愈兜底 (对齐 deliverOnTradeComplete 的回退策略): 付款卡片变体可能不含订单号
+      // (无卡片 JSON / URL 参数名变更), 回退该会话最近一笔可发货订单, 优先匹配商品
+      const byItem = msg.itemId
+        ? await db
+            .get<{ order_id: string }>(
+              `SELECT order_id FROM orders
+               WHERE cookie_id = ? AND chat_id = ? AND system_shipped = 0
+                 AND order_status NOT IN ('shipped', 'closed', 'completed') AND item_id = ?
+               ORDER BY updated_at DESC LIMIT 1`,
+              [cookieId, msg.chatId, msg.itemId],
+            )
+            .catch(() => null)
+        : null
+      const anyOrder =
+        byItem ||
+        (await db
+          .get<{ order_id: string }>(
+            `SELECT order_id FROM orders
+             WHERE cookie_id = ? AND chat_id = ? AND system_shipped = 0
+               AND order_status NOT IN ('shipped', 'closed', 'completed')
+             ORDER BY updated_at DESC LIMIT 1`,
+            [cookieId, msg.chatId],
+          )
+          .catch(() => null))
+      if (anyOrder?.order_id) {
+        orderId = String(anyOrder.order_id)
+        logWarn(`[${cookieId}] 付款卡片未含订单号, 回退会话最近可发货订单 ${orderId} 触发发货`)
+      }
+    }
     if (!orderId) {
       logWarn(`[${cookieId}] 检测到付款触发消息但未提取到订单号, 跳过自动发货`)
-      // 决策日志可见: 付款卡片丢失订单号是漏发的直接证据 (此前仅 console, 用户无法排查)
+      // 决策日志可见: 付款卡片丢失订单号是漏发的直接证据; 附卡片原文摘要供排查结构变体
       await addLog(db, cookieId, msg, opts, {
         process_status: 'skipped',
         decision_reason: 'delivery_failed',
         reply_strategy: 'none',
         reply_text: '付款卡片未提取到订单号, 无法自动发货',
+        error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
       })
       return []
     }
@@ -436,7 +467,7 @@ export async function handleSystemEvent(
   if (!cookieId) return []
 
   // 订单状态回写 (交易卡片事件统一落 orders, 与后台订单页/统计共用)
-  const orderId = msg.orderId
+  let orderId = msg.orderId
   if (orderId) {
     const statusMap: Record<string, string> = {
       等待买家付款: 'pending_payment',
@@ -520,14 +551,48 @@ export async function handleSystemEvent(
 
   if (msg.redReminder !== '等待卖家发货') return []
   if (!orderId) {
-    logWarn(`[${cookieId}] 检测到付款事件但未提取到订单号, 跳过自动发货`)
-    await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-      process_status: 'skipped',
-      decision_reason: 'delivery_failed',
-      reply_strategy: 'none',
-      reply_text: '付款事件未提取到订单号, 无法自动发货',
-    })
-    return []
+    // 自愈兜底: 系统卡片变体可能不含订单号 — 用 商品/买家 维度回退最近一笔 10 分钟内有
+    // 动作的可发货订单 (订单列表同步/拍下建单已落库, 时间窗锁定刚付款的那单, 防误发)
+    let fallbackRow: { order_id: string; buyer_id?: string; chat_id?: string } | null = null
+    if (msg.itemId && msg.buyerId) {
+      fallbackRow = await db
+        .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
+          `SELECT order_id, buyer_id, chat_id FROM orders
+           WHERE cookie_id = ? AND system_shipped = 0
+             AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
+             AND item_id = ? AND buyer_id = ?
+             AND updated_at >= datetime('now', '-10 minutes')
+           ORDER BY updated_at DESC LIMIT 1`,
+          [cookieId, msg.itemId, msg.buyerId],
+        )
+        .catch(() => null)
+    }
+    if (!fallbackRow && msg.itemId) {
+      fallbackRow = await db
+        .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
+          `SELECT order_id, buyer_id, chat_id FROM orders
+           WHERE cookie_id = ? AND system_shipped = 0
+             AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
+             AND item_id = ?
+             AND updated_at >= datetime('now', '-10 minutes')
+           ORDER BY updated_at DESC LIMIT 1`,
+          [cookieId, msg.itemId],
+        )
+        .catch(() => null)
+    }
+    if (!fallbackRow) {
+      logWarn(`[${cookieId}] 检测到付款事件但未提取到订单号, 跳过自动发货`)
+      await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
+        process_status: 'skipped',
+        decision_reason: 'delivery_failed',
+        reply_strategy: 'none',
+        reply_text: '付款事件未提取到订单号, 无法自动发货',
+        error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
+      })
+      return []
+    }
+    orderId = String(fallbackRow.order_id)
+    logWarn(`[${cookieId}] 系统卡片未含订单号, 回退商品/买家维度最近可发货订单 ${orderId} 触发发货`)
   }
 
   // 会话/买家信息兜底: 纯系统卡片可能缺 chatId/buyerId, 从订单行回填 (缺失则无法发送, 跳过)
@@ -1644,8 +1709,8 @@ async function addLog(
     .run(
       `INSERT INTO auto_reply_logs
        (cookie_id, chat_id, item_id, sender_user_id, sender_user_name, source_message,
-        process_status, decision_reason, reply_strategy, matched_keyword, reply_text, send_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        process_status, decision_reason, reply_strategy, matched_keyword, reply_text, error_message, send_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         cookieId,
         msg.chatId,
@@ -1658,6 +1723,7 @@ async function addLog(
         fields.reply_strategy || 'none',
         fields.matched_keyword || '',
         fields.reply_text || '',
+        fields.error_message || '',
         fields.send_status || 'unknown',
       ],
     )

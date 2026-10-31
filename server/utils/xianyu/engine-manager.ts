@@ -11,7 +11,8 @@ import { getDb } from '../db'
 import { generateEngineToken } from '../engine-auth'
 import { XianyuAccountClient, type AccountState, type ManualTokenOutcome } from './ws-client'
 import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
-import { fetchItemList, polishItem, fetchOrderDetail } from './mtop'
+import { fetchItemList, polishItem, fetchOrderDetail, fetchSellerOrders } from './mtop'
+import { upsertSoldOrders } from './order-sync'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from './brain'
 import { dispatchNotify } from '../notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from './publisher'
@@ -549,7 +550,45 @@ async function orderSyncTick(): Promise<void> {
 }
 
 async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>): Promise<void> {
-  // 非稳定状态订单逐单实查 (shipped/completed/cancelled 为终态不刷新, 与 butler needs_refresh 一致)
+  // 第一步: 每账号拉取闲鱼卖家待发货订单列表 (NOT_SHIP) upsert 入库 —
+  // 交易卡片丢失/解析失败时, "已付款待发货" 订单在此自愈落库 (自动发货兜底数据源)
+  let accountRows: { id: string; value: string }[] = []
+  try {
+    accountRows = await db.all<{ id: string; value: string }>(
+      "SELECT id, value FROM cookies WHERE value IS NOT NULL AND value != ''",
+    )
+  } catch {
+    return
+  }
+  for (const acct of accountRows) {
+    try {
+      const pg = await fetchSellerOrders(String(acct.value), 1, 'NOT_SHIP')
+      if (pg.finalCookieStr && pg.finalCookieStr !== String(acct.value)) {
+        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, acct.id]).catch(() => {})
+        runtime.cookieCache.set(String(acct.id), pg.finalCookieStr)
+        runtime.clients.get(String(acct.id))?.setCookieStr(pg.finalCookieStr)
+      }
+      if (pg.retMsg) {
+        await db
+          .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'order_sync', ?)", [
+            `账号 ${acct.id} 待发货订单列表拉取失败: ${pg.retMsg.slice(0, 120)}`,
+          ])
+          .catch(() => {})
+        continue
+      }
+      if (pg.items.length) {
+        const r = await upsertSoldOrders(db, String(acct.id), pg.items)
+        if (r.inserted > 0) {
+          console.log(`[xianyu-engine] 账号 ${acct.id} 待发货订单列表同步: 新入库 ${r.inserted} 单`)
+        }
+      }
+    } catch {
+      // 单账号列表拉取失败不阻断详情刷新
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+
+  // 第二步: 非稳定状态订单逐单实查精修 (shipped/completed/cancelled 为终态不刷新, 与 butler needs_refresh 一致)
   let targets: { order_id: string; cookie_id: string; order_status: string }[] = []
   try {
     targets = await db.all<any>(

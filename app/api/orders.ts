@@ -95,9 +95,15 @@ export interface RefreshAllResult {
   no_change: number
   failed: number
   results: { order_id: string; changed: boolean; error?: string }[]
+  list_sync?: {
+    inserted: number
+    updated: number
+    accounts: number
+    errors: string[]
+  }
 }
 
-/** 批量刷新非终态订单状态 (实查闲鱼订单详情, 限速防风控) */
+/** 一键同步: 先拉闲鱼卖家订单列表 (全部状态, 含已付款待发货) 入库, 再精修非终态订单详情 */
 export function refreshAllOrders(body: { cookie_id?: string; status?: string } = {}) {
   return useApi().post<RefreshAllResult>('/api/orders/refresh', body)
 }

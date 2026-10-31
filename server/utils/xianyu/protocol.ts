@@ -423,12 +423,19 @@ export function extractOrderId(message: any): string {
       }
     }
 
-    // ---- 全文兜底 (与 butler 相同的模式优先级) ----
+    // ---- 全文兜底 (与 butler 相同的模式优先级 + 变体扩展) ----
+    // 变体覆盖: 值带引号 ("orderId":"123...") / JSON.stringify 转义引号 (orderId\":\"123) /
+    // URL 编码等号 (orderId%3D123)。plainText 版本先按原样匹配, 再对转义引号匹配。
     const raw = JSON.stringify(message)
-    const patterns = [
+    const patterns: RegExp[] = [
       /orderId[=:](\d{10,})/,
+      /orderId\\?"?\s*[=:]\s*\\?"?(\d{10,})/,
+      /orderId%3D(\d{10,})/i,
       /order_detail\?id=(\d{10,})/,
+      /order_detail%3Fid%3D(\d{10,})/i,
       /bizOrderId[=:](\d{10,})/,
+      /bizOrderId\\?"?\s*[=:]\s*\\?"?(\d{10,})/,
+      /bizOrderId%3D(\d{10,})/i,
       /"id"\s*:\s*"?(\d{10,})"?/,
     ]
     for (const p of patterns) {
@@ -525,8 +532,27 @@ function extractItemId(message: any): string {
 }
 
 /**
+ * 从卡片更新消息的 message['4'] (结构与标准消息的 message['1']['10'] 相同) 提取商品 ID
+ * (语义对齐 butler _extract_item_id_from_card_update): reminderUrl 的 itemId= → extJson.itemId。
+ */
+function extractItemIdFromMeta(meta: any): string {
+  try {
+    const url = meta?.reminderUrl
+    if (typeof url === 'string' && url.includes('itemId=')) {
+      return url.split('itemId=')[1].split('&')[0] || ''
+    }
+  } catch {}
+  try {
+    const ext = typeof meta?.extJson === 'string' && meta.extJson ? JSON.parse(meta.extJson) : null
+    if (ext?.itemId != null && String(ext.itemId).trim()) return String(ext.itemId)
+  } catch {}
+  return ''
+}
+
+/**
  * 解析同步包内一条 data:
  *   - chatType 结 构 = 平台系统引导消息 (小闲鱼提示等), 不含业务事件, 返回 null
+ *   - message['1'] 为字符串 + message['4'].reminderContent = 卡片更新消息 (付款状态变更) → chat
  *   - message['3'].redReminder = 交易状态提醒 (等待买家付款/等待卖家发货/交易关闭) → system
  *   - message['1']['10'] = 聊天消息体 → chat
  */
@@ -536,6 +562,28 @@ export function parseSyncItem(data: string, myId: string): ParsedMessage {
 
   // 未加密系统引导消息 (chatType 结构)
   if ('chatType' in message) return null
+
+  // 卡片更新消息 (付款状态变更等): message['1'] 为字符串, message['4'] 含 reminderContent
+  // (语义对齐 butler is_card_update_message / parse_card_update_message —
+  //  买家付款后上游常以此格式重推「[我已付款，等待你发货]」, 丢失该类型会漏发货)
+  const m1Raw = message['1']
+  const m4 = message['4']
+  if (typeof m1Raw === 'string' && m4 && typeof m4 === 'object' && m4.reminderContent != null) {
+    const chatIdRaw = String(message['2'] ?? '')
+    const cuItemId = extractItemIdFromMeta(m4)
+    return {
+      kind: 'chat',
+      chatId: chatIdRaw.split('@')[0] || chatIdRaw,
+      senderUserId: String(m4.senderUserId ?? ''),
+      senderNick: String(m4.reminderTitle ?? '系统'),
+      content: String(m4.reminderContent ?? ''),
+      itemId: cuItemId,
+      createTime: Number(message['5'] ?? 0),
+      sessionType: '1',
+      isSelf: String(m4.senderUserId ?? '') === myId,
+      raw: message,
+    }
+  }
 
   const redReminder = message?.['3']?.redReminder || ''
   const itemId = extractItemId(message)
