@@ -39,10 +39,10 @@ export default defineEventHandler(
       settings: counts[8]?.c || 0,
       logs: counts[9]?.c || 0,
       tableCount,
-      driver: state.dbDriver,
+      driver: db.driver || state.dbDriver,
       appName: config.public.appName,
       appVersion: config.public.appVersion,
-      uptime: process.uptime ? Math.floor(process.uptime()) : 0,
+      uptime: (() => { try { return Math.floor(process.uptime()) } catch { return 0 } })(),
     })
   }),
 )

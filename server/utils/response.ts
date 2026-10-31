@@ -64,6 +64,10 @@ export function withApi<T = any>(
       }
       return ok(data)
     } catch (e: any) {
+      // 服务端留痕 (Cloudflare wrangler tail / node 日志可直接看到真实原因)
+      try {
+        console.error(`[api] ${event?.path || '-'} → ${e?.statusCode || 500}:`, e?.message || e)
+      } catch {}
       if (e instanceof ApiError) {
         setResponseStatus(event, e.code)
         return { success: false, code: e.code, message: e.message, data: e.data }

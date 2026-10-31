@@ -19,7 +19,6 @@
  *     参考项目一致。token 刷新与 cookie 保活不在此处 (h5api) — 由监听引擎侧承担。
  */
 import { createHash } from 'node:crypto'
-import QRCode from 'qrcode'
 import { getDb } from '../db'
 
 const UA =
@@ -148,9 +147,47 @@ async function fetchRedirectJar(
   throw new Error('重定向次数超限')
 }
 
-/** 服务端渲染二维码 PNG data-url (对齐参考项目 render_qr_base64) */
+/** UTF-8 安全 base64 (纯 Web API, Node/workerd 通吃)。 */
+function utf8ToBase64(str: string): string {
+  if (typeof btoa === 'function') {
+    const bytes = new TextEncoder().encode(str)
+    let bin = ''
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)) as any)
+    }
+    return btoa(bin)
+  }
+  return Buffer.from(str, 'utf8').toString('base64')
+}
+
+/** 服务端渲染二维码 (纯 JS 内核 + SVG 字符串渲染 → data-url)。
+ *
+ * 为什么必须深导入 (qrcode/lib/core/qrcode + qrcode/lib/renderer/svg-tag):
+ *   包入口 qrcode/lib/server.js 顶层 require png 渲染器 → pngjs → 顶层
+ *   util.inherits(stream mock) — 在 Cloudflare workerd 的 unenv 层上评估期即炸
+ *   ("superCtor.prototype must be of type object"), 模块评估失败逃逸 withApi,
+ *   线上表现为 nitro 裸 500 "Server Error"。core/qrcode + svg-tag 是官方浏览器
+ *   构建的同款组合 (browser.js 即此二者), 零 node 内建依赖, Node/workerd 通吃;
+ *   SVG 产物避开 png 的 node:zlib (unenv notImplemented) — 一并免疫。
+ * 产物仍为 data-url, 前端 <img :src> 无感。
+ */
 async function renderQrDataUrl(content: string): Promise<string> {
-  return QRCode.toDataURL(content, { errorCorrectionLevel: 'L', margin: 2, width: 240 })
+  const core: any = await import('qrcode/lib/core/qrcode')
+  const svgTag: any = await import('qrcode/lib/renderer/svg-tag')
+  const qr = core.create(content, { errorCorrectionLevel: 'L' })
+  const svg: string = svgTag.render(qr, { margin: 2 })
+  return `data:image/svg+xml;base64,${utf8ToBase64(svg)}`
+}
+
+/** 上游异常分级包装: fetch 裸异常一律转 ApiError(502) 统一 JSON, 前端可见真实原因 */
+function upstreamError(scope: string, e: any): ApiError {
+  const raw = String(e?.message || e)
+  const cause = /timeout|abort|timed?\s*out/i.test(raw)
+    ? '上游连接超时 (网络不可达或被网关拦截)'
+    : /fetch failed|network|socket|econn/i.test(raw)
+        ? '上游网络不可达'
+        : raw.slice(0, 200)
+  return new ApiError(502, `${scope}: ${cause}`)
 }
 
 function parseTs(v: any): number {
@@ -246,23 +283,32 @@ export async function startQrLogin(userId: number): Promise<{ sessionKey: string
   await tryGetCna(jar).catch(() => console.warn('[qr-login] cna 获取失败, 降级继续'))
   await tryGetMh5tk(jar).catch(() => console.warn('[qr-login] m_h5_tk 获取失败, 降级继续'))
 
-  const params = await getLoginParams(jar)
+  // passport 主链: 任何裸异常统一转 ApiError(502) — 上游抖动对用户是「可重试」,
+  // 不该以未分类 500 的形状出现 (对齐参考项目 generate_qr_code 的 except 链文案)
+  let params: Record<string, string>
+  let qrUrl: string
+  try {
+    params = await getLoginParams(jar)
 
-  const genUrl = `${API_GENERATE_QR}?${new URLSearchParams(params).toString()}`
-  const { res, setCookies } = await fetchSetCookies(genUrl, {
-    method: 'GET',
-    headers: withCookieHeader(PASSPORT_HEADERS, jar),
-  })
-  mergeSetCookies(jar, setCookies)
-  const json = (await res.json().catch(() => ({}))) as any
-  const data = json?.content?.data || {}
-  const qrContent = String(data.codeContent || '')
-  if (!(json?.content?.success === true) || !qrContent) {
-    throw new Error(`获取登录二维码失败: ${JSON.stringify(json).slice(0, 300)}`)
+    const genUrl = `${API_GENERATE_QR}?${new URLSearchParams(params).toString()}`
+    const { res, setCookies } = await fetchSetCookies(genUrl, {
+      method: 'GET',
+      headers: withCookieHeader(PASSPORT_HEADERS, jar),
+    })
+    mergeSetCookies(jar, setCookies)
+    const json = (await res.json().catch(() => ({}))) as any
+    const data = json?.content?.data || {}
+    const qrContent = String(data.codeContent || '')
+    if (!(json?.content?.success === true) || !qrContent) {
+      throw new Error(`上游拒绝出码: ${JSON.stringify(json).slice(0, 300)}`)
+    }
+    params.t = String(data.t || '')
+    params.ck = String(data.ck || '')
+    qrUrl = await renderQrDataUrl(qrContent)
+  } catch (e: any) {
+    if (e instanceof ApiError) throw e
+    throw upstreamError('获取登录二维码失败', e)
   }
-  params.t = String(data.t || '')
-  params.ck = String(data.ck || '')
-  const qrUrl = await renderQrDataUrl(qrContent)
 
   const sessionKey = 'qr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
   await db.run(

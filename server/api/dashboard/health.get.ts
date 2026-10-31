@@ -1,5 +1,23 @@
-/** GET /api/dashboard/health — system health (uptime, memory, DB size, table counts). */
+/** GET /api/dashboard/health — system health (uptime, memory, DB size, table counts).
+ *
+ * Runtime-safe by design: on Cloudflare Pages (workerd + unenv polyfill layer)
+ * `process.memoryUsage/cpuUsage/uptime` are not-implemented stubs that THROW on
+ * call — this endpoint must degrade to zeroed metrics, never 500.
+ */
 import { databaseFilePath } from '../../utils/db-config'
+
+/** Current isolate boot time — uptime source that works on every runtime. */
+const BOOT_AT = Date.now()
+
+/** Call a Node-only metric, fall back silently when the runtime lacks it. */
+function tryMetric<T>(fn: () => T, fallback: T): T {
+  try {
+    const v = fn()
+    return v == null ? fallback : v
+  } catch {
+    return fallback
+  }
+}
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -7,19 +25,25 @@ export default defineEventHandler(
     const db = await getDb()
     const state = getRuntimeState()
 
-    // Process metrics
-    const mem = process.memoryUsage()
-    const uptime = Math.floor(process.uptime())
+    // Process metrics — all guarded (workerd has no process.memoryUsage/cpuUsage)
+    const mem = tryMetric(() => process.memoryUsage(), null as any)
+    const uptime = tryMetric(
+      () => Math.floor(process.uptime()),
+      Math.floor((Date.now() - BOOT_AT) / 1000),
+    )
+    const cpuUsage = tryMetric(() => process.cpuUsage(), { user: 0, system: 0 })
+    const nodeVersion = tryMetric(() => process.version, 'workerd')
 
-    // DB stats
+    // DB stats — branch on the ADAPTER's real driver (on Cloudflare the sqlite
+    // config auto-adapts to D1, state.dbDriver alone would misroute the branch)
+    const driver = db.driver || state.dbDriver
     let dbSize = 0
     let tableCount = 0
     let totalRows = 0
 
-    if (state.dbDriver === 'sqlite') {
+    if (driver === 'sqlite') {
       try {
         const fs = await import('node:fs')
-        const path = await import('node:path')
         const dbPath = databaseFilePath()
         if (fs.existsSync(dbPath)) {
           dbSize = fs.statSync(dbPath).size
@@ -42,7 +66,7 @@ export default defineEventHandler(
     } else {
       // 非 sqlite 驱动（MySQL/D1/memory）：查询真实表数量，失败时保持 0
       try {
-        if (state.dbDriver === 'mysql') {
+        if (driver === 'mysql') {
           const r = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM information_schema.tables WHERE table_schema = DATABASE()')
           tableCount = r?.c || 0
         } else {
@@ -55,23 +79,20 @@ export default defineEventHandler(
       }
     }
 
-    // CPU load (approximate via process)
-    const cpuUsage = process.cpuUsage()
-
     return ok({
       uptime,
       uptimeLabel: formatUptime(uptime),
       memory: {
-        rss: mem.rss,
-        rssLabel: formatBytes(mem.rss),
-        heapUsed: mem.heapUsed,
-        heapUsedLabel: formatBytes(mem.heapUsed),
-        heapTotal: mem.heapTotal,
-        heapTotalLabel: formatBytes(mem.heapTotal),
-        heapPercent: Math.round((mem.heapUsed / mem.heapTotal) * 100),
+        rss: mem?.rss ?? 0,
+        rssLabel: mem ? formatBytes(mem.rss) : '—',
+        heapUsed: mem?.heapUsed ?? 0,
+        heapUsedLabel: mem ? formatBytes(mem.heapUsed) : '—',
+        heapTotal: mem?.heapTotal ?? 0,
+        heapTotalLabel: mem ? formatBytes(mem.heapTotal) : '—',
+        heapPercent: mem && mem.heapTotal ? Math.round((mem.heapUsed / mem.heapTotal) * 100) : 0,
       },
       db: {
-        driver: state.dbDriver,
+        driver,
         size: dbSize,
         sizeLabel: formatBytes(dbSize),
         tableCount,
@@ -81,7 +102,7 @@ export default defineEventHandler(
         user: cpuUsage.user,
         system: cpuUsage.system,
       },
-      nodeVersion: process.version,
+      nodeVersion,
       timestamp: new Date().toISOString(),
     })
   }),
