@@ -98,7 +98,15 @@ async function mtopFetch(
   url: string,
   init: { method: string; headers: Record<string, string>; body?: string },
 ): Promise<{ status: number; text: string; setCookie: string[] }> {
-  const relayed = await relayMtopRequest(url, init)
+  // (v2.1.6) 网关失败不再直接抛错: 曾致发货决策整体异常 (占位被删, 代理无限重报,
+  // 不发货无日志死循环)。回退本机直连兜底: CF 直连被墙时 20s 超时后决策仍能完成
+  // 并落 delivery_failed 日志, 由代理重报自愈; 网关正常/本地引擎时行为不变。
+  let relayed: Awaited<ReturnType<typeof relayMtopRequest>> = null
+  try {
+    relayed = await relayMtopRequest(url, init)
+  } catch {
+    relayed = null
+  }
   if (relayed) return relayed
   const res = await fetch(url, {
     method: init.method,

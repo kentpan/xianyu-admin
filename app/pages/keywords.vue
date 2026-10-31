@@ -124,7 +124,6 @@
                   <template v-else>
                     <p class="truncate text-slate-700 dark:text-slate-200">{{ k.reply }}</p>
                   </template>
-                  <p v-if="delayLabel(k)" class="text-xs text-amber-600 dark:text-amber-400 mt-0.5">延时 {{ delayLabel(k) }}</p>
                 </td>
                 <td class="text-slate-500 dark:text-slate-400">{{ formatTime(k.created_at) }}</td>
                 <td>
@@ -188,16 +187,6 @@
             </option>
           </select>
           <p class="text-xs text-slate-400 mt-1">从商品管理列表选择; 留空表示对所有商品生效</p>
-        </div>
-        <div>
-          <label class="label">回复随机延时 (秒, 可选)</label>
-          <div class="flex items-center gap-2">
-            <input v-model="form.delay_min" type="number" min="0" step="0.1" class="input" placeholder="0" />
-            <span class="text-slate-400">-</span>
-            <input v-model="form.delay_max" type="number" min="0" step="0.1" class="input" placeholder="0" />
-            <span class="text-sm text-slate-500 shrink-0">秒</span>
-          </div>
-          <p class="text-xs text-slate-400 mt-1">都留空/都 0 = 立即回复；相等 = 固定延时；最小 &lt; 最大 = 高斯分布随机延时（自然钟形节奏，更像真人）</p>
         </div>
       </div>
       <template #footer>
@@ -640,19 +629,7 @@ const form = ref<any>({
   item_id: '',
   type: 'text',
   image_url: '',
-  delay_min: '',
-  delay_max: '',
 })
-
-/** 列表延时徽标: 空/0 不显示; 相等=固定; 区间=随机 (容错填反) */
-function delayLabel(k: any): string {
-  let min = Math.max(0, Number(k?.delay_min) || 0)
-  let max = Math.max(0, Number(k?.delay_max) || 0)
-  if (min > max) [min, max] = [max, min]
-  if (!min && !max) return ''
-  if (min === max) return `固定 ${min}s`
-  return `${min}-${max}s 随机`
-}
 
 async function loadAccounts() {
   try {
@@ -681,7 +658,7 @@ function onCookieChange() {
 
 function openCreate() {
   editing.value = false
-  form.value = { id: null, keyword: '', reply: '', item_id: '', type: 'text', image_url: '', delay_min: '', delay_max: '' }
+  form.value = { id: null, keyword: '', reply: '', item_id: '', type: 'text', image_url: '' }
   modalOpen.value = true
 }
 
@@ -694,8 +671,6 @@ function openEdit(k: Keyword) {
     item_id: k.item_id,
     type: k.type,
     image_url: k.image_url || '',
-    delay_min: (k as any).delay_min ?? '',
-    delay_max: (k as any).delay_max ?? '',
   }
   modalOpen.value = true
 }
@@ -721,8 +696,6 @@ async function save() {
       item_id: form.value.item_id,
       type: form.value.type,
       image_url: form.value.image_url,
-      delay_min: form.value.delay_min === '' || form.value.delay_min === null ? 0 : form.value.delay_min,
-      delay_max: form.value.delay_max === '' || form.value.delay_max === null ? 0 : form.value.delay_max,
     }
     if (editing.value) {
       await updateKeyword(currentCookieId.value, form.value.id, payload)

@@ -150,6 +150,11 @@ function strategyMeta(log: ReplyLog) {
     switch (log.decision_reason) {
       case 'manual_reply_pause': return { label: '手动回复暂停', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
       case 'reply_cooldown': return { label: '冷却跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'duplicate_reply': return { label: '相同回复静默', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'decision_timeout': return { label: '决策超时', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
+      case 'not_own_item': return { label: '非本店铺会话', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'self_message': return { label: '本人消息', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'already_shipped': return { label: '已发货跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'system_notice': return { label: '系统通知', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'skip_reply_filter': return { label: '过滤规则', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'delivery_failed': return { label: '发货失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }

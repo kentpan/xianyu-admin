@@ -45,6 +45,10 @@ import { consumeRate } from '../../utils/rate-limit'
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
 
+/** 后台决策整体超时预算 (v2.1.6): 兜底任何未知挂起点 (网关+任务+直连全超时/外部 API 卡死),
+ *  必须 < PENDING_TTL_MS — 保证代理在本预算内拿到失效信号重报自愈, 而不是黑箱等满 3 分钟。 */
+const DECISION_BUDGET_MS = 150_000
+
 export default defineEventHandler(
   withApi(async (event) => {
     const engine = await requireEngine(event)
@@ -294,8 +298,14 @@ async function decideInBackground(
   account: string,
   eventId: string,
 ): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null
   try {
-    const decided = await decideEvent(db, engine, ev, account)
+    const decided = await Promise.race([
+      decideEvent(db, engine, ev, account),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`决策整体超时 (${Math.round(DECISION_BUDGET_MS / 1000)}s)`)), DECISION_BUDGET_MS)
+      }),
+    ])
     await db
       .run('UPDATE engine_event_dedup SET actions_json = ?, pending = 0 WHERE event_id = ?', [
         JSON.stringify(decided),
@@ -304,7 +314,30 @@ async function decideInBackground(
       .catch(() => {})
   } catch (e: any) {
     console.log(`[engine-api] 后台决策失败 (${ev?.type}/${account}): ${e?.message}`)
+    // 决策日志留痕 (v2.1.6): 决策挂死/失败不再黑箱 — 回复日志页可见 decision_timeout,
+    // 付款/回复卡住有据可查; 占位释放后代理重报自愈 (发货/回复均有业务层防重, 重试安全)
+    if (ev?.type === 'chat' || ev?.type === 'system') {
+      await db
+        .run(
+          `INSERT INTO auto_reply_logs
+           (cookie_id, chat_id, item_id, sender_user_id, sender_user_name, source_message,
+            process_status, decision_reason, reply_strategy, matched_keyword, reply_text, error_message, send_status)
+           VALUES (?, ?, ?, ?, ?, ?, 'skipped', 'decision_timeout', 'none', '', '', ?, 'unknown')`,
+          [
+            account,
+            String(ev.chat_id || ''),
+            String(ev.item_id || ''),
+            String(ev.sender_user_id || ev.buyer_id || ''),
+            String(ev.sender_nick || ''),
+            String(ev.content || ev.red_reminder || '').slice(0, 500),
+            `决策超时或失败: ${String(e?.message || '').slice(0, 200)}`,
+          ],
+        )
+        .catch(() => {})
+    }
     await db.run("DELETE FROM engine_event_dedup WHERE event_id = ? AND actions_json = ''", [eventId]).catch(() => {})
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 

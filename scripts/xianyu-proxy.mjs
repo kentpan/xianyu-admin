@@ -1839,7 +1839,7 @@ if (PROXY_PORT > 0) {
       res.end(
         JSON.stringify({
           ok: true,
-          script_version: 'v2.1.4',
+          script_version: 'v2.1.6',
           engine_active: engineActive,
           gateway: true,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),

@@ -77,8 +77,18 @@ async function chatPaused(db: Awaited<ReturnType<typeof getDb>>, cookieId: strin
   return !!row
 }
 
-/** 会话级回复冷却: 距上次自动回复不足该时长则跳过 (用户要求至少 1 分钟内不重复回复)。 */
-const REPLY_COOLDOWN_MS = 60_000
+
+/** 商品是否属于当前账号 (本店铺): 回复链仅对本店铺买家会话生效 (v2.1.6)。 */
+async function isOwnShopItem(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId: string,
+): Promise<boolean> {
+  const row = await db
+    .get<{ item_id: string }>('SELECT item_id FROM item_info WHERE cookie_id = ? AND item_id = ? LIMIT 1', [cookieId, itemId])
+    .catch(() => null)
+  return !!row
+}
 
 /** 旧消息过滤: 断线重连 sync 会重推几分钟前的历史消息, 直接回复会插进正在进行的对话
  *  (XianyuAutoAgent MESSAGE_EXPIRE_TIME 同语义, 默认 5 分钟)。仅作用于回复链, isSelf/付款触发不受限。 */
@@ -105,6 +115,30 @@ async function emitReplyActions(
     })
     return []
   }
+  // 相同回复静默 (v2.1.5): 上一条已发出的自动回复与本次内容相同 → 跳过不重复回复。
+  // 覆盖关键词回复 / AI 回复 / 指定商品回复 / 默认回复全部链路 (买家重复发同一关键词只回一次,
+  // 换话题即恢复回复); 决策日志落 duplicate_reply 可追溯。
+  const pendingText = String(fields.reply_text || '').trim()
+  if (pendingText) {
+    const lastSent = await db
+      .get<{ reply_text: string }>(
+        `SELECT reply_text FROM auto_reply_logs
+         WHERE cookie_id = ? AND chat_id = ? AND decision_reason = 'reply_sent' AND reply_text != ''
+         ORDER BY id DESC LIMIT 1`,
+        [cookieId, msg.chatId],
+      )
+      .catch(() => null)
+    if (lastSent?.reply_text && String(lastSent.reply_text).trim() === pendingText) {
+      await addLog(db, cookieId, msg, opts, {
+        process_status: 'skipped',
+        decision_reason: 'duplicate_reply',
+        reply_strategy: fields.reply_strategy,
+        matched_keyword: fields.matched_keyword || '',
+        reply_text: fields.reply_text,
+      })
+      return []
+    }
+  }
   const logId = await addLog(db, cookieId, msg, opts, {
     process_status: 'success',
     decision_reason: 'reply_sent',
@@ -114,11 +148,6 @@ async function emitReplyActions(
     send_status: 'pending',
   })
   return actions.map((a) => ({ ...a, log_id: logId }))
-}
-
-function parseUtcTimestamp(t: string): number {
-  const parsed = Date.parse(t.includes('T') || t.includes('Z') ? t : t.replace(' ', 'T') + 'Z')
-  return Number.isFinite(parsed) ? parsed : 0
 }
 
 /* ---------------------------------- 常量 (语义对齐 butler handle_message) ---------------------------------- */
@@ -142,7 +171,16 @@ const SYSTEM_NOTICE_TEXTS = new Set([
   '[你已确认收货，交易成功]',
   '[你已发货]',
   '已发货',
+  // (v2.1.5) 退款/拍下/退款成功系统卡片: 静默不自动回复 (误回复会干扰买家退款流程)
+  '[我发起了退款申请]',
+  '[买家已拍下，待付款]',
+  '[退款成功，钱款已原路退返]',
 ])
+
+/** 变体归一化集合: 全/半角逗号与内部空白差异的兜底匹配 (平台不同入口下发文本可能有变体)。 */
+const SYSTEM_NOTICE_NORMALIZED = new Set(
+  [...SYSTEM_NOTICE_TEXTS].map((t) => t.replace(/，/g, ',').replace(/\s+/g, '')),
+)
 
 /** 付款成功触发关键词 (聊天卡片 reminderContent): 命中即触发自动发货 (butler _is_auto_delivery_trigger)。 */
 const PAYMENT_TRIGGER_KEYWORDS = [
@@ -158,7 +196,9 @@ function isPaymentTrigger(content: string): boolean {
 }
 
 function isSystemNotice(content: string): boolean {
-  return SYSTEM_NOTICE_TEXTS.has(String(content || '').trim())
+  const text = String(content || '').trim()
+  if (SYSTEM_NOTICE_TEXTS.has(text)) return true
+  return SYSTEM_NOTICE_NORMALIZED.has(text.replace(/，/g, ',').replace(/\s+/g, ''))
 }
 
 /** 订单终态集合 (远程拉单匹配时排除)。 */
@@ -383,6 +423,30 @@ export async function handleChatEvent(
     return deliverOnTradeComplete(db, cookieId, msg, opts)
   }
 
+  // (v2.1.6) 仅本店铺买家会话才自动回复: 自己作为买家在他人店铺的会话 (会话商品不属于本账号)
+  // 一律静默, 绝不回复/误触发; 付款/发货触发在上方已提前处理, 不受此限。
+  // 注: itemId 为空的会话 (无商品上下文) 维持原行为不拦截。
+  if (msg.itemId && !(await isOwnShopItem(db, cookieId, msg.itemId))) {
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'not_own_item',
+      reply_strategy: 'none',
+    })
+    return []
+  }
+  // 发送者即账号本人 (代理 isSelf 判定的兜底双保险): 绝不回复自己
+  if (msg.senderUserId) {
+    const own = await db.get<{ user_id: number }>('SELECT user_id FROM cookies WHERE id = ?', [cookieId]).catch(() => null)
+    if (own?.user_id && String(own.user_id) === String(msg.senderUserId)) {
+      await addLog(db, cookieId, msg, opts, {
+        process_status: 'skipped',
+        decision_reason: 'self_message',
+        reply_strategy: 'none',
+      })
+      return []
+    }
+  }
+
   // 人工接入暂停检查 (落库状态, APP/后台消息页人工回复均触发; 仅作用于回复链, 付款触发已在上方提前处理)
   if (await chatPaused(db, cookieId, msg.chatId)) return []
 
@@ -443,23 +507,7 @@ export async function handleChatEvent(
     item_id: msg.itemId,
   }
 
-  // 会话级回复冷却: 距上次自动回复不足 1 分钟不重复回复 (连续刷屏场景每会话至多一分钟一条)
-  const lastReply = await db
-    .get<{ created_at: string }>(
-      `SELECT created_at FROM auto_reply_logs
-       WHERE cookie_id = ? AND chat_id = ? AND decision_reason = 'reply_sent' AND process_status = 'success'
-       ORDER BY id DESC LIMIT 1`,
-      [cookieId, msg.chatId],
-    )
-    .catch(() => null)
-  if (lastReply?.created_at && Date.now() - parseUtcTimestamp(lastReply.created_at) < REPLY_COOLDOWN_MS) {
-    await addLog(db, cookieId, msg, opts, {
-      process_status: 'skipped',
-      decision_reason: 'reply_cooldown',
-      reply_strategy: 'none',
-    })
-    return []
-  }
+  // (v2.1.5) 固定 1 分钟冷却已移除: 重复回复防护统一收敛至 emitReplyActions 的「上一条相同回复静默」检测
 
   // 1) 关键词回复 (商品绑定 > 通用)
   const keywordHit = await matchKeywordReply(db, cookieId, msg, vars)
@@ -879,7 +927,7 @@ async function matchKeywordReply(
   vars: Record<string, string>,
 ): Promise<KeywordHit> {
   const rows = await db.all<any>(
-    'SELECT keyword, reply, item_id, type, image_url, delay_min, delay_max FROM keywords WHERE cookie_id = ?',
+    'SELECT keyword, reply, item_id, type, image_url FROM keywords WHERE cookie_id = ?',
     [cookieId],
   )
   const content = msg.content.toLowerCase()
@@ -894,12 +942,11 @@ async function matchKeywordReply(
         .map((s: string) => s.trim())
         .filter(Boolean)
       if (!kws.length || !kws.some((k) => content.includes(k))) continue
-      const delayMs = ruleReplyDelayMs(row)
       if (row.type === 'image' && row.image_url) {
         return {
           result: 'hit',
           keyword: row.keyword,
-          actions: [imageAction(cookieId, msg, row.image_url, delayMs)],
+          actions: [imageAction(cookieId, msg, row.image_url, 0)],
           preview: `[图片] ${row.image_url}`,
         }
       }
@@ -907,40 +954,12 @@ async function matchKeywordReply(
         return { result: 'empty', keyword: row.keyword, actions: [] }
       }
       const text = applyVars(String(row.reply), vars)
-      return { result: 'hit', keyword: row.keyword, actions: [textAction(cookieId, msg, text, delayMs)], preview: text }
+      return { result: 'hit', keyword: row.keyword, actions: [textAction(cookieId, msg, text, 0)], preview: text }
     }
   }
   return { result: 'none', actions: [] }
 }
 
-/**
- * 高斯分布随机延时 (Box-Muller 变换), mean/stddev 均为毫秒。
- * 输出呈自然钟形曲线 (如 mean=2500/stddev=800 → 有时 1800ms 有时 3200ms 有时 2500ms),
- * 下限 800ms 防止分布尾部落在负数或过小值。
- */
-function gaussianDelay(mean: number, stddev: number): number {
-  let u1 = Math.random()
-  if (u1 <= 0) u1 = 1e-9 // 防 log(0) → -Infinity
-  const u2 = Math.random()
-  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)
-  return Math.max(800, Math.round(mean + z * stddev))
-}
-
-/**
- * 关键词规则「回复随机延时」: 规则表存秒 (delay_min/delay_max), 动作用毫秒。
- *   都留空/都 0 → 0 (立即回复, 维持原行为);
- *   min == max 且 > 0 → 固定延时 (精确 min 秒, 不套高斯下限);
- *   min < max → 高斯分布随机延时 (均值取区间中点, 标准差取半宽);
- *   min > max → 交换后按 min < max 处理 (容错填反)。
- * 返回动作 delay_ms (毫秒); 引擎发送队列自身的人化间隔照常生效。
- */
-function ruleReplyDelayMs(row: { delay_min?: unknown; delay_max?: unknown }): number {
-  let min = Math.max(0, Math.round((Number(row?.delay_min) || 0) * 1000))
-  let max = Math.max(0, Math.round((Number(row?.delay_max) || 0) * 1000))
-  if (min > max) [min, max] = [max, min]
-  if (!max || min === max) return min
-  return gaussianDelay(Math.round((min + max) / 2), Math.round((max - min) / 2))
-}
 
 /* ---------------------------------- AI 回复 (语义对齐 butler ai_reply_engine) ---------------------------------- */
 
@@ -1349,15 +1368,8 @@ async function autoDeliver(
     if (order.buyer_id && ctx.buyerId && String(order.buyer_id) !== String(ctx.buyerId)) return []
   }
   const localStatus = order?.order_status
-  // 已发货判定以 system_shipped (本系统发货标记) 为准, 不再误伤 completed (交易成功但本系统未发货);
-  // shipped = 人工已发货 / closed = 交易关闭(退款), 均不补发
-  const systemShipped = Number(order?.system_shipped ?? 0) === 1
-  if (systemShipped || (localStatus && ['shipped', 'closed'].includes(String(localStatus)))) {
-    logWarn(`[${cookieId}] 订单 ${orderId} 已发货或已关闭 (status=${localStatus || '未知'}, system_shipped=${order?.system_shipped ?? 0}), 跳过自动发货`)
-    return []
-  }
 
-  // 决策日志桩: 发货动作在决策日志中全程可见 (成功 = 自动发货, 失败 = 发货失败)
+  // 决策日志桩: 发货动作在决策日志中全程可见 (成功 = 自动发货, 失败/跳过原因均可追溯)
   const logMsg: ParsedChatMessage = {
     kind: 'chat',
     chatId: ctx.chatId || '',
@@ -1379,6 +1391,22 @@ async function autoDeliver(
     })
   }
 
+  // 已发货判定以 system_shipped (本系统发货标记) 为准, 不再误伤 completed (交易成功但本系统未发货);
+  // shipped = 人工已发货 / closed = 交易关闭(退款), 均不补发。
+  // (v2.1.5) 买家重复点「提醒发货」([记得及时发货]) / 付款卡片重推时: 已发货订单静默不重复发货,
+  // 决策日志落 already_shipped 供排查「为什么没发货」。
+  const systemShipped = Number(order?.system_shipped ?? 0) === 1
+  if (systemShipped || (localStatus && ['shipped', 'closed'].includes(String(localStatus)))) {
+    logWarn(`[${cookieId}] 订单 ${orderId} 已发货或已关闭 (status=${localStatus || '未知'}, system_shipped=${order?.system_shipped ?? 0}), 跳过自动发货`)
+    await addLog(db, cookieId, logMsg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'already_shipped',
+      reply_strategy: 'none',
+      reply_text: `订单 ${orderId} 已发货, 不重复发货 (status=${localStatus || '未知'})`,
+    })
+    return []
+  }
+
   // 内存锁 + 冷却 (跨消息去重; 冷却仅在发货成功后设置, 失败允许后续触发重试)
   if (orderCooldown.get(orderId) && Date.now() - (orderCooldown.get(orderId) || 0) < ORDER_COOLDOWN_MS) return []
   const existing = orderLocks.get(orderId)
@@ -1388,6 +1416,8 @@ async function autoDeliver(
   }
 
   const run = (async () => {
+    try {
+      return await (async () => {
     const buyerId = ctx.buyerId || order?.buyer_id || ''
     const chatId = ctx.chatId || order?.chat_id || ''
 
@@ -1559,7 +1589,9 @@ async function autoDeliver(
     // 规则 ship_mode 优先; 旧行为兼容: 未配置时沿用账号级 auto_confirm 开关
     const shipMode = String(rule.ship_mode || (accountRow?.auto_confirm ? 'dummy_consign' : 'none') || 'none')
     if (shipMode === 'dummy_consign' && orderId) {
-      if (delayMs > 0) await sleep(delayMs)
+      // (v2.1.6) 决策后台 sleep 硬上限 60s: delay_seconds 配置过大曾拖垮决策 (占位3分钟即判失效,
+      // 代理重报死循环, 发货/发消息全部停滞); 卡券延迟语义保留, 仅封顶防决策超时
+      if (delayMs > 0) await sleep(Math.min(delayMs, 60_000))
       const confirm = await confirmOrderShipped(String(accountRow?.value || ''), orderId)
       if (confirm.finalCookieStr && confirm.finalCookieStr !== accountRow?.value) {
         await db.run('UPDATE cookies SET value = ? WHERE id = ?', [confirm.finalCookieStr, cookieId]).catch(() => {})
@@ -1691,6 +1723,25 @@ async function autoDeliver(
       orderId,
     )
     return deliveryLogId ? actions.map((a) => ({ ...a, log_id: deliveryLogId })) : actions
+      })()
+    } catch (e: any) {
+      // (v2.1.6) 发货全链路异常兜底: mtop 网关/任务/直连全挂、DB 异常等场景不再炸决策
+      // (曾致: 占位被删 → 代理「决策超时失效」无限重报 → 不发货+无日志死循环)。
+      // 落 delivery_failed 决策日志 + 通知, 决策正常终结, 代理重报后由防重链安全重试。
+      logWarn(`[${cookieId}] 订单 ${orderId} 自动发货异常: ${String(e?.message || e).slice(0, 200)}`)
+      await failLog(`自动发货异常: ${String(e?.message || e).slice(0, 350)}`)
+      dispatchNotify(
+        {
+          type: 'delivered',
+          cookieId,
+          title: '自动发货异常',
+          fields: { 订单号: orderId, 异常: String(e?.message || e).slice(0, 120) },
+          link: '/orders',
+        },
+        orderId,
+      )
+      return []
+    }
   })()
 
   const lock = run.finally(() => {
