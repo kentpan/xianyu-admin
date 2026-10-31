@@ -2,6 +2,9 @@
   <div class="space-y-5 animate-fade-in">
     <PageHeader title="卡券管理" description="维护 API / 文本 / 卡密 / 图片 卡券；卡密型发货时按配置生成随机码并留档">
       <template #actions>
+        <button class="btn-secondary" @click="varModalOpen = true">
+          <Icon name="edit" /> 变量配置
+        </button>
         <button class="btn-secondary" @click="reload">
           <Icon name="refresh" :class="loading ? 'animate-spin' : ''" /> 刷新
         </button>
@@ -264,6 +267,10 @@
                 <span class="text-slate-700 dark:text-slate-200">鉴权头 Authorization: Bearer {apikey}</span>
               </label>
               <label class="flex items-center gap-2 cursor-pointer">
+                <input v-model="form.use_item_id" type="checkbox" class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500" />
+                <span class="text-slate-700 dark:text-slate-200">商品ID item_id</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
                 <input v-model="form.use_title" type="checkbox" class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500" />
                 <span class="text-slate-700 dark:text-slate-200">商品名称 title</span>
               </label>
@@ -272,13 +279,14 @@
                 <span class="text-slate-700 dark:text-slate-200">价格 price</span>
               </label>
             </div>
-            <p class="text-slate-400">勾选后以 POST JSON 拼装请求体 (title/price 发货时替换为实际商品值); 不勾选则发 GET 无体</p>
+            <p class="text-slate-400">勾选后以 POST JSON 拼装请求体 (item_id/title/price 发货时替换为实际商品值; 资源交付平台按 item_id 匹配绑定资源, 对接 autoship/cards-hub 必勾); 不勾选则发 GET 无体</p>
           </div>
           <div class="flex flex-wrap gap-2 items-center">
             <button type="button" class="btn-secondary !py-1.5 !px-3" @click="fillCardsHubTemplate">填入 cards-hub 模板</button>
             <button type="button" class="btn-ghost !py-1.5 !px-3" :disabled="apiTesting" @click="testApiConfig">测试请求</button>
             <span v-if="apiTestResult" class="text-slate-500 break-all">{{ apiTestResult }}</span>
           </div>
+          <p class="text-slate-400">测试请求按真实发货模拟: 编辑已有卡券时自动取其发货规则绑定商品的 item_id / title / price 拼装请求 (新卡券取最新同步商品); 上游接口返回的错误原因会原样显示, 便于排查地址/密钥/资源绑定问题 (每点一次测试, 资源交付平台会真实发一张卡, 可在其后台作废)</p>
           <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
             <p class="text-slate-600 dark:text-slate-300 font-medium">对接 cloudflare-cards-hub（资源交付系统）</p>
             <p class="text-slate-500 mt-1">填入模板后改 3 处：① 接口地址换你的 cards-hub 域名 ② 鉴权密钥填「APIKEY 管理」里的 ak- 密钥 ③ 资源 ID。发货时自动调 /api/issue 生成一单一密的加密提取页链接发给买家，买家打开即自动核销下载（全程看不到真实文件路径）。</p>
@@ -438,6 +446,9 @@
       </template>
     </ModalBase>
 
+    <!-- 发货变量配置弹窗 (右上角入口: CRUD/多选启用, 启用后出现在各输入框可用变量列表) -->
+    <VariableConfigModal v-model="varModalOpen" />
+
     <!-- Delete confirm modal -->
     <ModalBase :model-value="!!deleteTarget" title="删除卡券" size="sm" @update:model-value="deleteTarget = null" @close="deleteTarget = null">
       <div class="text-center py-2">
@@ -498,6 +509,7 @@ const filterType = ref('')
 const modalOpen = ref(false)
 const editing = ref(false)
 const deleteTarget = ref<Card | null>(null)
+const varModalOpen = ref(false)
 
 const form = ref<any>({
   id: null,
@@ -507,6 +519,7 @@ const form = ref<any>({
   api_method: 'POST',
   api_key: '',
   use_auth: true,
+  use_item_id: true,
   use_title: true,
   use_price: true,
   data_path: 'data.url',
@@ -550,24 +563,26 @@ function fillCardsHubTemplate() {
   form.value.api_method = 'POST'
   form.value.api_key = 'ak-你的APIKEY'
   form.value.use_auth = true
+  form.value.use_item_id = true
   form.value.use_title = true
   form.value.use_price = true
   form.value.data_path = 'data.url'
 }
 
-/** 表单 → api_config JSON 拼装 (勾选鉴权头/商品名称/价格 → 代码拼装, 存储结构不变向后兼容) */
-function buildApiConfig(): string {
+/** 表单 → api_config 对象 (勾选鉴权头/商品ID/商品名称/价格 → 代码拼装, 存储结构不变向后兼容)。网络传输一律用对象, 仅存库时在调用点 JSON.stringify */
+function buildApiConfigObject(): Record<string, any> {
   const conf: any = { url: form.value.api_url.trim(), method: form.value.api_method }
   if (form.value.use_auth) {
     if (form.value.api_key.trim()) conf.api_key = form.value.api_key.trim()
     conf.headers = { 'content-type': 'application/json', Authorization: 'Bearer {apikey}' }
   }
   const body: any = {}
+  if (form.value.use_item_id) body.item_id = '{item_id}'
   if (form.value.use_title) body.title = '{title}'
   if (form.value.use_price) body.price = '{price}'
   if (Object.keys(body).length) conf.body = body
   conf.data_path = form.value.data_path.trim() || 'data'
-  return JSON.stringify(conf)
+  return conf
 }
 
 /** api_config JSON → 表单回填 (兼容旧手写 JSON: Authorization 真实密钥/任意 body) */
@@ -580,6 +595,7 @@ function parseApiConfig(raw: string): void {
   const bearerKey = auth.replace(/^Bearer\s+/i, '')
   form.value.use_auth = !!auth
   form.value.api_key = String(conf.api_key || (bearerKey && bearerKey !== '{apikey}' ? bearerKey : ''))
+  form.value.use_item_id = conf.body != null && typeof conf.body === 'object' && 'item_id' in conf.body
   form.value.use_title = conf.body != null && typeof conf.body === 'object' && 'title' in conf.body
   form.value.use_price = conf.body != null && typeof conf.body === 'object' && 'price' in conf.body
   form.value.data_path = String(conf.data_path || 'data')
@@ -614,7 +630,7 @@ async function testApiConfig() {
   try {
     const r: any = await $fetch('/api/cards/test-api', {
       method: 'POST',
-      body: { api_config: buildApiConfig() },
+      body: { api_config: buildApiConfigObject(), card_id: form.value.id || null },
     })
     const d = r?.data || {}
     apiTestResult.value = d.ok
@@ -645,7 +661,7 @@ function openCreate() {
   editing.value = false
   form.value = {
     id: null, name: '', type: 'text',
-    api_url: '', api_method: 'POST', api_key: '', use_auth: true, use_title: true, use_price: true, data_path: 'data.url',
+    api_url: '', api_method: 'POST', api_key: '', use_auth: true, use_item_id: true, use_title: true, use_price: true, data_path: 'data.url',
     text_content: '', image_url: '',
     code_length: 6, code_letters: true, code_digits: true, code_case: 'mixed', code_template: DEFAULT_CODE_TEMPLATE,
     description: '', enabled: true, delay_seconds: 0,
@@ -660,7 +676,7 @@ function openEdit(c: Card) {
   editing.value = true
   form.value = {
     id: c.id, name: c.name, type: c.type,
-    api_url: '', api_method: 'POST', api_key: '', use_auth: false, use_title: false, use_price: false, data_path: 'data',
+    api_url: '', api_method: 'POST', api_key: '', use_auth: false, use_item_id: false, use_title: false, use_price: false, data_path: 'data',
     text_content: c.text_content || '',
     image_url: c.image_url || '',
     code_length: c.code_length || 6,
@@ -712,7 +728,7 @@ async function saveCard() {
         toast.error('请填写 API 接口地址')
         return
       }
-      payload.api_config = buildApiConfig()
+      payload.api_config = JSON.stringify(buildApiConfigObject())
     }
     if (form.value.type === 'text' || form.value.type === 'image' || form.value.type === 'api') {
       payload.text_content = form.value.text_content

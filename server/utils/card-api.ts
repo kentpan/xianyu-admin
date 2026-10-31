@@ -26,18 +26,25 @@ export interface ApiCardVars {
   userid?: string
   /** API 接口返回的资源交付分享 URL (data_path 提取结果) */
   shareURL?: string
+  /** 其余启用变量 (item_id/desc/detail/seller_nick/card_name/order_id/自定义变量…) */
+  [key: string]: string | undefined
 }
 
-const VAR_KEYS = ['title', 'price', 'apikey', 'username', 'userid', 'shareURL'] as const
+/** 变量键合法性 (var_key/模板占位符均为字母数字下划线, 防注入): */
+const VAR_KEY_RE = /^\w+$/
 
-/** 卡券变量替换: {title}/{price}/{apikey}/{username}/{userid}/{shareURL}; 整值占位且为数字时转 Number (如 price 传数字类型)。 */
+/**
+ * 卡券变量替换: 遍历 vars 的全部键做 {key} 整值替换 (键来自 card_variables 启用集合,
+ * 不再固定六变量); 数值型纯占位由 deepApplyVars 转数字。
+ */
 export function applyCardVars(text: unknown, vars?: ApiCardVars): string {
   let out = String(text ?? '')
   if (!out || !vars) return out
-  for (const k of VAR_KEYS) {
-    if (!out.includes(`{${k}}`)) continue
-    const v = String(vars[k] ?? '')
-    out = out.replaceAll(`{${k}}`, v)
+  for (const k of Object.keys(vars)) {
+    if (!VAR_KEY_RE.test(k)) continue
+    const token = `{${k}}`
+    if (!out.includes(token)) continue
+    out = out.replaceAll(token, String(vars[k] ?? ''))
   }
   return out
 }
@@ -86,7 +93,11 @@ export async function fetchApiCardContent(conf: unknown, vars?: ApiCardVars): Pr
       body,
       signal: AbortSignal.timeout(15_000),
     })
-    const json: any = await res.json().catch(() => null)
+    const rawBody = await res.text().catch(() => '')
+    let json: any = null
+    try {
+      json = rawBody ? JSON.parse(rawBody) : null
+    } catch {}
     const path = String(c.data_path || 'data')
     let value: any = json
     for (const seg of path.split('.')) {
@@ -95,7 +106,13 @@ export async function fetchApiCardContent(conf: unknown, vars?: ApiCardVars): Pr
     }
     const text = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value)
     if (!res.ok) {
-      return { ok: false, text, status: res.status, message: `接口返回 ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}` }
+      // 上游错误原因透明化: data_path 在错误响应上通常提取为空, 回退 error/message 字段与原始响应体, 否则只看到状态码无从排查
+      const fallback = String(json?.error || json?.message || rawBody || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200)
+      const detail = text || fallback
+      return { ok: false, text, status: res.status, message: `接口返回 ${res.status}${detail ? `: ${detail}` : ''}` }
     }
     return {
       ok: !!text,

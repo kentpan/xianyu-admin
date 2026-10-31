@@ -576,12 +576,57 @@ const SCHEMA: string[] = [
   // 以 event_id 保证恰好处理一次; actions_json 保存首次决策的动作列表,
   // 重试时原样重放 (不重算决策、不重复发送), 响应丢失也不再丢单。
   // pending=1 且 actions_json='' 表示决策进行中 (快速 ACK 模式的占位, 拉取完成前不重放)
+  // 卡券变量配置: 发货文案/消息回复/卡密文案可用的 {变量} 定义 (多选启用后出现在可用变量列表)。
+  // category: item=商品数据 / account=闲鱼账号数据 / code=卡密数据 / api=API数据 / custom=自定义固定值
+  // sample_value: 自定义变量的固定值 (builtin 动态变量留空, 发货时按来源实时取值)
+  `CREATE TABLE IF NOT EXISTS card_variables (
+    id __AUTO__,
+    var_key VARCHAR(64) NOT NULL UNIQUE,
+    label VARCHAR(128) NOT NULL,
+    category VARCHAR(16) NOT NULL DEFAULT 'custom',
+    description TEXT DEFAULT '',
+    sample_value TEXT DEFAULT '',
+    builtin INTEGER DEFAULT 0,
+    enabled INTEGER DEFAULT 1,
+    sort INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_card_vars_enabled ON card_variables(enabled, category, sort)`,
   `CREATE TABLE IF NOT EXISTS engine_event_dedup (
     event_id VARCHAR(80) PRIMARY KEY,
     actions_json TEXT DEFAULT '[]',
     pending INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+]
+
+/**
+ * 内置卡券变量种子 (var_key 唯一, INSERT OR IGNORE 幂等补种):
+ * builtin=1 不可删除, 发货时按来源实时取值; 用户可在卡券管理页变量配置弹窗中
+ * 修改说明/启停 (enabled=1 才出现在可用变量列表与发货替换集合)。
+ */
+export const BUILTIN_CARD_VARIABLES: { var_key: string; label: string; category: string; description: string; sort: number }[] = [
+  // ── 商品数据 (发货订单对应商品, item_info 实时取值) ──
+  { var_key: 'item_id', label: '商品ID', category: 'item', description: '本次发货订单的商品ID (可传给资源交付平台按商品匹配资源)', sort: 10 },
+  { var_key: 'title', label: '商品名称', category: 'item', description: '本次发货订单的商品标题', sort: 11 },
+  { var_key: 'price', label: '商品价格', category: 'item', description: '本次发货订单的商品价格 (纯占位替换后为数字类型)', sort: 12 },
+  { var_key: 'desc', label: '商品描述', category: 'item', description: '本次发货订单的商品描述/介绍文案', sort: 13 },
+  { var_key: 'detail', label: '商品详情', category: 'item', description: '本次发货订单的商品详情长文本', sort: 14 },
+  { var_key: 'quantity', label: '购买数量', category: 'item', description: '本次发货订单的购买数量', sort: 15 },
+  // ── 闲鱼账号数据 (当前发货账号, cookies 实时取值) ──
+  { var_key: 'seller_nick', label: '卖家昵称', category: 'account', description: '当前发货的闲鱼账号昵称', sort: 20 },
+  { var_key: 'seller_id', label: '卖家账号ID', category: 'account', description: '当前发货的闲鱼账号ID (cookie_id)', sort: 21 },
+  { var_key: 'username', label: '买家昵称', category: 'account', description: '本次订单买家的闲鱼昵称', sort: 22 },
+  { var_key: 'userid', label: '买家用户ID', category: 'account', description: '本次订单买家的闲鱼用户ID', sort: 23 },
+  // ── 卡密数据 (本次发货上下文) ──
+  { var_key: 'code', label: '本次生成卡密', category: 'code', description: '卡密型卡券本次生成的随机卡密', sort: 30 },
+  { var_key: 'card_name', label: '卡券名称', category: 'code', description: '本次发货使用的卡券名称', sort: 31 },
+  { var_key: 'card_id', label: '卡券ID', category: 'code', description: '本次发货使用的卡券ID', sort: 32 },
+  { var_key: 'order_id', label: '订单号', category: 'code', description: '本次发货的闲鱼订单号', sort: 33 },
+  // ── API 数据 (API 型卡券专用) ──
+  { var_key: 'apikey', label: '鉴权密钥', category: 'api', description: 'API 卡券配置里填写的鉴权密钥 (请求头/请求体通用)', sort: 40 },
+  { var_key: 'shareURL', label: '分享链接', category: 'api', description: 'API 接口按 data_path 提取返回的资源交付分享URL (发货文案/消息回复中可用)', sort: 41 },
 ]
 
 /**
@@ -856,6 +901,18 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
       'INSERT INTO system_settings (key_name, value, description) VALUES (?, ?, ?)',
       [s.key, s.value, s.description],
     )
+  }
+
+  // Seed builtin card variables (幂等补种; 用户启停/改说明不覆盖, 删除后按 builtin 定义找回)
+  for (const v of BUILTIN_CARD_VARIABLES) {
+    await db
+      .run(
+        `INSERT INTO card_variables (var_key, label, category, description, sample_value, builtin, enabled, sort)
+         VALUES (?, ?, ?, ?, '', 1, 1, ?)
+         ON CONFLICT(var_key) DO NOTHING`,
+        [v.var_key, v.label, v.category, v.description, v.sort],
+      )
+      .catch(() => {})
   }
 }
 

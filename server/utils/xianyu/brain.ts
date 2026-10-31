@@ -1268,11 +1268,13 @@ async function autoDeliver(
       )
       return []
     }
-    // 发货变量 ({title}/{price}/{apikey}/{username}/{userid}/{shareURL}): 发货请求/文案/消息回复共用
+    // 发货变量 ({title}/{item_id}/{seller_nick}/{code}/{card_name}/{order_id}/自定义变量…):
+    // 按卡券变量配置 (card_variables enabled=1, 卡券管理页可配) 注入; 发货请求/文案/消息回复共用
     let apiConf: any = {}
     if (card.type === 'api') {
       try { apiConf = JSON.parse(String(card.api_config || '{}')) } catch {}
     }
+    const accountRow = await db.get<any>('SELECT value, auto_confirm, username FROM cookies WHERE id = ?', [cookieId])
     const conv = chatId
       ? await db
           .get<{ peer_nick: string }>('SELECT peer_nick FROM im_conversations WHERE cookie_id = ? AND chat_id = ?', [cookieId, chatId])
@@ -1281,9 +1283,38 @@ async function autoDeliver(
     const deliverVars: ApiCardVars = {
       title: String(item.item_title || ''),
       price: String(item.item_price || ''),
+      // 商品ID是 API 卡券按商品匹配资源 (autoship/cards-hub body.item_id) 的必需上下文, 恒可用
+      item_id: String(ctx.itemId || ''),
       apikey: String(apiConf.api_key || ''),
       username: String(conv?.peer_nick || buyerId || ''),
       userid: String(buyerId || ''),
+    }
+    // 启用变量按 category 从发货上下文取值 (item=商品 / account=账号 / code=卡密与订单 / custom=固定值);
+    // shareURL 由 API 卡券提取结果回写, 此处不预置
+    const enabledVars = await db
+      .all<{ var_key: string; category: string; sample_value: string }>(
+        "SELECT var_key, category, sample_value FROM card_variables WHERE enabled = 1 AND var_key != 'shareURL'",
+      )
+      .catch(() => [] as { var_key: string; category: string; sample_value: string }[])
+    for (const v of enabledVars) {
+      const key = String(v.var_key || '')
+      if (!key || key in deliverVars) continue
+      if (v.category === 'item') {
+        if (key === 'item_id') deliverVars[key] = String(ctx.itemId || '')
+        else if (key === 'desc') deliverVars[key] = String(item.item_description || '')
+        else if (key === 'detail') deliverVars[key] = String(item.item_detail || '')
+        else if (key === 'quantity') deliverVars[key] = String(order?.quantity || '1')
+      } else if (v.category === 'account') {
+        if (key === 'seller_nick') deliverVars[key] = String(accountRow?.username || accountRow?.remark || cookieId)
+        else if (key === 'seller_id') deliverVars[key] = String(cookieId)
+      } else if (v.category === 'code') {
+        if (key === 'card_name') deliverVars[key] = String(card.name || '')
+        else if (key === 'card_id') deliverVars[key] = String(card.id || '')
+        else if (key === 'order_id') deliverVars[key] = String(orderId || '')
+        // code 由卡密生成后回填 (persistCardCode 拿到最终码时)
+      } else if (v.category === 'custom') {
+        deliverVars[key] = String(v.sample_value || '')
+      }
     }
 
     // 发送数量 = 订单数量(多数量发货开启时) × delivery_count (卡密型按份逐一生成, 需先于内容提取)
@@ -1311,7 +1342,6 @@ async function autoDeliver(
     }
 
     // 金额回填: 订单无金额时用商品定价填充 (卡片/详情后续可修正为实付价)
-    const accountRow = await db.get<any>('SELECT value, auto_confirm FROM cookies WHERE id = ?', [cookieId])
     if (orderId && item.item_price) {
       await db
         .run(
@@ -1357,6 +1387,8 @@ async function autoDeliver(
           }
         }
       }
+      // {code} 变量回填 (发货文案/消息回复中可用, 取第一份生成码)
+      deliverVars.code = extract.generatedCodes[0]
     }
 
     const actions: EngineAction[] = []
@@ -1524,6 +1556,8 @@ async function extractCardContent(
     for (let i = 0; i < Math.max(1, count); i++) {
       const code = generateCardCode(card)
       generatedCodes.push(code)
+      // {code} 变量先行回填 (码型文案模板其余变量照常替换)
+      if (vars) vars.code = code
       items.push({
         parts: [{ kind: 'text', value: applyCardVars(renderCodeTemplate(card.code_template, code), vars) }],
         preview: `[卡密] ${code}`,
