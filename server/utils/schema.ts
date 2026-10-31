@@ -348,6 +348,10 @@ const SCHEMA: string[] = [
     xianyu_uid VARCHAR(64),
     xianyu_nick VARCHAR(255),
     error_message TEXT,
+    params_json TEXT,
+    jar_json TEXT,
+    face_qr_url TEXT,
+    verification_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -692,6 +696,11 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE message_notifications ADD COLUMN event_types TEXT`,
   // 监听引擎: 回连来源 IP (cf-connecting-ip/XFF, 不可伪造) — 登记地址与回连来源一致即真实部署点
   `ALTER TABLE engines ADD COLUMN last_poll_ip VARCHAR(64) DEFAULT ''`,
+  // 扫码登录: 会话状态机落库 (serverless 跨隔离实例 + 重启存活) — 表单参数/cookie jar/人脸核验二维码
+  `ALTER TABLE qr_login_sessions ADD COLUMN params_json TEXT`,
+  `ALTER TABLE qr_login_sessions ADD COLUMN jar_json TEXT`,
+  `ALTER TABLE qr_login_sessions ADD COLUMN face_qr_url TEXT`,
+  `ALTER TABLE qr_login_sessions ADD COLUMN verification_url TEXT`,
   // 监听引擎注册表 (新建表, CREATE IF NOT EXISTS 幂等) + 内置引擎种子行
   `CREATE TABLE IF NOT EXISTS engines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

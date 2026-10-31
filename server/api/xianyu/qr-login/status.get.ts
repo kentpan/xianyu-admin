@@ -12,7 +12,7 @@ export default defineEventHandler(
     if (!sessionKey) throw new ApiError(400, '缺少 sessionKey 参数')
 
     // Verify ownership: the session's userId must match the caller (admin bypass)
-    const sessionUserId = getSessionUserId(sessionKey)
+    const sessionUserId = await getSessionUserId(sessionKey)
     if (sessionUserId == null) throw new ApiError(404, '二维码会话不存在')
     if (!payload.isAdmin && sessionUserId !== payload.userId) {
       throw new ApiError(403, '无权访问此二维码会话')

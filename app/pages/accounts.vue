@@ -129,8 +129,9 @@
                     <span class="w-1.5 h-1.5 rounded-full" :class="a.enabled ? 'bg-emerald-500' : 'bg-slate-400'" />
                     {{ a.enabled ? '运行中' : '已停用' }}
                   </span>
-                  <span v-if="a.cookie_status_text" class="block text-[10px] mt-1" :class="a.cookie_status_text === 'valid' ? 'text-emerald-500' : a.cookie_status_text === 'invalid' ? 'text-rose-500' : 'text-slate-400'">
-                    {{ a.cookie_status_text === 'valid' ? 'Cookie有效' : a.cookie_status_text === 'invalid' ? 'Cookie失效' : a.cookie_status_text }}
+                  <span v-if="listenerBadge(a)" class="inline-flex items-center gap-1 mt-1" :class="listenerBadge(a).cls">
+                    <span class="w-1.5 h-1.5 rounded-full" :class="listenerBadge(a).cls.includes('emerald') ? 'bg-emerald-500' : listenerBadge(a).cls.includes('amber') ? 'bg-amber-500' : listenerBadge(a).cls.includes('rose') ? 'bg-rose-500' : 'bg-slate-400'" />
+                    {{ listenerBadge(a).text }}
                   </span>
                 </td>
                 <td>
@@ -445,6 +446,23 @@ const filtered = computed(() => {
     (a) => a.id.toLowerCase().includes(k) || (a.remark || '').toLowerCase().includes(k),
   )
 })
+
+/** 监听心跳状态 (与 /api/listener/status 同判定: 引擎每账号心跳回写 cookie_status_text + last_check_at 60s 新鲜度) */
+function listenerBadge(a: Account): { text: string; cls: string } | null {
+  if (!a.enabled) return null
+  const st = a.cookie_status_text || ''
+  if (st === 'valid' || st === 'invalid') {
+    return { text: st === 'valid' ? 'Cookie有效' : 'Cookie失效', cls: st === 'valid' ? 'text-emerald-500' : 'text-rose-500' }
+  }
+  const ts = a.last_check_at ? new Date(a.last_check_at + 'Z').getTime() || new Date(a.last_check_at).getTime() : 0
+  if (!ts || Date.now() - ts > 60_000) return { text: '引擎未接入', cls: 'text-slate-400' }
+  if (st === 'listening') return { text: '监听中', cls: 'text-emerald-500' }
+  if (st === 'connecting' || st === 'reconnecting') return { text: st === 'connecting' ? '连接中' : '重连中', cls: 'text-amber-500' }
+  if (st === 'need_relogin') return { text: '需重新登录', cls: 'text-rose-500' }
+  if (st === 'risk_cooldown') return { text: '风控冷却', cls: 'text-rose-500' }
+  if (st === 'error') return { text: '监听异常', cls: 'text-rose-500' }
+  return { text: '心跳正常', cls: 'text-emerald-500' }
+}
 
 async function reload() {
   loading.value = true

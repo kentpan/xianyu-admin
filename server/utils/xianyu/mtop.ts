@@ -19,6 +19,9 @@ import crypto from 'node:crypto'
 /** 闲鱼 H5 appKey (全项目硬编码值)。 */
 const APP_KEY = '34839810'
 
+/** mtop 单请求硬超时 (上游参数自身约定 20000ms; 防不可达网络下 fetch 永久挂起拖死引擎) */
+const MTOP_TIMEOUT_MS = 20_000
+
 /** mtop 通用请求头。 */
 const MTOP_HEADERS: Record<string, string> = {
   'User-Agent':
@@ -141,6 +144,7 @@ export async function mtopCall<T = any>(
     method,
     headers: { ...MTOP_HEADERS, Cookie: cookieHeader(jar) },
     body: method === 'POST' ? body : undefined,
+    signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
   })
 
   // 合并轮换后的 cookie (尤其是 _m_h5_tk)
@@ -171,6 +175,7 @@ export async function mtopCall<T = any>(
       method,
       headers: { ...MTOP_HEADERS, Cookie: newCookieStr },
       body: method === 'POST' ? body : undefined,
+      signal: AbortSignal.timeout(MTOP_TIMEOUT_MS),
     })
     mergeSetCookies(jar, getSetCookies(retryRes))
     const retryRaw = await retryRes.json().catch(() => ({}))
