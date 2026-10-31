@@ -325,6 +325,19 @@ CREATE TABLE engine_event_dedup (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
+CREATE TABLE engine_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type VARCHAR(32) NOT NULL,
+    payload TEXT DEFAULT '',
+    result TEXT DEFAULT '',
+    status VARCHAR(16) DEFAULT 'pending',
+    engine_id INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+CREATE INDEX idx_enginetasks_status ON engine_tasks(status, engine_id, id);
+
 CREATE TABLE chat_pauses (
     cookie_id VARCHAR(64) NOT NULL,
     chat_id VARCHAR(64) NOT NULL,
@@ -521,6 +534,10 @@ CREATE TABLE qr_login_sessions (
     xianyu_uid VARCHAR(64),
     xianyu_nick VARCHAR(255),
     error_message TEXT,
+    params_json TEXT,
+    jar_json TEXT,
+    face_qr_url TEXT,
+    verification_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );

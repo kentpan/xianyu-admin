@@ -19,6 +19,7 @@ import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-c
 import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
 import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
+import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
@@ -177,6 +178,25 @@ async function pickOrderIdFromRemote(
   buyerId: string,
 ): Promise<{ orderId: string; source: string }> {
   try {
+    // 引擎模式分流: 独立代理模式 (CF 等闲鱼 mtop 不可直连环境) → 任务通道借代理拉单;
+    // 内置引擎 → 本机直连 (原语义)
+    if (await isProxyEngineMode(db)) {
+      const pr = await fetchOrdersViaProxy(db, cookieId, { queryCode: 'NOT_SHIP', pages: 1, timeoutMs: 12_000 })
+      if (pr.errors.length && !pr.items.length) return { orderId: '', source: `代理拉单失败: ${pr.errors.join('; ').slice(0, 120)}` }
+      await upsertSoldOrders(db, cookieId, pr.items).catch(() => {})
+      const pending = pr.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
+      const hit =
+        (itemId && buyerId && pending.find((o) => o.item_id === itemId && o.buyer_id === buyerId)) ||
+        (itemId ? pending.find((o) => o.item_id === itemId) : null) ||
+        null
+      if (!hit) {
+        return {
+          orderId: '',
+          source: `代理待发货 ${pr.items.length} 单中无 商品${itemId || '未知'}/买家${buyerId || '未知'} 匹配`,
+        }
+      }
+      return { orderId: String(hit.order_id), source: '代理待发货列表' }
+    }
     const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
     const cookieStr = String(acct?.value || '')
     if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }

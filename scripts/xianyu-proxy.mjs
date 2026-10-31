@@ -8,6 +8,8 @@
  *   2. 对每个启用账号建立闲鱼消息长连接 (协议与后台内置引擎同源)
  *   3. POST /api/engine/events  — 上报连接状态/聊天/交易/风控事件, 回收决策动作
  *   4. 按 delay_ms 人化执行动作 (发文本/发图片, 串行队列 + 滑动窗口限速)
+ *   5. GET  /api/engine/tasks   — 领取后台下发任务 (fetch_orders: 订单拉取 — CF Pages
+ *      出口到 h5api 被墙, 一键同步/付款拉单借代理本地执行, 结果经 task_result 回报)
  *
  * 部署: 上传本文件到任意能出网的机器 (Node ≥ 20; Node 20 若无内置 WebSocket
  * 请在同目录 `npm i ws`), 配好环境变量后 `node xianyu-proxy.mjs`。
@@ -18,6 +20,7 @@
  *   XY_ENGINE_TOKEN  引擎接入令牌 (必填, 后台「监听服务」页该代理行的接入令牌)
  *   XY_PROXY_PORT    本地健康检查端口 (选填, 默认关闭; 绑定全部网卡, /health 返回运行状态 JSON, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
+ *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
  *
  * 风控硬约束 (与后台内置引擎完全同源):
  *   设备指纹持久化 (后台下发 cookies.device_id) / 心跳与重连随机抖动 /
@@ -100,6 +103,10 @@ if (dotenvInfo && dotenvInfo.injected.length) {
 
 const CONFIG_URL = `${ADMIN_URL}/api/engine/config`
 const EVENTS_URL = `${ADMIN_URL}/api/engine/events`
+const TASKS_URL = `${ADMIN_URL}/api/engine/tasks`
+
+/** 任务轮询间隔秒 (选填, 默认 3): fetch_orders 等下发任务的领取频率, 越短后台等得越短 */
+const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
 
 /* ----------------- 协议常量与纯函数 (与后台 server/utils/xianyu/protocol.ts 同源) ----------------- */
 
@@ -748,6 +755,9 @@ async function fetchTokenDetailed(cookieStr, deviceId) {
 const RISK_LADDER_SECONDS = [300, 600, 1200, 1800]
 const RISK_LADDER_WINDOW_MS = 30 * 60 * 1000
 const TOKEN_REFRESH_MS = 3600 * 1000
+// cookie 保活 (复刻参考项目 cookie_refresh_loop): 3 分钟周期, 消息活动后 5 分钟冷却
+const COOKIE_KEEPALIVE_MS = 180 * 1000
+const COOKIE_MSG_COOLDOWN_MS = 300 * 1000
 const SEND_WINDOW_MS = 60_000
 const SEND_MAX_PER_WINDOW = 12
 
@@ -762,6 +772,115 @@ function backoffDelay(failures) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+/* ------------- 订单拉取执行器 (与后台 mtop.ts fetchSellerOrders 同源复刻) ------------- */
+
+/** 闲鱼订单中文状态 → 后台状态码 (与后台 SELLER_ORDER_STATUS_MAP 同源)。 */
+const SELLER_ORDER_STATUS_MAP = {
+  待付款: 'pending_payment',
+  待发货: 'pending_ship',
+  已发货: 'shipped',
+  交易成功: 'completed',
+  交易关闭: 'cancelled',
+  退款中: 'refunding',
+  退款成功: 'refunded',
+  已退款: 'refunded',
+  退款关闭: 'cancelled',
+}
+
+/** 解析卖家订单列表单条 item (与后台 parseSoldOrderItem 同源复刻)。 */
+function parseSoldOrderItem(item) {
+  const common = item?.commonData || {}
+  const orderId = String(common.orderId || '')
+  if (!orderId) return null
+  const buyer = item?.buyerInfoVO || {}
+  const priceVo = item?.priceVO || {}
+  const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
+  const rawStatus = String(common.orderStatus || '')
+  return {
+    order_id: orderId,
+    order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
+    item_id: String(common.itemId || ''),
+    buyer_id: String(buyer.buyerId || ''),
+    buyer_nick: String(buyer.userNick || ''),
+    receiver_name: String(buyer.name || ''),
+    receiver_phone: String(buyer.phone || ''),
+    receiver_address: String(buyer.address || ''),
+    amount: String(priceVo.totalPrice ?? ''),
+    quantity: String(priceVo.buyNum ?? '1'),
+    is_bargain: btnList.some((b) => b?.tradeAction === 'SKIP_PIN'),
+    created_at_text: String(common.createTime || ''),
+  }
+}
+
+/**
+ * 拉取卖家订单列表单页 (api=mtop.taobao.idle.trade.merchant.sold.get, 与后台同源):
+ * 卖家端接口校验来源, Origin/Referer 必须为 seller.goofish.com, 且 query 需带 valueType=string。
+ * 代理在可达闲鱼的机器上执行, 解决 CF Pages 出口到 h5api 被墙的一键同步/付款拉单需求。
+ */
+async function fetchSellerOrdersPage(cookieStr, page, queryCode) {
+  const empty = { items: [], nextPage: false, retMsg: '' }
+  if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
+  const api = 'mtop.taobao.idle.trade.merchant.sold.get'
+  const dataVal = JSON.stringify({ pageNumber: page, rowsPerPage: 30, orderIds: '', queryCode, orderSearchParam: '{}' })
+
+  const callOnce = async (useCookie) => {
+    const cookies = transCookies(useCookie)
+    const h5tk = cookies['_m_h5_tk'] || ''
+    const signToken = h5tk ? h5tk.split('_')[0] : ''
+    const t = String(Date.now())
+    const params = new URLSearchParams({
+      jsv: '2.7.2',
+      appKey: SIGN_APP_KEY,
+      t,
+      sign: md5Sign(t, signToken, dataVal),
+      v: '1.0',
+      type: 'originaljson',
+      dataType: 'json',
+      timeout: '20000',
+      api,
+      sessionOption: 'AutoLoginOnly',
+      spm_cnt: 'a21107h.42826273.0.0',
+      valueType: 'string',
+    })
+    return await fetch(`https://h5api.m.goofish.com/h5/${api}/1.0/?${params.toString()}`, {
+      method: 'POST',
+      headers: {
+        ...mtopHeaders(useCookie),
+        Origin: 'https://seller.goofish.com',
+        Referer: 'https://seller.goofish.com/',
+      },
+      body: new URLSearchParams({ data: dataVal }).toString(),
+      signal: AbortSignal.timeout(20_000),
+    })
+  }
+
+  let res = await callOnce(cookieStr)
+  let json = await res.json().catch(() => ({}))
+  const retArr = Array.isArray(json?.ret) ? json.ret : []
+  const retStr = retArr.join(' ')
+  // token 过期: 用响应轮换后的 _m_h5_tk 重试一次 (与后台 mtopCall 同语义)
+  if (retStr.includes('FAIL_SYS_TOKEN_EXOIRED') || retStr.includes('FAIL_SYS_TOKEN_EXPIRED')) {
+    const merged = { ...transCookies(cookieStr) }
+    try {
+      const setCookies = res.headers.getSetCookie?.() || []
+      for (const sc of setCookies) {
+        const [pair] = sc.split(';')
+        const eq = pair.indexOf('=')
+        if (eq > 0) merged[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim()
+      }
+    } catch {}
+    const retryCookie = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
+    res = await callOnce(retryCookie)
+    json = await res.json().catch(() => ({}))
+  }
+  const ret = Array.isArray(json?.ret) ? json.ret.join(' ') : ''
+  if (!ret.includes('SUCCESS')) return { ...empty, retMsg: ret || '卖家订单列表查询失败' }
+  const module = json?.data?.module || {}
+  const rawItems = Array.isArray(module.items) ? module.items : []
+  const items = rawItems.map(parseSoldOrderItem).filter((x) => !!x)
+  return { items, nextPage: String(module.nextPage ?? 'false') === 'true', retMsg: '' }
 }
 
 async function createWsSocket(url, headers) {
@@ -793,6 +912,8 @@ class XianyuAccountClient {
     this.lastTokenRefresh = 0
     this.tokenTimer = null
     this.heartbeatTimer = null
+    this.cookieKeepaliveTimer = null
+    this.cookieRefreshing = false
     this.riskCooldownUntil = 0
     this.riskLadderIndex = 0
     this.lastRiskTripAt = 0
@@ -829,15 +950,31 @@ class XianyuAccountClient {
     this.tokenTimer = setInterval(() => {
       if (!this.stopped) void this.refreshTokenSafely()
     }, jitter(TOKEN_REFRESH_MS, 0.08))
+    // cookie 保活 (复刻参考项目 cookie_refresh_loop): 每 3 分钟调一次 token API,
+    // Set-Cookie 滚动合并回写后台; 收到下游消息后 5 分钟冷却 (风控降频)
+    this.cookieKeepaliveTimer = setInterval(() => {
+      if (!this.stopped) void this.maybeCookieKeepalive()
+    }, jitter(COOKIE_KEEPALIVE_MS, 0.1))
+  }
+
+  async maybeCookieKeepalive() {
+    if (this.cookieRefreshing || this.stopped) return
+    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
+    this.cookieRefreshing = true
+    try {
+      await this.refreshTokenSafely()
+    } finally {
+      this.cookieRefreshing = false
+    }
   }
 
   async stop() {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
-    this.tokenTimer = this.heartbeatTimer = null
+    this.tokenTimer = this.heartbeatTimer = this.cookieKeepaliveTimer = null
     this.generation++
     this.setState('disabled', '已停止')
     try {
@@ -1101,6 +1238,8 @@ class XianyuAccountClient {
 
 const clients = new Map()
 const latestCookies = new Map()
+/** 最近一次 config 下发的账号表 (id → {cookies,...}): 任务执行时取 Cookie 的兜底源 */
+const lastAccountsConfig = new Map()
 let engineActive = false
 let pollSeconds = DEFAULT_POLL_SECONDS
 let heartbeatSeconds = 15
@@ -1431,6 +1570,8 @@ async function pollConfigOnce() {
     const wanted = new Map(
       (Array.isArray(cfg.accounts) ? cfg.accounts : []).map((a) => [a.id && String(a.id), accountEntryFromConfig(a)]),
     )
+    lastAccountsConfig.clear()
+    for (const [id, entry] of wanted) lastAccountsConfig.set(id, entry)
 
     for (const [id] of [...clients]) {
       if (!wanted.has(id)) await stopClient(id)
@@ -1539,6 +1680,104 @@ async function configLoop() {
   }
 }
 
+/* ------------- 任务通道: 后台下发的需“可达闲鱼的机器执行”的工作 (fetch_orders 等) -------------
+ * 背景: CF Pages 出口到闲鱼 mtop 网关 (h5api) 被墙, 一键同步/付款拉单的远程拉单在
+ * 服务端直连必 500 超时 — 后台把任务写入 engine_tasks 表, 代理从此处领取并本地执行,
+ * 结果经 events task_result 回报 (后台轮询任务行取回)。代理主动外呼后台, 无需入站端口。 */
+
+/**
+ * 执行 fetch_orders 任务: 按账号 Cookie 拉卖家订单列表 (ALL/NOT_SHIP, 逐页 400ms 限速)。
+ * 返回 { ok, data }: data.items = 标准化订单数组 (后台直接 upsert 入库)。
+ */
+async function executeFetchOrdersTask(payload) {
+  const cookieId = String(payload?.cookie_id || '')
+  const queryCode = payload?.query_code === 'NOT_SHIP' ? 'NOT_SHIP' : 'ALL'
+  const pages = Math.min(Math.max(Number(payload?.pages) || 1, 1), 5)
+  const cookieStr = latestCookies.get(cookieId) || String(lastAccountsConfig.get(cookieId)?.cookies || '')
+  if (!cookieStr) {
+    return { ok: false, data: { errors: [`账号 ${cookieId || '未知'} 本地无 Cookie (等待配置下发后重试)`] } }
+  }
+  const items = []
+  let page = 1
+  while (page <= pages) {
+    const pg = await fetchSellerOrdersPage(cookieStr, page, queryCode)
+    if (pg.retMsg) return { ok: false, data: { items, errors: [String(pg.retMsg).slice(0, 200)] } }
+    items.push(...pg.items)
+    if (!pg.nextPage || !pg.items.length) break
+    page++
+    await sleep(400)
+  }
+  return { ok: true, data: { items } }
+}
+
+/**
+ * 执行 send_message 任务: 消息管理页手动发送 — 内置引擎未托管账号时由代理本地 WS 发送。
+ * 复用账号长连接与 client.sendText (与决策动作发送同源协议)。
+ */
+async function executeSendMessageTask(payload) {
+  const cookieId = String(payload?.cookie_id || '')
+  const client = clients.get(cookieId)
+  if (!client) return { ok: false, data: { error: `账号 ${cookieId || '未知'} 不由本代理托管 (账号未启用或未在线)` } }
+  const chatId = String(payload?.chat_id || '')
+  const toUserId = String(payload?.to_user_id || '')
+  const text = String(payload?.text || '')
+  if (!chatId || !toUserId || !text) return { ok: false, data: { error: '任务缺少会话/收件人/内容' } }
+  await client.sendText(chatId, toUserId, text, 0)
+  log(`任务发送文本 → 账号 ${cookieId} 会话 ${chatId} (${text.length} 字)`)
+  return { ok: true, data: {} }
+}
+
+/** 领取并执行一轮任务 (无任务静默返回; 单任务异常不影响后续任务与轮询循环)。 */
+async function pollTasksOnce() {
+  if (!engineActive) return
+  let resp
+  try {
+    resp = await apiCallWithRetry(TASKS_URL, undefined, 15_000)
+  } catch (e) {
+    if (e?.fatal) throw e
+    return // 网络抖动: 下轮重试 (任务过期由后台守护, 无需本地补路)
+  }
+  const tasks = Array.isArray(resp?.tasks) ? resp.tasks : []
+  for (const task of tasks) {
+    const taskId = Number(task?.id || 0)
+    if (!taskId) continue
+    let payload = {}
+    try { payload = JSON.parse(String(task?.payload || '{}')) } catch {}
+    let result
+    try {
+      result = task?.type === 'fetch_orders'
+        ? await executeFetchOrdersTask(payload)
+        : task?.type === 'send_message'
+          ? await executeSendMessageTask(payload)
+          : { ok: false, data: { errors: [`未知任务类型: ${String(task?.type).slice(0, 32)}`] } }
+    } catch (e) {
+      result = { ok: false, data: { errors: [String(e?.message || e).slice(0, 200)] } }
+    }
+    try {
+      await apiCallWithRetry(EVENTS_URL, {
+        events: [{ type: 'task_result', task_id: taskId, ok: !!result.ok, data: result.data || {} }],
+      }, 30_000)
+    } catch (e) {
+      if (e?.fatal) throw e
+      log(`任务 ${taskId} 结果回报失败 (后台轮询将判过期): ${e?.message}`)
+    }
+  }
+}
+
+async function tasksLoop() {
+  while (!stopped) {
+    try {
+      await pollTasksOnce()
+    } catch (e) {
+      if (e?.fatal) {
+        log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
+        process.exit(1)
+      }
+    }
+    await sleep(jitter(DEFAULT_TASK_POLL_SECONDS * 1000, 0.1))
+  }
+}
+
 /**
  * 状态心跳: 空闲期也定期上报连接状态, 后台账号心跳 (cookies.last_check_at) 由此保持
  * 新鲜 —— 否则静默 60s 后监听页会把在线账号误判为 engine_offline (监听中归零)。
@@ -1561,7 +1800,7 @@ if (PROXY_PORT > 0) {
       res.end(
         JSON.stringify({
           ok: true,
-          script_version: 'v2.0.9',
+          script_version: 'v2.1.0',
           engine_active: engineActive,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),
           uptime_seconds: Math.round(process.uptime()),
@@ -1587,9 +1826,13 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 }
 
 log(`独立代理已启动 → 后台 ${ADMIN_URL}`)
-log(`配置轮询 ${DEFAULT_POLL_SECONDS}s (以后台下发的 intervals 为准), 事件上报合并窗口 250ms`)
+log(`配置轮询 ${DEFAULT_POLL_SECONDS}s (以后台下发的 intervals 为准), 事件上报合并窗口 250ms, 任务轮询 ${DEFAULT_TASK_POLL_SECONDS}s`)
 configLoop().catch((e) => {
   log(`主循环异常退出: ${e?.message}`)
+  process.exit(1)
+})
+tasksLoop().catch((e) => {
+  log(`任务循环异常退出: ${e?.message}`)
   process.exit(1)
 })
 statusHeartbeatLoop().catch(() => {})

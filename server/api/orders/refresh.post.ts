@@ -14,6 +14,7 @@
  */
 import { fetchOrderDetail, fetchSellerOrders } from '../../utils/xianyu/mtop'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
+import { fetchOrdersViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -35,39 +36,63 @@ export default defineEventHandler(
     const listErrors: string[] = []
     const MAX_LIST_PAGES = 5
 
-    for (const acct of accounts) {
-      let cookieStr = String(acct.value || '')
-      let page = 1
-      while (page <= MAX_LIST_PAGES) {
-        const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
-        if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
-          cookieStr = pg.finalCookieStr
-          await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, acct.id]).catch(() => {})
+    /* ---- 第一步分流: 独立代理模式 → 任务通道 (CF 出口到 h5api 被墙, 直连必 500);
+     *      内置引擎 → 本机直连 (原语义) ---- */
+    const proxyMode = await isProxyEngineMode(db)
+
+    if (proxyMode) {
+      // 各账号并行下发任务, 统一等待代理回报 (每账号一任务, 代理串行逐账号执行)
+      const TIMEOUT_MS = 20_000
+      const settled = await Promise.all(
+        accounts.map(async (acct) => ({ acct, r: await fetchOrdersViaProxy(db, String(acct.id), { queryCode: 'ALL', pages: MAX_LIST_PAGES, timeoutMs: TIMEOUT_MS }) })),
+      )
+      for (const { acct, r } of settled) {
+        if (r.errors.length) listErrors.push(`${acct.id}: ${r.errors.join('; ').slice(0, 200)}`)
+        if (r.items.length) {
+          const ur = await upsertSoldOrders(db, String(acct.id), r.items)
+          listInserted += ur.inserted
+          listUpdated += ur.updated
         }
-        if (pg.retMsg) {
-          listErrors.push(`${acct.id}: ${pg.retMsg.slice(0, 120)}`)
-          break
+      }
+    } else {
+      for (const acct of accounts) {
+        let cookieStr = String(acct.value || '')
+        let page = 1
+        while (page <= MAX_LIST_PAGES) {
+          const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
+          if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+            cookieStr = pg.finalCookieStr
+            await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, acct.id]).catch(() => {})
+          }
+          if (pg.retMsg) {
+            listErrors.push(`${acct.id}: ${pg.retMsg.slice(0, 120)}`)
+            break
+          }
+          if (pg.items.length) {
+            const r = await upsertSoldOrders(db, String(acct.id), pg.items)
+            listInserted += r.inserted
+            listUpdated += r.updated
+          }
+          if (!pg.nextPage || !pg.items.length) break
+          page++
+          await new Promise((r) => setTimeout(r, 400))
         }
-        if (pg.items.length) {
-          const r = await upsertSoldOrders(db, String(acct.id), pg.items)
-          listInserted += r.inserted
-          listUpdated += r.updated
-        }
-        if (!pg.nextPage || !pg.items.length) break
-        page++
-        await new Promise((r) => setTimeout(r, 400))
       }
     }
 
-    /* ---- 第二步: 非终态订单详情精修 (规格/城市等列表接口不含的字段) ---- */
-    const rows = await db.all<any>(
-      `SELECT o.order_id, o.cookie_id, o.order_status FROM orders o
-       WHERE o.order_status IN ('pending_ship', 'processing', 'refunding', 'unknown')
-          OR o.order_status IS NULL OR o.order_status = ''
-       ${cookieFilter ? 'AND o.cookie_id = ?' : ''}
-       ORDER BY o.updated_at DESC LIMIT 200`,
-      cookieFilter ? [cookieFilter] : [],
-    )
+    /* ---- 第二步: 非终态订单详情精修 (规格/城市等列表接口不含的字段) ----
+     * 独立代理模式跳过: 详情接口同为 h5api 直连 (CF 被墙), 逐单任务等待在请求预算内
+     * 不可能完成; 列表接口已含 状态/金额/买家/收货人 核心字段, 满足订单管理页展示 ---- */
+    const rows = proxyMode
+      ? []
+      : await db.all<any>(
+          `SELECT o.order_id, o.cookie_id, o.order_status FROM orders o
+           WHERE o.order_status IN ('pending_ship', 'processing', 'refunding', 'unknown')
+              OR o.order_status IS NULL OR o.order_status = ''
+           ${cookieFilter ? 'AND o.cookie_id = ?' : ''}
+           ORDER BY o.updated_at DESC LIMIT 200`,
+          cookieFilter ? [cookieFilter] : [],
+        )
     const targets = rows.filter((r) => !statusFilter || String(r.order_status || 'unknown') === statusFilter)
 
     const cookieCache = new Map<string, string>()
@@ -148,6 +173,8 @@ export default defineEventHandler(
           updated: listUpdated,
           accounts: accounts.length,
           errors: listErrors,
+          mode: proxyMode ? 'proxy' : 'direct',
+          detail_refine: proxyMode ? 'skipped (代理模式: 详情接口 CF 不可直连, 列表字段已含核心数据)' : 'executed',
         },
       },
       listInserted || listUpdated ? `订单列表已同步: 新拉取 ${listInserted} 单, 更新 ${listUpdated} 单` : '订单列表已同步',

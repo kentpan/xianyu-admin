@@ -28,7 +28,8 @@
  *     { "type": "system", "account": "xy_1", "event_id", "red_reminder", "item_id", "buyer_id",
  *       "order_id", "chat_id" },
  *     { "type": "risk",   "account": "xy_1", "event_id", "description" },
- *     { "type": "action_result", "account": "xy_1", "log_id", "ok", "error" }
+ *     { "type": "action_result", "account": "xy_1", "log_id", "ok", "error" },
+ *     { "type": "task_result", "task_id", "ok", "data" }   // engine_tasks 通道回报
  *   ],
  *   "pull": ["evt_1", ...]   // 新版代理: 拉取这些事件的决策结果 (快速 ACK 模式的回收通道)
  * }
@@ -104,6 +105,23 @@ export default defineEventHandler(
     const pending: string[] = []
 
     for (const ev of events) {
+      // ---- 任务执行结果回报 (engine_tasks 通道): fetch_orders 等代理侧执行的落库任务 ----
+      // (必须在 account 守卫之前: task_result 不携带账号且不走去重/决策链)
+      if (ev.type === 'task_result') {
+        const taskId = Number(ev.task_id || 0)
+        if (taskId > 0) {
+          const resultJson = JSON.stringify(ev.data ?? {}).slice(0, 500_000)
+          await db
+            .run(
+              `UPDATE engine_tasks SET result = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND status IN ('pending', 'running')`,
+              [resultJson, ev.ok ? 'done' : 'failed', taskId],
+            )
+            .catch(() => {})
+        }
+        continue
+      }
+
       const account = String(ev?.account || '')
       if (!account) continue
       try {
@@ -134,6 +152,7 @@ export default defineEventHandler(
           continue
         }
 
+        // ---- 任务执行结果回报 (engine_tasks 通道): 已前移至 account 守卫之前 (task_result 不带账号) ----
         if (ev.type !== 'chat' && ev.type !== 'system' && ev.type !== 'risk') continue
 
         // 风控事件轻量 (无外呼决策), 内联处理

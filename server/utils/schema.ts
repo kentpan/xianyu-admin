@@ -817,6 +817,23 @@ const MIGRATIONS: string[] = [
   )`,
   // 事件决策占位: 快速 ACK 模式下先占位再后台决策 (1=决策中; actions_json='' 未完成不重放)
   `ALTER TABLE engine_event_dedup ADD COLUMN pending INTEGER DEFAULT 0`,
+  // 引擎任务下发 (落库, CF serverless 多实例/多进程可见): 独立代理模式下后台无法直连
+  // 闲鱼 mtop 网关 (h5api 出口被墙), 订单拉取等需要"可达闲鱼的机器执行"的工作以任务行
+  // 中转 — 后台写任务 (pending), 代理轮询领取 (running), 结果经 events task_result 回报
+  // (done/failed)。CF 上与扫码登录会话落库 (qr_login_sessions) 同一设计动因。
+  `CREATE TABLE IF NOT EXISTS engine_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type VARCHAR(32) NOT NULL,
+    payload TEXT DEFAULT '',
+    result TEXT DEFAULT '',
+    status VARCHAR(16) DEFAULT 'pending',
+    engine_id INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_enginetasks_status ON engine_tasks(status, engine_id, id)`,
+  // 任务行生命周期 (查询侧守护, 不用 trigger): 领取/写入超过 120s 仍 pending/running
+  // 一律判 expired (代理中断/无代理在线), 由 order-task 轮询侧与 tasks 领取侧顺手清理
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

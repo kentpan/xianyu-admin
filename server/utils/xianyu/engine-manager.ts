@@ -13,6 +13,7 @@ import { XianyuAccountClient, type AccountState, type ManualTokenOutcome } from 
 import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 import { fetchItemList, polishItem, fetchOrderDetail, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
+import { isProxyEngineMode, sendTextViaProxy } from './order-task'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from './brain'
 import { dispatchNotify } from '../notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from './publisher'
@@ -274,7 +275,11 @@ async function executeActions(actions: EngineAction[]): Promise<void> {
   }
 }
 
-/** 后台手动发送 (消息管理页): 账号必须由内置引擎托管且在线。 */
+/**
+ * 后台手动发送 (消息管理页): 内置引擎托管账号直发; 独立代理模式走任务通道
+ * (engine_tasks → 代理本地 WS 发送 → task_result 回报) — 代理部署形态主动外呼,
+ * 后台无法直连代理, WS 发送只能由长连接所在代理执行。
+ */
 export async function sendTextToAccount(
   cookieId: string,
   chatId: string,
@@ -282,9 +287,19 @@ export async function sendTextToAccount(
   text: string,
 ): Promise<void> {
   const client = runtime.clients.get(cookieId)
-  if (!client) throw new Error(`账号 ${cookieId} 不由内置引擎托管 (切换引擎或账号未启用)`)
-  await client.sendText(chatId, toUserId, text)
-  await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text')
+  if (client) {
+    await client.sendText(chatId, toUserId, text)
+    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text')
+    return
+  }
+  const db = await getDb()
+  if (await isProxyEngineMode(db)) {
+    const r = await sendTextViaProxy(db, cookieId, chatId, toUserId, text)
+    if (!r.ok) throw new Error(r.error || '代理发送失败')
+    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text')
+    return
+  }
+  throw new Error(`账号 ${cookieId} 不由内置引擎托管 (切换引擎或账号未启用)`)
 }
 
 /** 账号 WS 客户端直取 (会话列表拉取等协议请求用)。 */
