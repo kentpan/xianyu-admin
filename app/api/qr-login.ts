@@ -10,7 +10,7 @@ export interface QrLoginStatusResponse {
   xianyuUid?: string
   xianyuNick?: string
   cookieValue?: string
-  /** 风控二次核验页链接 (passport 官方页, 前端弹窗 iframe 直嵌, 页面内完成人脸/滑块核验) */
+  /** 风控二次核验页链接 (passport 官方页, 前端按钮新开顶部标签页打开完成人脸/滑块核验) */
   iframeRedirectUrl?: string
 }
 

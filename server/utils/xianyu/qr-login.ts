@@ -529,9 +529,10 @@ export async function pollQrStatus(sessionKey: string): Promise<QrPollResult> {
     qdata.iframeRedirect === true || qdata.iframeRedirect === 'true'
 
   // Risk-control / face verification branch — 伴随状态而非终态:
-  // 前端把核验页 (ivCheckLogin.htm) 直接 iframe 嵌入弹窗, 用户在页面内完成人脸/滑块
-  // (官方无 X-Frame-Options 限制且字段名即 iframeRedirectUrl, 本就是 iframe 嵌入设计),
-  // 核验通过后同一会话 (t/ck) 的 query.do 会返回 CONFIRMED, 在此直接继续正常轮询即可自动完成登录。
+  // 前端把核验页 (ivCheckLogin.htm) 链接做成按钮, 用户点击在新标签页 (顶部框架, 第一方
+  // cookie 可用; iframe 内第三方 cookie 被拦截会导致官方页报过期, 故不用 iframe)
+  // 完成人脸/滑块, 核验通过后同一会话 (t/ck) 的 query.do 会返回 CONFIRMED,
+  // 在此直接继续正常轮询即可自动完成登录。
   if (iframeRedirect) {
     const isFirstVerify = session.status !== 'verification_required'
     session.status = 'verification_required'
