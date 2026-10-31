@@ -472,6 +472,8 @@ CREATE TABLE keywords (
     item_id VARCHAR(64) DEFAULT '',
     type VARCHAR(16) DEFAULT 'text',
     image_url TEXT,
+    delay_min REAL DEFAULT 0,
+    delay_max REAL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 

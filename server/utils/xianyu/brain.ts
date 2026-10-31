@@ -879,7 +879,7 @@ async function matchKeywordReply(
   vars: Record<string, string>,
 ): Promise<KeywordHit> {
   const rows = await db.all<any>(
-    'SELECT keyword, reply, item_id, type, image_url FROM keywords WHERE cookie_id = ?',
+    'SELECT keyword, reply, item_id, type, image_url, delay_min, delay_max FROM keywords WHERE cookie_id = ?',
     [cookieId],
   )
   const content = msg.content.toLowerCase()
@@ -887,12 +887,19 @@ async function matchKeywordReply(
   const general = rows.filter((r) => !r.item_id)
   for (const pool of [bound, general]) {
     for (const row of pool) {
-      if (!content.includes(String(row.keyword).toLowerCase())) continue
+      // 关键词支持 | 分隔多个 (| 两侧任意空格自动忽略, 拆分后逐个 trim), 任一命中即触发
+      const kws = String(row.keyword || '')
+        .toLowerCase()
+        .split('|')
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+      if (!kws.length || !kws.some((k) => content.includes(k))) continue
+      const delayMs = ruleReplyDelayMs(row)
       if (row.type === 'image' && row.image_url) {
         return {
           result: 'hit',
           keyword: row.keyword,
-          actions: [imageAction(cookieId, msg, row.image_url, 0)],
+          actions: [imageAction(cookieId, msg, row.image_url, delayMs)],
           preview: `[图片] ${row.image_url}`,
         }
       }
@@ -900,10 +907,39 @@ async function matchKeywordReply(
         return { result: 'empty', keyword: row.keyword, actions: [] }
       }
       const text = applyVars(String(row.reply), vars)
-      return { result: 'hit', keyword: row.keyword, actions: [textAction(cookieId, msg, text)], preview: text }
+      return { result: 'hit', keyword: row.keyword, actions: [textAction(cookieId, msg, text, delayMs)], preview: text }
     }
   }
   return { result: 'none', actions: [] }
+}
+
+/**
+ * 高斯分布随机延时 (Box-Muller 变换), mean/stddev 均为毫秒。
+ * 输出呈自然钟形曲线 (如 mean=2500/stddev=800 → 有时 1800ms 有时 3200ms 有时 2500ms),
+ * 下限 800ms 防止分布尾部落在负数或过小值。
+ */
+function gaussianDelay(mean: number, stddev: number): number {
+  let u1 = Math.random()
+  if (u1 <= 0) u1 = 1e-9 // 防 log(0) → -Infinity
+  const u2 = Math.random()
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)
+  return Math.max(800, Math.round(mean + z * stddev))
+}
+
+/**
+ * 关键词规则「回复随机延时」: 规则表存秒 (delay_min/delay_max), 动作用毫秒。
+ *   都留空/都 0 → 0 (立即回复, 维持原行为);
+ *   min == max 且 > 0 → 固定延时 (精确 min 秒, 不套高斯下限);
+ *   min < max → 高斯分布随机延时 (均值取区间中点, 标准差取半宽);
+ *   min > max → 交换后按 min < max 处理 (容错填反)。
+ * 返回动作 delay_ms (毫秒); 引擎发送队列自身的人化间隔照常生效。
+ */
+function ruleReplyDelayMs(row: { delay_min?: unknown; delay_max?: unknown }): number {
+  let min = Math.max(0, Math.round((Number(row?.delay_min) || 0) * 1000))
+  let max = Math.max(0, Math.round((Number(row?.delay_max) || 0) * 1000))
+  if (min > max) [min, max] = [max, min]
+  if (!max || min === max) return min
+  return gaussianDelay(Math.round((min + max) / 2), Math.round((max - min) / 2))
 }
 
 /* ---------------------------------- AI 回复 (语义对齐 butler ai_reply_engine) ---------------------------------- */

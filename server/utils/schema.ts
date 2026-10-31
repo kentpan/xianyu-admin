@@ -49,6 +49,8 @@ const SCHEMA: string[] = [
     item_id VARCHAR(64) DEFAULT '',
     type VARCHAR(16) DEFAULT 'text',
     image_url TEXT,
+    delay_min REAL DEFAULT 0,
+    delay_max REAL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS item_info (
@@ -696,6 +698,9 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE message_notifications ADD COLUMN event_types TEXT`,
   // 监听引擎: 回连来源 IP (cf-connecting-ip/XFF, 不可伪造) — 登记地址与回连来源一致即真实部署点
   `ALTER TABLE engines ADD COLUMN last_poll_ip VARCHAR(64) DEFAULT ''`,
+  // 关键词回复: 回复随机延时 (秒; 都空/0=立即, min==max=固定, min<max=高斯随机) — 配套关键词 | 分隔多匹配
+  `ALTER TABLE keywords ADD COLUMN delay_min REAL DEFAULT 0`,
+  `ALTER TABLE keywords ADD COLUMN delay_max REAL DEFAULT 0`,
   // 扫码登录: 会话状态机落库 (serverless 跨隔离实例 + 重启存活) — 表单参数/cookie jar/人脸核验二维码
   `ALTER TABLE qr_login_sessions ADD COLUMN params_json TEXT`,
   `ALTER TABLE qr_login_sessions ADD COLUMN jar_json TEXT`,
