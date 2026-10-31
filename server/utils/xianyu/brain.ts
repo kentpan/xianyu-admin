@@ -1585,27 +1585,8 @@ async function autoDeliver(
         .catch(() => {})
     }
 
-    // 无需邮寄发货 (真实平台接口 mtop.taobao.idle.logistic.consign.dummy, 已实测幂等):
-    // 规则 ship_mode 优先; 旧行为兼容: 未配置时沿用账号级 auto_confirm 开关
-    const shipMode = String(rule.ship_mode || (accountRow?.auto_confirm ? 'dummy_consign' : 'none') || 'none')
-    if (shipMode === 'dummy_consign' && orderId) {
-      // (v2.1.6) 决策后台 sleep 硬上限 60s: delay_seconds 配置过大曾拖垮决策 (占位3分钟即判失效,
-      // 代理重报死循环, 发货/发消息全部停滞); 卡券延迟语义保留, 仅封顶防决策超时
-      if (delayMs > 0) await sleep(Math.min(delayMs, 60_000))
-      const confirm = await confirmOrderShipped(String(accountRow?.value || ''), orderId)
-      if (confirm.finalCookieStr && confirm.finalCookieStr !== accountRow?.value) {
-        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [confirm.finalCookieStr, cookieId]).catch(() => {})
-      }
-      await db
-        .run(
-          'UPDATE orders SET consign_status = ?, consign_message = ?, consign_at = CURRENT_TIMESTAMP WHERE order_id = ?',
-          [confirm.success ? 'success' : 'failed', confirm.message.slice(0, 240), orderId],
-        )
-        .catch(() => {})
-      logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货: ${confirm.success ? '成功' : `失败 (${confirm.message.slice(0, 120)})`}`)
-    }
-
-    // 卡密型: 先落库生成记录 (唯一约束防重发, 冲突自动重试换码), 保证文案与落库码一致
+    // 卡密型: 先落库生成记录 (唯一约束防重发, 冲突自动重试换码)。
+    // (v2.1.7) persist 前移到发货之前: 无需邮寄发货凭证必须携带最终落库卡密, 保证凭证/文案/落库三者一致
     if (extract.generatedCodes?.length) {
       for (let i = 0; i < extract.generatedCodes.length; i++) {
         const finalCode = await persistCardCode(
@@ -1627,13 +1608,69 @@ async function autoDeliver(
       deliverVars.code = extract.generatedCodes[0]
     }
 
+    // 发货凭证文本: 文本 parts 按发送顺序换行拼接 (与聊天内容同源同序; 图片无法进凭证)
+    const voucherTexts: string[] = []
+    for (let i = 0; i < total; i++) {
+      const content = extract.items[i % extract.items.length]
+      for (const part of content.parts) {
+        if (part.kind === 'text') voucherTexts.push(part.value)
+      }
+    }
+
+    // 无需邮寄发货 (真实平台接口 mtop.taobao.idle.logistic.consign.dummy, 已实测幂等):
+    // 规则 ship_mode 优先; 旧行为兼容: 未配置时沿用账号级 auto_confirm 开关
+    const shipMode = String(rule.ship_mode || (accountRow?.auto_confirm ? 'dummy_consign' : 'none') || 'none')
+    // (v2.1.7) viaVoucher: 文本发货内容已随无需邮寄发货接口作为「发货凭证」提交平台
+    // (consign.dummy tradeText, 语义对齐参考项目 confirm_service.py 无需邮寄凭证),
+    // 买家在闲鱼订单发货信息中查看验证码/卡密, 不再以聊天消息发送 (避免站外引流类风控)
+    let viaVoucher = false
+    if (shipMode === 'dummy_consign' && orderId) {
+      // (v2.1.6) 决策后台 sleep 硬上限 60s: delay_seconds 配置过大曾拖垮决策 (占位3分钟即判失效,
+      // 代理重报死循环, 发货/发消息全部停滞); 卡券延迟语义保留, 仅封顶防决策超时
+      if (delayMs > 0) await sleep(Math.min(delayMs, 60_000))
+      const confirm = await confirmOrderShipped(
+        String(accountRow?.value || ''),
+        orderId,
+        voucherTexts.join('\n').slice(0, 1000),
+      )
+      if (confirm.finalCookieStr && confirm.finalCookieStr !== accountRow?.value) {
+        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [confirm.finalCookieStr, cookieId]).catch(() => {})
+      }
+      await db
+        .run(
+          'UPDATE orders SET consign_status = ?, consign_message = ?, consign_at = CURRENT_TIMESTAMP WHERE order_id = ?',
+          [confirm.success ? 'success' : 'failed', confirm.message.slice(0, 240), orderId],
+        )
+        .catch(() => {})
+      logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货: ${confirm.success ? '成功 (发货凭证已提交平台)' : `失败 (${confirm.message.slice(0, 120)})`}`)
+      if (!confirm.success) {
+        // (v2.1.7) 平台发货未达成 → 不标记已发货/不落发货记录, 发货内容也不降级为聊天消息;
+        // 后续触发 ([记得及时发货]/付款卡片重报) 由防重链自动重试, 防止买家什么都收不到
+        await failLog(`无需邮寄发货失败 (${confirm.message.slice(0, 200)}), 发货内容未提交, 订单未标记已发货`)
+        dispatchNotify(
+          {
+            type: 'delivered',
+            cookieId,
+            title: '自动发货失败 · 无需邮寄发货失败',
+            fields: { 订单号: orderId, 原因: confirm.message.slice(0, 150) },
+            link: '/orders',
+          },
+          orderId,
+        )
+        return []
+      }
+      viaVoucher = voucherTexts.length > 0
+    }
+
     const actions: EngineAction[] = []
-    // 卡券内容交付消息 (是否发送/发什么由卡券管理配置决定):
-    // 卡密型按份生成随机卡密并渲染文案模板, 文本/API/图片型原样发送内容
+    // 卡券内容交付 (是否发送/发什么由卡券管理配置决定):
+    // (v2.1.7) 无需邮寄发货成功时文本内容已随发货凭证提交平台, 不再占用聊天消息; 图片内容仍聊天发送。
+    // 其余模式 (仅发消息/跟随账号) 保持原行为: 文本+图片均聊天发送
     for (let i = 0; i < total; i++) {
       const content = extract.items[i % extract.items.length]
       for (const part of content.parts) {
         if (part.kind === 'text') {
+          if (viaVoucher) continue
           actions.push({
             type: 'send_text',
             account: cookieId,
@@ -1704,7 +1741,9 @@ async function autoDeliver(
       reply_strategy: 'delivery',
       matched_keyword: `规则 #${rule.id} · 卡券「${card.name}」× ${total}`,
       reply_text: extract.items.map((c) => c.preview).join(' | ').slice(0, 400),
-      send_status: 'pending',
+      // (v2.1.7) 凭证模式且无聊天动作时直接落终态「发货凭证」; 有消息动作仍走 pending→代理回报闭环
+      send_status: actions.length ? 'pending' : viaVoucher ? 'voucher' : 'pending',
+      ...(viaVoucher ? { error_message: '发货方式: 无需邮寄发货凭证 (买家在订单发货信息中查看)' } : {}),
     })
     dispatchNotify(
       {
@@ -1715,6 +1754,7 @@ async function autoDeliver(
           订单号: orderId,
           商品ID: ctx.itemId || '未知',
           发送内容: `${total} 份`,
+          发货方式: viaVoucher ? '无需邮寄发货凭证 (买家在订单中查看, 不占聊天消息)' : '聊天消息',
           ...(extract.generatedCodes?.length ? { 卡密: extract.generatedCodes.join(', ') } : {}),
           规则: `#${rule.id}`,
         },

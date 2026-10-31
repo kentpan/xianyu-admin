@@ -486,14 +486,20 @@ export async function fetchItemDetail(cookieStr: string, itemId: string): Promis
  * 虚拟发货确认 (语义对齐 butler auto_confirm / secure_confirm_decrypted)。
  * api=mtop.taobao.idle.logistic.consign.dummy, data={"orderId":...,"tradeText":"","picList":[],"newUnconsign":true}
  *
+ * (v2.1.7) tradeText = 无需邮寄发货凭证内容 (语义对齐参考项目 confirm_service.py "无需邮寄凭证内容"):
+ * 卡密/验证码等发货内容随本接口提交平台, 买家在闲鱼订单的发货信息(发货凭证)中查看;
+ * 传空时请求与原实现字节级一致 (人工发货等场景零影响)。
+ *
+ * @param tradeText 发货凭证内容 (默认空串 = 不带凭证, 与历史行为完全一致)
  * @returns { success, message, finalCookieStr } — 系统侧订单状态置为已发货
  */
 export async function confirmOrderShipped(
   cookieStr: string,
   orderId: string,
+  tradeText = '',
 ): Promise<{ success: boolean; message: string; finalCookieStr: string }> {
   if (!orderId) return { success: false, message: '缺少订单号', finalCookieStr: cookieStr }
-  const data = { orderId: String(orderId), tradeText: '', picList: [], newUnconsign: true }
+  const data = { orderId: String(orderId), tradeText: String(tradeText || ''), picList: [], newUnconsign: true }
   const r = await mtopCall<any>('mtop.taobao.idle.logistic.consign.dummy', data, cookieStr, {
     method: 'POST',
   })
