@@ -598,13 +598,24 @@ export function parseSyncItem(data: string, myId: string): ParsedMessage {
   const m10 = m1 && typeof m1 === 'object' ? m1['10'] : null
   if (!m10 || typeof m10 !== 'object') {
     if (redReminder) {
+      // 会话 ID 提取 (两类卡片变体统一): ① 极简交易卡片 message['1'] 为 "<会话ID>@goofish"
+      // 字符串 (结构 = {"1":"<cid>@goofish","2":"1","3":{redReminder},"4":"<ts>"});
+      // ② m1 为对象但无聊天体 (m10) 时会话 ID 在 m1['2'] (与聊天消息同源)。
+      // 会话 ID 是无聊天体卡片唯一可用的业务上下文 — 丢失它, 后台付款兜底只剩商品/买家
+      // 维度 (本卡片常均无), 必然落空并在决策日志谎报「发货失败」(实际发货由随后的付款卡片完成)。
+      const minimalChatId =
+        typeof m1 === 'string' && m1.includes('@')
+          ? m1.split('@')[0] || ''
+          : m1 && typeof m1 === 'object'
+            ? String(m1['2'] ?? '').split('@')[0] || ''
+            : ''
       return {
         kind: 'system',
         redReminder,
         itemId,
         buyerId: '',
         orderId: extractOrderId(message),
-        chatId: '',
+        chatId: minimalChatId,
         cardTitle: card.title,
         amount: card.amount,
         raw: message,
