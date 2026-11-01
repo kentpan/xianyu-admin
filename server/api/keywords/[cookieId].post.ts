@@ -18,7 +18,7 @@ export default defineEventHandler(
 
     const r = await db.run(
       `INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?)`,
       [cookieId, keyword, reply, item_id, type, image_url],
     )
 
