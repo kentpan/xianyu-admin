@@ -1715,19 +1715,10 @@ async function autoDeliver(
         .catch(() => {})
       logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货: ${confirm.success ? '成功 (发货凭证已提交平台)' : `失败 (${confirm.message.slice(0, 120)})`}`)
       if (!confirm.success) {
-        // (v2.1.7) 平台发货未达成 → 不标记已发货/不落发货记录, 发货内容也不降级为聊天消息;
-        // 后续触发 ([记得及时发货]/付款卡片重报) 由防重链自动重试, 防止买家什么都收不到
-        await failLog(`无需邮寄发货失败 (${confirm.message.slice(0, 200)}), 发货内容未提交, 订单未标记已发货`)
-        dispatchNotify(
-          {
-            type: 'delivered',
-            cookieId,
-            title: '自动发货失败 · 无需邮寄发货失败',
-            fields: { 订单号: orderId, 原因: confirm.message.slice(0, 150) },
-            link: '/orders',
-          },
-          orderId,
-        )
+        // (v2.1.16) 平台发货未达成 → 不标记已发货/不落发货记录, 发货内容也不降级为聊天消息。
+        // 不再落红色「发货失败」日志/弹失败通知: 典型场景是发货先于付款事件到达 (买家拍下未付款),
+        // 平台如实报 ORDER_STATUS_ERROR 属瞬时误报 — 后续 [记得及时发货]/付款卡片重报 会经防重链
+        // 自动重试并正常发货 (失败时未设冷却、未标记已发货, 重试链路原样保留), 仅保留 console 记录可排查
         return []
       }
       viaVoucher = voucherTexts.length > 0
