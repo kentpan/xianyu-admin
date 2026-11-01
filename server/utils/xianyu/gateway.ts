@@ -26,11 +26,14 @@ export interface GatewayTarget {
   token: string
 }
 
-/** 网关透传结果 (与直连 fetch 同构: 状态码 + 响应文本 + Set-Cookie 列表)。 */
+/** 网关透传结果 (与直连 fetch 同构: 状态码 + 响应文本 + Set-Cookie 列表 + 响应头)。
+ *  headers 供 302 跳转链取 location 等单值头 (qr-login 人脸核验链逐跳驱动必需);
+ *  旧版代理 (<v2.1.16) 不回 headers → 空对象, 调用方对跳转链须如实报「网关需升级」。 */
 export interface GatewayRelayResult {
   status: number
   text: string
   setCookie: string[]
+  headers: Record<string, string>
 }
 
 /** 目标解析缓存 (15s): 引擎行 host/port/token 变更最迟 15s 生效; mtop 高频调用不逐次查库。 */
@@ -126,5 +129,8 @@ export async function relayMtopRequest(
     status: Number(payload.status) || 0,
     text: String(payload.text || ''),
     setCookie: Array.isArray(payload.set_cookie) ? payload.set_cookie.map(String) : [],
+    headers: payload.headers && typeof payload.headers === 'object' && !Array.isArray(payload.headers)
+      ? Object.fromEntries(Object.entries(payload.headers).map(([k, v]) => [String(k), String(v)]))
+      : {},
   }
 }

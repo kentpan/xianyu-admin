@@ -28,8 +28,22 @@ export interface MenuRow {
   enabled: number
 }
 
+/** 内置菜单分组 (不可删, 标签可改): 侧边栏分组标题单源。 */
+export const BUILTIN_MENU_GROUPS: Array<{ key: string; label: string; sort: number }> = [
+  { key: 'main', label: '主菜单', sort: 0 },
+  { key: 'admin', label: '管理员', sort: 1 },
+  { key: 'bottom', label: '其他', sort: 2 },
+]
+
 /** 幂等补种: 菜单种子 (按 path 去重, NAV_ITEMS 新增菜单自动入表) + 内置角色 + 存量用户兜底。 */
 export async function seedRbac(db: DatabaseAdapter): Promise<void> {
+  // 0) 菜单分组种子 (INSERT OR IGNORE 幂等): 内置 main/admin/bottom, 菜单管理分组配置页可新增自定义组
+  for (const g of BUILTIN_MENU_GROUPS) {
+    await db
+      .run('INSERT OR IGNORE INTO menu_groups (key, label, is_system, sort_order) VALUES (?, ?, 1, ?)', [g.key, g.label, g.sort])
+      .catch(() => {})
+  }
+
   // 1) 菜单种子: 已存在 (按 path) 的跳过, 名称/图标/排序不覆盖 (菜单管理页可自定义)
   const existing = new Set(
     (await db.all<{ path: string }>('SELECT path FROM menus').catch(() => [])).map((r) => r.path),
@@ -114,6 +128,24 @@ export async function getMenusForUser(db: DatabaseAdapter, userId: number, isAdm
 export async function userHasMenuPath(db: DatabaseAdapter, userId: number, isAdmin: boolean, path: string): Promise<boolean> {
   const menus = await getMenusForUser(db, userId, isAdmin)
   return menus.some((m) => path === m.path || path.startsWith(m.path + '/'))
+}
+
+/** 菜单分组行 (侧边栏标题/菜单管理分组配置共用)。 */
+export interface MenuGroupRow {
+  id: number
+  key: string
+  label: string
+  is_system: number
+  sort_order: number
+}
+
+/** 按排序取全部分组 (侧边栏 SSR 标题 + 菜单/角色管理页共用)。 */
+export async function getMenuGroups(db: DatabaseAdapter): Promise<MenuGroupRow[]> {
+  return (
+    (await db
+      .all<MenuGroupRow>('SELECT id, key, label, is_system, sort_order FROM menu_groups ORDER BY sort_order, id')
+      .catch(() => [])) || []
+  )
 }
 
 /** 平铺菜单行 → 树 (菜单管理页用)。 */

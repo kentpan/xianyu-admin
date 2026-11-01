@@ -684,7 +684,7 @@ CREATE TABLE IF NOT EXISTS menus (
   name VARCHAR(64) NOT NULL,
   path VARCHAR(128) NOT NULL UNIQUE,
   icon VARCHAR(64) DEFAULT '',
-  group_name VARCHAR(16) DEFAULT 'main',
+  group_name VARCHAR(32) DEFAULT 'main',
   sort_order INTEGER DEFAULT 0,
   admin_only INTEGER DEFAULT 0,
   enabled INTEGER DEFAULT 1,
@@ -720,3 +720,14 @@ CREATE TABLE IF NOT EXISTS user_roles (
 CREATE INDEX idx_rolemenu_role ON role_menus(role_id, menu_id);
 
 CREATE INDEX idx_userrole_user ON user_roles(user_id, role_id);
+
+-- 菜单分组 (v2.1.15): 侧边栏分组标题/排序可配置; group_name 引用本表 key, 内置 main/admin/bottom 种子不可删
+CREATE TABLE IF NOT EXISTS menu_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key VARCHAR(32) NOT NULL UNIQUE,
+  label VARCHAR(64) NOT NULL,
+  is_system INTEGER DEFAULT 0,
+  sort_order INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

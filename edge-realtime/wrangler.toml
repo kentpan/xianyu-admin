@@ -34,3 +34,14 @@ class_name = "EdgeRealtimeDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["EdgeRealtimeDO"]
+
+# ==== 定时备份 Cron Triggers (v2.1.15) ====
+# 每分钟触发一次 scheduled → 回调站点 /api/admin/backup/cron (到点判定在站点侧:
+# enabled + 每 X 天 X时X分X秒, 见 server/utils/backup-runner.ts)。
+# 启用需同时配置:
+#   [vars]
+#   SITE_URL = "https://xianyu-admin.pages.dev"   # 站点地址
+#   # BACKUP_TOKEN 用 secret 存放(不入库): 备份管理页生成令牌后
+#   # printf '%s' "<令牌>" | npx wrangler secret put BACKUP_TOKEN -c edge-realtime/wrangler.toml
+# [triggers]
+# crons = ["* * * * *"]

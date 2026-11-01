@@ -161,4 +161,29 @@ export default {
     }
     return json(fail('Not Found'), 404)
   },
+
+  /**
+   * Cron Triggers (v2.1.15): 定时备份调度 — 每分钟回调站点备份端点, 到点判定在站点侧
+   * (enabled + 每 X 天 X时X分X秒, 见 server/utils/backup-runner.ts isBackupDue)。
+   * 配置 (wrangler.toml): [triggers] crons = ["* * * * *"] + vars SITE_URL / BACKUP_TOKEN
+   * (BACKUP_TOKEN = 备份管理页生成的回调令牌)。
+   */
+  async scheduled(event, env, ctx) {
+    const site = String(env.SITE_URL || '').replace(/\/+$/, '')
+    const token = String(env.BACKUP_TOKEN || '')
+    if (!site || !token) {
+      console.log('[edge-realtime] cron: SITE_URL/BACKUP_TOKEN 未配置, 跳过定时备份回调')
+      return
+    }
+    try {
+      const res = await fetch(`${site}/api/admin/backup/cron?token=${encodeURIComponent(token)}`, {
+        method: 'POST',
+        headers: { 'x-backup-token': token },
+      })
+      const text = await res.text().catch(() => '')
+      console.log(`[edge-realtime] cron backup callback: status=${res.status} body=${text.slice(0, 200)}`)
+    } catch (e) {
+      console.log(`[edge-realtime] cron backup callback failed: ${e && e.message}`)
+    }
+  },
 }

@@ -31,7 +31,7 @@ const SCHEMA: string[] = [
     name VARCHAR(64) NOT NULL,
     path VARCHAR(128) NOT NULL UNIQUE,
     icon VARCHAR(64) DEFAULT '',
-    group_name VARCHAR(16) DEFAULT 'main',
+    group_name VARCHAR(32) DEFAULT 'main',
     sort_order INTEGER DEFAULT 0,
     admin_only INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
@@ -59,6 +59,16 @@ const SCHEMA: string[] = [
     role_id INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, role_id)
+  )`,
+  // 菜单分组 (v2.1.15): 侧边栏分组标题/排序可配置; group_name 引用本表 key, 内置 main/admin/bottom 种子不可删
+  `CREATE TABLE IF NOT EXISTS menu_groups (
+    id __AUTO__,
+    key VARCHAR(32) NOT NULL UNIQUE,
+    label VARCHAR(64) NOT NULL,
+    is_system INTEGER DEFAULT 0,
+    sort_order INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS cookies (
     id VARCHAR(64) PRIMARY KEY,
@@ -146,7 +156,6 @@ const SCHEMA: string[] = [
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    // 状态时间 (v2.1.15): 付款/发货/完成/取消 — 卖家列表接口能提取到才写入, 空则 NULL 不伪造
     paid_at TIMESTAMP,
     shipped_at TIMESTAMP,
     finished_at TIMESTAMP,
@@ -719,6 +728,8 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN finished_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN cancelled_at TIMESTAMP`,
+  // 菜单分组 (v2.1.15): group_name 列宽扩到 32 (SQLite/D1 不限长自动生效, 仅 MySQL 需要)
+  `ALTER TABLE menus MODIFY group_name VARCHAR(32) DEFAULT 'main'`,
   // 监听引擎: 账号级买家互动开关 + 公开资料回写列
   `ALTER TABLE cookies ADD COLUMN auto_rate_enabled INTEGER DEFAULT 0`,
   `ALTER TABLE cookies ADD COLUMN auto_flower_enabled INTEGER DEFAULT 0`,
@@ -930,6 +941,29 @@ const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = 
   { key: 'order_sync_interval', value: '1800', description: '订单同步间隔(秒, 最低1800)' },
   { key: 'auto_polish_enabled', value: 'false', description: '商品自动擦亮开关' },
   { key: 'auto_polish_interval', value: '86400', description: '商品自动擦亮间隔(秒)' },
+  // 备份管理 (v2.1.15): 定时备份开关/周期 (默认关闭, 每1天 04:38:00), 备份到 R2 (未配绑定回落本地快照目录)
+  { key: 'backup_enabled', value: 'false', description: '定时备份开关(默认关闭)' },
+  { key: 'backup_interval_days', value: '1', description: '定时备份间隔(天)' },
+  { key: 'backup_hour', value: '4', description: '定时备份时(0-23)' },
+  { key: 'backup_minute', value: '38', description: '定时备份分(0-59)' },
+  { key: 'backup_second', value: '0', description: '定时备份秒(0-59)' },
+  { key: 'backup_tables', value: 'all', description: '定时备份表范围(all=全部白名单表, 或逗号分隔表名)' },
+  { key: 'backup_last_run_at', value: '', description: '上次定时备份时间(ISO)' },
+  { key: 'backup_cron_token', value: '', description: 'Cloudflare 定时任务回调用令牌(空=未启用回调)' },
+  // R2/S3 对象存储 (v2.1.16): 备份存储与外部访问 CDN — 设置页「R2/S3 存储」配置,
+  // 配置齐全时优先于 BACKUP_R2 绑定; R2 无需单独 endpoint (由 account_id 拼装)
+  { key: 'storage_driver', value: 'r2', description: '对象存储类型: r2|s3' },
+  { key: 'r2_account_id', value: '', description: 'R2 账户 ID (endpoint 自动拼装)' },
+  { key: 'r2_access_key_id', value: '', description: 'R2 Access Key ID' },
+  { key: 'r2_secret_access_key', value: '', description: 'R2 Secret Access Key' },
+  { key: 'r2_bucket', value: '', description: 'R2 存储桶名' },
+  { key: 's3_endpoint', value: '', description: 'S3 兼容 endpoint (如 https://s3.amazonaws.com)' },
+  { key: 's3_region', value: 'us-east-1', description: 'S3 区域 (R2 为 auto)' },
+  { key: 's3_access_key_id', value: '', description: 'S3 Access Key ID' },
+  { key: 's3_secret_access_key', value: '', description: 'S3 Secret Access Key' },
+  { key: 's3_bucket', value: '', description: 'S3 存储桶名' },
+  { key: 's3_path_style', value: 'true', description: 'S3 path-style 寻址 (R2/MinIO 必须 true)' },
+  { key: 'storage_cdn_base_url', value: '', description: '外部访问 CDN 域名 (如 https://cdn.example.com)' },
 ]
 
 /**

@@ -1,6 +1,6 @@
 <template>
   <div class="space-y-5 animate-fade-in">
-    <PageHeader title="系统设置" description="通用 / SMTP / 商品同步 等全局配置">
+    <PageHeader title="系统设置" description="通用 / SMTP / 商品同步 / R2·S3 存储 等全局配置">
       <template #actions>
         <button class="btn-secondary" @click="exportConfig" :disabled="exporting">
           <Icon v-if="exporting" name="refresh" class="animate-spin" />
@@ -109,6 +109,58 @@
           </SettingRow>
         </div>
 
+        <!-- R2/S3 存储 -->
+        <div v-if="activeTab === 'storage'" class="space-y-4">
+          <h3 class="font-semibold text-slate-900 dark:text-white">R2/S3 存储</h3>
+          <p class="text-base text-slate-400">备份管理云端存储目标。配置齐全后优先于平台 R2 绑定 (BACKUP_R2) 生效；本地/自托管部署也可用此直连 R2/S3。</p>
+          <SettingRow label="存储类型" desc="Cloudflare R2 或任意 S3 兼容存储">
+            <select v-model="form.storage_driver" class="input">
+              <option value="r2">Cloudflare R2</option>
+              <option value="s3">S3 兼容存储 (AWS S3 / MinIO / OSS / COS)</option>
+            </select>
+          </SettingRow>
+          <template v-if="form.storage_driver === 'r2'">
+            <SettingRow label="R2 账户 ID" desc="Cloudflare 控制台 R2 页右侧 Account ID">
+              <input v-model="form.r2_account_id" class="input" placeholder="a1b2c3..." />
+            </SettingRow>
+            <SettingRow label="R2 Access Key ID" desc="R2 → Manage R2 API Tokens 创建">
+              <input v-model="form.r2_access_key_id" class="input" autocomplete="off" />
+            </SettingRow>
+            <SettingRow label="R2 Secret Access Key">
+              <input v-model="form.r2_secret_access_key" type="password" class="input" autocomplete="new-password" />
+            </SettingRow>
+            <SettingRow label="R2 存储桶名" desc="不存在时可在仓库工作流自动创建 (r2Name)">
+              <input v-model="form.r2_bucket" class="input" placeholder="xianyu-backups" />
+            </SettingRow>
+          </template>
+          <template v-else>
+            <SettingRow label="S3 Endpoint" desc="如 https://s3.amazonaws.com 或 MinIO 地址">
+              <input v-model="form.s3_endpoint" class="input" placeholder="https://s3.amazonaws.com" />
+            </SettingRow>
+            <SettingRow label="S3 区域" desc="AWS 如 us-east-1；R2 为 auto">
+              <input v-model="form.s3_region" class="input" placeholder="us-east-1" />
+            </SettingRow>
+            <SettingRow label="S3 Access Key ID">
+              <input v-model="form.s3_access_key_id" class="input" autocomplete="off" />
+            </SettingRow>
+            <SettingRow label="S3 Secret Access Key">
+              <input v-model="form.s3_secret_access_key" type="password" class="input" autocomplete="new-password" />
+            </SettingRow>
+            <SettingRow label="S3 存储桶名">
+              <input v-model="form.s3_bucket" class="input" placeholder="xianyu-backups" />
+            </SettingRow>
+            <SettingRow label="Path-Style 寻址" desc="R2/MinIO 必须开启；AWS 可关闭用虚拟域名寻址">
+              <Toggle v-model="form.s3_path_style" />
+            </SettingRow>
+          </template>
+          <SettingRow label="外部访问 CDN 域名" desc="绑定自定义域名/CDN 后对象的外部访问地址 (如 https://cdn.example.com)">
+            <input v-model="form.storage_cdn_base_url" class="input" placeholder="https://cdn.example.com" />
+          </SettingRow>
+          <div class="rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 p-3 text-base text-amber-700 dark:text-amber-300">
+            保存后即可在「管理员 → 备份管理」使用该存储云端备份。密钥仅存于系统设置表，不回传明文（加载时按配置态显示）。
+          </div>
+        </div>
+
         <div class="pt-4 border-t border-slate-100 dark:border-slate-700 flex items-center justify-end gap-2">
           <button class="btn-secondary" @click="reset">还原</button>
           <button class="btn-primary" :disabled="saving" @click="save">
@@ -194,6 +246,7 @@ const TABS = [
   { key: 'general', label: '通用', icon: 'settings' },
   { key: 'smtp', label: '邮件服务', icon: 'bell' },
   { key: 'item_sync', label: '商品同步', icon: 'refresh' },
+  { key: 'storage', label: 'R2/S3 存储', icon: 'database' },
 ] as const
 
 const activeTab = ref<typeof TABS[number]['key']>('general')
@@ -258,6 +311,9 @@ const FIELDS = [
   'mail_provider', 'smtp_server', 'smtp_port', 'smtp_user', 'smtp_password', 'smtp_from',
   'resend_api_key', 'resend_from',
   'item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages',
+  'storage_driver', 'r2_account_id', 'r2_access_key_id', 'r2_secret_access_key', 'r2_bucket',
+  's3_endpoint', 's3_region', 's3_access_key_id', 's3_secret_access_key', 's3_bucket', 's3_path_style',
+  'storage_cdn_base_url',
 ] as const
 
 const form = reactive<Record<string, any>>({
@@ -277,6 +333,18 @@ const form = reactive<Record<string, any>>({
   item_sync_enabled: true,
   item_sync_interval: 600,
   item_sync_max_pages: 5,
+  storage_driver: 'r2',
+  r2_account_id: '',
+  r2_access_key_id: '',
+  r2_secret_access_key: '',
+  r2_bucket: '',
+  s3_endpoint: '',
+  s3_region: 'us-east-1',
+  s3_access_key_id: '',
+  s3_secret_access_key: '',
+  s3_bucket: '',
+  s3_path_style: true,
+  storage_cdn_base_url: '',
 })
 
 let snapshot: Record<string, any> = {}
@@ -295,10 +363,12 @@ async function reload() {
     form.smtp_port = Number(form.smtp_port) || 587
     form.item_sync_interval = Number(form.item_sync_interval) || 600
     form.item_sync_max_pages = Number(form.item_sync_max_pages) || 5
-    for (const bk of ['registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled']) {
+    form.s3_path_style = form.s3_path_style === true || form.s3_path_style === 'true'
+    for (const bk of ['registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled', 's3_path_style']) {
       form[bk] = form[bk] === true || form[bk] === 'true'
     }
     if (form.mail_provider !== 'resend') form.mail_provider = 'smtp'
+    if (form.storage_driver !== 's3') form.storage_driver = 'r2'
     snapshot = { ...form }
     loaded.value = true
   } catch (e: any) {

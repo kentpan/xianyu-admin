@@ -12,10 +12,7 @@
  *   4. 按 delay_ms 人化执行动作 (发文本/发图片, 串行队列 + 滑动窗口限速)
  *   5. GET  /api/engine/tasks   — 领取后台下发任务: http_fetch (后台构造好的签名 HTTP
  *      请求原样转发, 原始响应文本原样回报, 不读不改) / send_message (WS 发文本)
- *   6. POST /api/engine/orders-sync 定时触发 (v2.1.12, 节奏由后台 intervals 下发) —
- *      恢复内置引擎时代「每 30 分钟自动拉待发货订单」的能力: CF 后台无长驻进程,
- *      唯一长驻点 = 本代理; 触发后拉单/解析/入库全在后台完成, 本代理零解析不变
- *   7. POST /gateway 透传网关 (选填, XY_PROXY_PORT) — 同语义: 后台构造请求, 本机转发,
+ *   6. POST /gateway 透传网关 (选填, XY_PROXY_PORT) — 同语义: 后台构造请求, 本机转发,
  *      原始响应回传
  *
  * 部署: 上传本文件到任意能出网的机器 (Node ≥ 20; Node 20 若无内置 WebSocket
@@ -37,7 +34,7 @@
  *                    GET /health 运行状态 + POST /gateway mtop 透传网关, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.13; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.14; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -103,8 +100,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.1.12 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.13'
+// XY_PKG_VERSION 读取, 缺省 2.1.14 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.14'
 
 const ADMIN_URL = String(process.env.XY_ADMIN_URL || '').replace(/\/+$/, '')
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
@@ -130,7 +127,6 @@ if (dotenvInfo && dotenvInfo.injected.length) {
 const CONFIG_URL = `${ADMIN_URL}/api/engine/config`
 const EVENTS_URL = `${ADMIN_URL}/api/engine/events`
 const TASKS_URL = `${ADMIN_URL}/api/engine/tasks`
-const ORDERSYNC_URL = `${ADMIN_URL}/api/engine/orders-sync`
 
 /** 任务轮询间隔秒 (选填, 默认 3): http_fetch 等下发任务的领取频率, 越短后台等得越短 */
 const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
@@ -972,8 +968,6 @@ const latestCookies = new Map()
 let engineActive = false
 let pollSeconds = DEFAULT_POLL_SECONDS
 let heartbeatSeconds = 15
-let orderSyncEnabled = true
-let orderSyncSeconds = 1800
 let stopped = false
 let configFailStreak = 0
 let pollOkCount = 0
@@ -1335,13 +1329,6 @@ async function pollConfigOnce() {
     if (cfg.intervals?.heartbeat_seconds) {
       heartbeatSeconds = Math.min(60, Math.max(5, Math.round(Number(cfg.intervals.heartbeat_seconds) || 15)))
     }
-    // 订单自动同步节奏 (后台系统设置为准): 代理定时触发后台 orders-sync (代理是唯一长驻点)
-    if (cfg.intervals && 'order_sync_enabled' in cfg.intervals) {
-      orderSyncEnabled = cfg.intervals.order_sync_enabled !== false
-    }
-    if (cfg.intervals?.order_sync_seconds) {
-      orderSyncSeconds = Math.min(Math.max(Math.round(Number(cfg.intervals.order_sync_seconds) || 1800), 600), 7200)
-    }
 
     if (!engineActive) {
       if (wasActive || clients.size) {
@@ -1673,7 +1660,15 @@ if (PROXY_PORT > 0) {
         const started = Date.now()
         const upstream = await fetch(target, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
         const text = (await upstream.text()).slice(0, 4 * 1024 * 1024)
-        json(200, { ok: true, status: upstream.status, text, set_cookie: upstream.headers.getSetCookie ? upstream.headers.getSetCookie() : [] })
+        // v2.1.16: 附带全部单值响应头 (location/content-type 等) — 后台扫码登录人脸核验链
+        // 需逐跳读 location 驱动 302 链 (set_cookie 已单独返回, 此处排除防重复)
+        const respHeaders = {}
+        for (const [k, v] of upstream.headers.entries()) {
+          const lk = String(k).toLowerCase()
+          if (lk === 'set-cookie' || lk === 'content-encoding' || lk === 'content-length' || lk === 'transfer-encoding') continue
+          respHeaders[lk] = v
+        }
+        json(200, { ok: true, status: upstream.status, text, set_cookie: upstream.headers.getSetCookie ? upstream.headers.getSetCookie() : [], headers: respHeaders })
         log(`透传网关: ${method} ${target.host}${target.pathname.slice(0, 64)} → ${upstream.status} (${Date.now() - started}ms)`)
       } catch (e) {
         json(502, { ok: false, error: `透传转发失败: ${String(e?.message || e).slice(0, 160)}` })
@@ -1687,36 +1682,6 @@ if (PROXY_PORT > 0) {
   server.listen(PROXY_PORT, () =>
     log(`HTTP 服务已监听: http://0.0.0.0:${PROXY_PORT} (GET /health 健康检查 + POST /gateway mtop 透传网关, Bearer 鉴权=XY_ENGINE_TOKEN, 绑定全部网卡 — 公网入站须放行端口)`),
   )
-}
-
-/**
- * 订单自动同步触发循环 (v2.1.12): 代理是部署形态里唯一的长驻进程, CF 后台没有
- * 定时器 — 内置引擎时代每 30 分钟自动拉待发货订单的能力在这里恢复: 定时 POST
- * 后台 orders-sync (Bearer 引擎令牌), 后台走任务通道本机转发拉单并解析入库,
- * 本代理零解析不变。失败不重试 (下个周期自然再来), 详细日志同 apiCallWithRetry。
- */
-async function orderSyncLoop() {
-  // 首轮 60s 后触发 (重启后尽快补拉漏单), 之后按后台下发的 order_sync_seconds 节奏
-  let first = true
-  while (!stopped) {
-    await sleep(first ? 60_000 : Math.max(orderSyncSeconds, 600) * 1000)
-    first = false
-    if (stopped || !engineActive || !orderSyncEnabled) continue
-    try {
-      const startedAt = Date.now()
-      const resp = await apiCallWithRetry(ORDERSYNC_URL, {}, 90_000)
-      const ins = Number(resp?.inserted || 0)
-      const upd = Number(resp?.updated || 0)
-      const errs = Array.isArray(resp?.errors) ? resp.errors.length : 0
-      log(
-        `订单自动同步触发完成 (${((Date.now() - startedAt) / 1000).toFixed(1)}s): 账号 ${resp?.accounts ?? '?'} 个, ` +
-          `新增 ${ins} 单, 更新 ${upd} 单${errs ? `, 错误 ${errs} 条 (详见后台日志)` : ''}`,
-      )
-    } catch (e) {
-      // apiCallWithRetry 已打详细诊断日志, 这里只留触发失败的锚点
-      log(`订单自动同步触发失败 (下个周期重试): ${e?.message?.slice(0, 160) || e}`)
-    }
-  }
 }
 
 /* --------------------- 启动 --------------------- */
@@ -1741,4 +1706,3 @@ tasksLoop().catch((e) => {
   process.exit(1)
 })
 statusHeartbeatLoop().catch(() => {})
-orderSyncLoop().catch(() => {})

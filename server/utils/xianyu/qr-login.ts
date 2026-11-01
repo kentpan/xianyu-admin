@@ -13,13 +13,16 @@
  *     登录 cookie — 核验全程不出服务端 cookie jar, 登录 cookie 完整, 不会 need_relogin。
  *     核验链全部跳转均在 passport.goofish.com 域。
  *   - 上游降级: 参考项目跑在闲鱼可达服务器上; CF 边缘出口到 h5api.m.goofish.com 被闲鱼
- *     mtop 网关墙死 (tarpit, 实测 90s+ 零响应), 而 passport.goofish.com 与
- *     log.mmstat.com 可达。cna 与 m_h5_tk 两跳为「尽力而为」(失败不阻塞 passport 链,
- *     v2.1.1 实证无 m_h5_tk 亦可出码/轮询/核验); 闲鱼可达环境两跳正常成功, 行为与
- *     参考项目一致。token 刷新与 cookie 保活不在此处 (h5api) — 由监听引擎侧承担。
+ *     mtop 网关墙死 (tarpit, 实测 90s+ 零响应), passport.goofish.com 出口也可能被墙
+ *     (v2.1.15 线上实证: 直连 8s 超时 → 扫码/人脸全挂)。v2.1.16 起全部上游请求改走
+ *     upstreamFetch 传输层: 透传网关优先 (「监听服务」页引擎行登记的可达闲鱼代理,
+ *     与 mtop.ts 同一条链路) → 失败/未登记回落本机直连 — 出码/轮询/人脸核验全链路
+ *     不再依赖 CF 出口可达性。cna 与 m_h5_tk 两跳为「尽力而为」(失败不阻塞 passport 链);
+ *     token 刷新与 cookie 保活不在此处 (h5api) — 由监听引擎侧承担。
  */
 import { createHash } from 'node:crypto'
 import { getDb } from '../db'
+import { relayMtopRequest } from './gateway'
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -114,42 +117,85 @@ function withCookieHeader(extra: Record<string, string>, jar: Map<string, string
   return h
 }
 
-/** Fetch with hard timeout + Set-Cookie extraction (Node 18+: `headers.getSetCookie()`). */
-async function fetchSetCookies(
+/** 上游单跳传输结果 (直连 Response 的最小同构投影)。 */
+interface UpstreamHop {
+  status: number
+  text: string
+  setCookies: string[]
+  /** 3xx 跳转目标 (无则空串)。人脸核验链逐跳驱动必需。 */
+  location: string
+}
+
+/**
+ * 上游单跳传输: 独立代理「POST 透传网关」优先 → 失败/未登记回落本机直连。
+ * 与 mtop.ts mtopFetch 同语义 — CF 出口对 passport/h5api 被墙 (上游连接超时) 时,
+ * 由「监听服务」页引擎行登记的可达闲鱼代理转发; sign/表单参数/cookie jar 等业务
+ * 逻辑全部留在本文件, 网关零业务逻辑。302 核验链逐跳走网关需代理 ≥v2.1.16
+ * (旧版不回跳转头, 如实报「代理需升级」而不是静默错链)。
+ */
+async function upstreamFetch(
   url: string,
-  init: RequestInit,
+  init: { method: string; headers: Record<string, string>; body?: string },
   timeoutMs = UPSTREAM_TIMEOUT_MS,
-): Promise<{ res: Response; setCookies: string[] }> {
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+): Promise<UpstreamHop> {
+  let relayed: Awaited<ReturnType<typeof relayMtopRequest>> | null = null
+  try {
+    relayed = await relayMtopRequest(url, init)
+  } catch {
+    relayed = null // 网关不可达/鉴权失败 → 直连兜底 (本地引擎/闲鱼可达环境原语义)
+  }
+  if (relayed) {
+    const loc = relayed.headers['location'] || ''
+    if (relayed.status >= 300 && relayed.status < 400 && !loc) {
+      throw new Error('透传网关未返回跳转头: 请升级独立代理脚本至 v2.1.16+ 并重启 (人脸核验链需逐跳 location)')
+    }
+    return { status: relayed.status, text: relayed.text, setCookies: relayed.setCookie, location: loc }
+  }
+  const res = await fetch(url, {
+    method: init.method,
+    headers: init.headers,
+    body: init.body,
+    redirect: 'manual',
+    signal: AbortSignal.timeout(timeoutMs),
+  })
   let setCookies: string[] = []
   try {
     setCookies = (res.headers as any).getSetCookie?.() ?? []
   } catch {
     setCookies = []
   }
-  return { res, setCookies }
+  return { status: res.status, text: await res.text(), setCookies, location: res.headers.get('location') || '' }
+}
+
+/** 响应文本宽松 JSON 解析 (空体/非 JSON 返空对象, 与 res.json().catch 同语义)。 */
+function parseHopJson(text: string): any {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
+  }
 }
 
 /**
  * 跟随 30x 重定向链并把每一跳的 Set-Cookie 合入 jar (对齐 httpx follow_redirects
  * 的 cookie jar 行为 — 核验链路中间跳转下发的 cookie 是登录身份锚点, 一跳都不能丢)。
+ * 每一跳均走 upstreamFetch (网关优先→直连兜底), redirect 固定 manual。
  */
 async function fetchRedirectJar(
   url: string,
-  init: RequestInit,
+  init: { method: string; headers: Record<string, string>; body?: string },
   jar: Map<string, string>,
   maxRedirects = 10,
-): Promise<Response> {
+): Promise<{ status: number; text: string }> {
   let current = url
   for (let i = 0; i < maxRedirects; i++) {
-    const { res, setCookies } = await fetchSetCookies(current, { ...init, redirect: 'manual' })
-    mergeSetCookies(jar, setCookies)
-    const loc = res.headers.get('location')
-    if (res.status >= 300 && res.status < 400 && loc) {
-      current = new URL(loc, current).toString()
+    const hop = await upstreamFetch(current, init)
+    mergeSetCookies(jar, hop.setCookies)
+    if (hop.status >= 300 && hop.status < 400 && hop.location) {
+      current = new URL(hop.location, current).toString()
       continue
     }
-    return res
+    return { status: hop.status, text: hop.text }
   }
   throw new Error('重定向次数超限')
 }
@@ -210,8 +256,8 @@ function parseTs(v: any): number {
 /** 参考项目 jar 初始化的 m_h5_tk 一跳 (对齐 _get_mh5tk): GET h5api 收 cookie → md5 sign POST 一次 */
 async function tryGetMh5tk(jar: Map<string, string>): Promise<void> {
   const dataStr = '{"bizScene":"home"}'
-  const { setCookies } = await fetchSetCookies(API_H5_TK, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, FALLBACK_TIMEOUT_MS)
-  mergeSetCookies(jar, setCookies)
+  const first = await upstreamFetch(API_H5_TK, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, FALLBACK_TIMEOUT_MS)
+  mergeSetCookies(jar, first.setCookies)
   const mH5Tk = jar.get('m_h5_tk') || ''
   const token = mH5Tk.includes('_') ? mH5Tk.split('_')[0] : ''
   const t = Date.now().toString()
@@ -228,18 +274,17 @@ async function tryGetMh5tk(jar: Map<string, string>): Promise<void> {
     api: 'mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get',
     data: dataStr,
   })
-  const { res } = await fetchSetCookies(
+  await upstreamFetch(
     `${API_H5_TK}?${params.toString()}`,
     { method: 'POST', headers: withCookieHeader(PASSPORT_HEADERS, jar) },
     FALLBACK_TIMEOUT_MS,
   )
-  await res.text().catch(() => {})
 }
 
 /** v2.1.1 实证可用的 cna 一跳 (log.mmstat.com/eg.js, CF 可达): GET 收 cna cookie */
 async function tryGetCna(jar: Map<string, string>): Promise<void> {
-  const { setCookies } = await fetchSetCookies(API_CNA, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, FALLBACK_TIMEOUT_MS)
-  mergeSetCookies(jar, setCookies)
+  const hop = await upstreamFetch(API_CNA, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, FALLBACK_TIMEOUT_MS)
+  mergeSetCookies(jar, hop.setCookies)
 }
 
 /** mini_login.htm 提取 viewData.loginFormData (对齐 _get_login_params) */
@@ -257,11 +302,11 @@ async function getLoginParams(jar: Map<string, string>): Promise<Record<string, 
     stie: '77',
     rnd: String(Math.random()),
   })
-  const { res } = await fetchSetCookies(`${API_MINI_LOGIN}?${params.toString()}`, {
+  const hop = await upstreamFetch(`${API_MINI_LOGIN}?${params.toString()}`, {
     method: 'GET',
     headers: withCookieHeader(PASSPORT_HEADERS, jar),
   })
-  const html = await res.text().catch(() => '')
+  const html = hop.text
   const match = html.match(/window\.viewData\s*=\s*(\{.*?\});/)
   if (!match) throw new Error('获取登录参数失败: mini_login 页面无 viewData')
   let viewData: any
@@ -298,12 +343,12 @@ export async function startQrLogin(userId: number): Promise<{ sessionKey: string
     params = await getLoginParams(jar)
 
     const genUrl = `${API_GENERATE_QR}?${new URLSearchParams(params).toString()}`
-    const { res, setCookies } = await fetchSetCookies(genUrl, {
+    const genHop = await upstreamFetch(genUrl, {
       method: 'GET',
       headers: withCookieHeader(PASSPORT_HEADERS, jar),
     })
-    mergeSetCookies(jar, setCookies)
-    const json = (await res.json().catch(() => ({}))) as any
+    mergeSetCookies(jar, genHop.setCookies)
+    const json = parseHopJson(genHop.text)
     const data = json?.content?.data || {}
     const qrContent = String(data.codeContent || '')
     if (!(json?.content?.success === true) || !qrContent) {
@@ -416,8 +461,8 @@ function completeLogin(s: QrSessionRow, note: string): void {
 async function runFaceVerificationChain(s: QrSessionRow, iframeUrl: string): Promise<void> {
   if (!iframeUrl) throw new Error('上游未返回核验入口链接')
   // 步骤1: 跟随风控跳转落到 normal_validate.htm
-  const normalRes = await fetchRedirectJar(iframeUrl, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, s.jar)
-  const normalHtml = await normalRes.text().catch(() => '')
+  const normalHop = await fetchRedirectJar(iframeUrl, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, s.jar)
+  const normalHtml = normalHop.text
 
   // 步骤2: 提取 htoken 与下一跳 verify_modes.htm 链接
   const htoken = normalHtml.match(/htoken=([A-Za-z0-9_-]+)/)?.[1]
@@ -429,8 +474,8 @@ async function runFaceVerificationChain(s: QrSessionRow, iframeUrl: string): Pro
   if (verifyModesUrl.endsWith('_umidfg=')) verifyModesUrl += '1'
 
   // 步骤3: verify_modes.htm 302 落到 identity_verify.htm
-  const identityRes = await fetchRedirectJar(verifyModesUrl, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, s.jar)
-  const identityHtml = await identityRes.text().catch(() => '')
+  const identityHop = await fetchRedirectJar(verifyModesUrl, { method: 'GET', headers: { ...PASSPORT_HEADERS } }, s.jar)
+  const identityHtml = identityHop.text
 
   // 步骤4: 提取人脸验证二维码内容并渲染 (用户手机闲鱼 App 扫码)
   const faceQrContent = identityHtml.match(/new\s+Qrcode\(\{\s*text:\s*"([^"]+)"/)?.[1]
@@ -459,11 +504,11 @@ async function driveFaceVerification(s: QrSessionRow): Promise<void> {
     },
     s.jar,
   )
-  const { res } = await fetchSetCookies(`${API_FACE_CHECK}?htoken=${encodeURIComponent(htoken)}`, {
+  const checkHop = await upstreamFetch(`${API_FACE_CHECK}?htoken=${encodeURIComponent(htoken)}`, {
     method: 'GET',
     headers: checkHeaders,
   })
-  const json = (await res.json().catch(() => ({}))) as any
+  const json = parseHopJson(checkHop.text)
   const code = String(json?.content?.code ?? '')
   if (code === '3') {
     const ivCheckUrl = String(json?.content?.url || '')
@@ -514,7 +559,7 @@ export async function getSessionStatus(sessionKey: string): Promise<QrPollResult
 
   try {
     if (s.status === 'waiting' || s.status === 'scanned') {
-      const { res, setCookies } = await fetchSetCookies(API_SCAN_STATUS, {
+      const hop = await upstreamFetch(API_SCAN_STATUS, {
         method: 'POST',
         headers: withCookieHeader(
           { ...PASSPORT_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -522,8 +567,8 @@ export async function getSessionStatus(sessionKey: string): Promise<QrPollResult
         ),
         body: new URLSearchParams(s.params).toString(),
       })
-      mergeSetCookies(s.jar, setCookies)
-      const json = (await res.json().catch(() => ({}))) as any
+      mergeSetCookies(s.jar, hop.setCookies)
+      const json = parseHopJson(hop.text)
       const qdata = json?.content?.data || {}
       const qrStatus = String(qdata.qrCodeStatus || '')
 

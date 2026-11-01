@@ -10,7 +10,8 @@ export interface NavItem {
   path: string
   label: string
   icon: string // icon name from the icon map (lucide-like keys)
-  group: 'main' | 'admin' | 'bottom'
+  /** 分组 key (menu_groups 表; 内置 main/admin/bottom, 分组配置页可扩展)。 */
+  group: string
   adminOnly?: boolean
   badge?: string
 }
@@ -48,6 +49,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/admin/audit', label: '操作审计', icon: 'shield', group: 'admin', adminOnly: true },
   { path: '/admin/settlement-records', label: '提现审核', icon: 'wallet', group: 'admin', adminOnly: true },
   { path: '/admin/data', label: '数据管理', icon: 'data', group: 'admin', adminOnly: true },
+  { path: '/admin/backup', label: '备份管理', icon: 'database', group: 'admin', adminOnly: true },
 
   { path: '/disclaimer', label: '免责声明', icon: 'disclaimer', group: 'bottom' },
   { path: '/wallet', label: '我的钱包', icon: 'wallet', group: 'bottom' },

@@ -25,8 +25,12 @@ export default defineEventHandler(
     }
     if (body.icon !== undefined) { fields.push('icon = ?'); params.push(String(body.icon)) }
     if (body.group_name !== undefined) {
+      // 分组真源 = menu_groups 表 (分组配置页可增删), 不再限死三个内置 key
+      const groupKey = String(body.group_name).trim() || 'main'
+      const groupExists = await db.get('SELECT id FROM menu_groups WHERE key = ?', [groupKey])
+      if (!groupExists) throw new ApiError(400, `分组不存在: ${groupKey} (先到「分组配置」新增)`)
       fields.push('group_name = ?')
-      params.push(['main', 'admin', 'bottom'].includes(String(body.group_name)) ? String(body.group_name) : 'main')
+      params.push(groupKey)
     }
     if (body.sort_order !== undefined) { fields.push('sort_order = ?'); params.push(Math.max(Number(body.sort_order) || 0, 0)) }
     if (body.parent_id !== undefined) {

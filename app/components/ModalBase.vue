@@ -38,17 +38,19 @@ const props = withDefaults(defineProps<{
   size?: 'sm' | 'md' | 'lg' | 'xl'
   closeOnBackdrop?: boolean
 }>(), {
-  size: 'md',
+  size: 'lg',
   closeOnBackdrop: true,
 })
 
 const emit = defineEmits<{ 'update:modelValue': [value: boolean]; close: [] }>()
 
+// v2.1.15 全档加宽 (原 sm/md/lg/xl = 24/28/42/56rem, 表单类弹窗内容拥挤):
+// sm=28rem(确认框) / md=36rem / lg=48rem(默认, 表单两列舒展) / xl=72rem(宽表格)
 const sizeClass = computed(() => ({
-  sm: 'max-w-sm',
-  md: 'max-w-md',
-  lg: 'max-w-2xl',
-  xl: 'max-w-4xl',
+  sm: 'max-w-md',
+  md: 'max-w-xl',
+  lg: 'max-w-3xl',
+  xl: 'max-w-6xl',
 }[props.size]))
 
 function close() {

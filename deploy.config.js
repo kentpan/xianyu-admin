@@ -18,6 +18,9 @@ export default {
   d1Id: '', // 可选; 已知 ID 直接复用(跳过创建)
   kvName: '', // KV 命名空间名; 留空 = 不使用 KV 数据库
   kvId: '', // 可选; 已知 ID 直接复用
+  r2Name: '', // R2 存储桶名; 留空 = 不使用 R2 (备份管理云端存储 BACKUP_R2 绑定; 同名桶已存在则跳过创建)
+  // R2 无需 id 字段 (绑定只认桶名)。S3 兼容存储为外部服务, 无需 CF 侧创建 —— 在系统设置
+  // 「R2/S3 存储」页运行时配置 (endpoint/密钥/桶名/CDN 域名)。
   ai: {
     enabled: false, // true 时要求调用方配置 AI_API_KEY secret
     vars: { AI_MODEL: 'glm-4.6' }, // 注入运行时的 AI 普通变量

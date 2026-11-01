@@ -10,12 +10,22 @@ export interface AdminMenu {
   name: string
   path: string
   icon: string
-  group_name: 'main' | 'admin' | 'bottom'
+  group_name: string
   sort_order: number
   admin_only: number
   enabled: number
   created_at?: string
   updated_at?: string
+}
+
+/** 菜单分组 (v2.1.15): 侧边栏分组标题/排序可配置; 内置 main/admin/bottom 不可删。 */
+export interface MenuGroup {
+  id: number
+  key: string
+  label: string
+  is_system: number
+  sort_order: number
+  menu_count?: number
 }
 
 export interface AdminRole {
@@ -37,7 +47,23 @@ export interface RoleAssignment {
 }
 
 export function getAdminMenus() {
-  return useApi().get<{ items: AdminMenu[]; tree: any[] }>('/api/admin/menus')
+  return useApi().get<{ items: AdminMenu[]; tree: any[]; groups?: MenuGroup[] }>('/api/admin/menus')
+}
+
+export function getMenuGroupsAdmin() {
+  return useApi().get<{ items: MenuGroup[] }>('/api/admin/menu-groups')
+}
+
+export function createMenuGroup(payload: { key: string; label: string; sort_order?: number }) {
+  return useApi().post<{ id: number }>('/api/admin/menu-groups', payload)
+}
+
+export function updateMenuGroup(id: number, payload: { key?: string; label?: string; sort_order?: number }) {
+  return useApi().put<{ id: number }>(`/api/admin/menu-groups/${id}`, payload)
+}
+
+export function deleteMenuGroup(id: number) {
+  return useApi().del(`/api/admin/menu-groups/${id}`)
 }
 
 export function createMenu(payload: Partial<AdminMenu>) {
@@ -76,7 +102,7 @@ export function updateUserRoles(userId: number, role_ids: number[]) {
   return useApi().put<{ id: number }>(`/api/admin/users/${userId}/roles`, { role_ids })
 }
 
-/** 当前登录用户可见菜单 (SSR 中间件为主通道, 此函数供客户端刷新)。 */
+/** 当前登录用户可见菜单 + 分组标签 (SSR 中间件为主通道, 此函数供客户端刷新)。 */
 export function getMyMenus() {
-  return useApi().get<{ menus: any[] }>('/api/auth/menus')
+  return useApi().get<{ menus: any[]; groups?: MenuGroup[] }>('/api/auth/menus')
 }

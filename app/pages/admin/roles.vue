@@ -74,7 +74,7 @@
             <tr>
               <th>用户</th>
               <th>平台角色</th>
-              <th>RBAC 角色</th>
+              <th>RBAC 角色 (单选)</th>
             </tr>
           </thead>
           <tbody>
@@ -85,16 +85,23 @@
               </td>
               <td class="text-slate-500 dark:text-slate-400">{{ u.is_admin ? '超级用户 (拥有全部菜单)' : '按 RBAC 角色授权' }}</td>
               <td>
-                <div class="flex flex-wrap gap-3">
-                  <label v-for="r in roles" :key="r.id" class="flex items-center gap-1.5 cursor-pointer select-none">
+                <div class="flex flex-wrap items-center gap-4">
+                  <label
+                    v-for="r in roles"
+                    :key="r.id"
+                    class="flex items-center gap-1.5 cursor-pointer select-none"
+                    title="一个用户只挂载一个角色; 点击已选中的角色可取消挂载"
+                  >
                     <input
-                      type="checkbox"
+                      type="radio"
+                      :name="`role-${u.id}`"
                       class="w-4 h-4 accent-brand-500"
-                      :checked="userRoleIds(u.id).includes(r.id)"
-                      @change="toggleUserRole(u, r.id, ($event.target as HTMLInputElement).checked)"
+                      :checked="primaryRoleId(u.id) === r.id"
+                      @change="setUserRole(u, r.id, ($event.target as HTMLInputElement).checked)"
                     />
                     <span class="text-slate-600 dark:text-slate-300">{{ r.name }}</span>
                   </label>
+                  <span v-if="!roles.length" class="text-slate-400">暂无角色可选</span>
                 </div>
               </td>
             </tr>
@@ -184,7 +191,7 @@
 import {
   getAdminRoles, createRole, updateRole, deleteRole,
   getAdminMenus, getRoleAssignments, updateUserRoles,
-  type AdminRole, type AdminMenu, type RoleAssignment,
+  type AdminRole, type AdminMenu, type MenuGroup, type RoleAssignment,
 } from '~/api/rbac'
 import { getAdminUsers, type AdminUser } from '~/api/admin'
 
@@ -197,6 +204,7 @@ const saving = ref(false)
 const deleting = ref(false)
 const roles = ref<AdminRole[]>([])
 const menus = ref<AdminMenu[]>([])
+const groups = ref<MenuGroup[]>([])
 const users = ref<AdminUser[]>([])
 const assignments = ref<RoleAssignment[]>([])
 const dialogOpen = ref(false)
@@ -211,14 +219,29 @@ const superAdminSelected = computed(() => {
 })
 
 const menuGroups = computed(() => {
-  const meta: Record<string, string> = { main: '主菜单', admin: '管理员', bottom: '底部' }
-  const order = ['main', 'admin', 'bottom']
-  return order.map((key) => ({
-    key,
-    label: meta[key],
-    items: menus.value.filter((m) => (m.group_name || 'main') === key),
-  })).filter((g) => g.items.length)
+  // 分组真源 = menu_groups 表 (菜单管理「分组配置」可增删改), 服务端已随菜单下发
+  const meta: Array<{ key: string; label: string }> = groups.value.length
+    ? groups.value.map((g) => ({ key: g.key, label: g.label }))
+    : [
+        { key: 'main', label: '主菜单' },
+        { key: 'admin', label: '管理员' },
+        { key: 'bottom', label: '其他' },
+      ]
+  const out: Array<{ key: string; label: string; items: AdminMenu[] }> = []
+  for (const g of meta) {
+    const items = menus.value.filter((m) => (m.group_name || 'main') === g.key)
+    if (items.length) out.push({ key: g.key, label: g.label, items })
+  }
+  const known = new Set(meta.map((g) => g.key))
+  const orphans = menus.value.filter((m) => !known.has(m.group_name || 'main'))
+  if (orphans.length) out.push({ key: '__ungrouped', label: '未分组', items: orphans })
+  return out
 })
+
+/** 用户当前挂载的角色 (单选语义: 取第一个; 一个用户只挂一个角色)。 */
+function primaryRoleId(userId: number): number | null {
+  return userRoleIds(userId)[0] ?? null
+}
 
 function userRoleIds(userId: number): number[] {
   return assignments.value.filter((a) => a.user_id === userId).map((a) => a.role_id)
@@ -237,12 +260,13 @@ async function reload() {
   try {
     const [roleData, menuData, userData, assignData] = await Promise.all([
       getAdminRoles(),
-      getAdminMenus().catch(() => ({ items: [] as AdminMenu[] })),
+      getAdminMenus().catch(() => ({ items: [] as AdminMenu[], groups: [] as MenuGroup[] })),
       getAdminUsers().catch(() => [] as AdminUser[]),
       getRoleAssignments().catch(() => ({ assignments: [] as RoleAssignment[] })),
     ])
     roles.value = roleData.items
     menus.value = menuData.items
+    groups.value = (menuData as any).groups || []
     users.value = userData as any as AdminUser[]
     assignments.value = assignData.assignments
   } catch (e: any) {
@@ -296,16 +320,20 @@ async function save() {
   }
 }
 
-async function toggleUserRole(u: AdminUser, roleId: number, checked: boolean) {
-  const ids = userRoleIds(u.id)
-  const next = checked ? [...ids, roleId] : ids.filter((v) => v !== roleId)
+/**
+ * 用户角色单选挂载: 选中某角色 → 替换为该角色; 再次点击已选中的角色 → 取消挂载。
+ * 一个用户只挂一个角色 (多角色并存语义已废除)。
+ */
+async function setUserRole(u: AdminUser, roleId: number, checked: boolean) {
+  const next = checked ? [roleId] : []
   try {
     await updateUserRoles(u.id, next)
     assignments.value = assignments.value.filter((a) => a.user_id !== u.id)
     for (const rid of next) assignments.value.push({ user_id: u.id, role_id: rid, username: u.username })
-    toast.success('用户角色已更新')
+    toast.success(checked ? `已挂载角色 (此前挂载已替换)` : '已取消角色挂载')
   } catch (e: any) {
     toast.error(e.message || '操作失败')
+    reload()
   }
 }
 

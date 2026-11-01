@@ -16,6 +16,10 @@ export default defineEventHandler(
     const db = await getDb()
     const dup = await db.get('SELECT id FROM menus WHERE path = ?', [path])
     if (dup) throw new ApiError(400, `菜单路径已存在: ${path}`)
+    // 分组真源 = menu_groups 表 (分组配置页可增删), 不再限死三个内置 key
+    const groupKey = String(body.group_name || 'main').trim() || 'main'
+    const groupExists = await db.get('SELECT id FROM menu_groups WHERE key = ?', [groupKey])
+    if (!groupExists) throw new ApiError(400, `分组不存在: ${groupKey} (先到「分组配置」新增)`)
     await db.run(
       `INSERT INTO menus (parent_id, name, path, icon, group_name, sort_order, admin_only, enabled)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -24,7 +28,7 @@ export default defineEventHandler(
         name,
         path,
         String(body.icon || 'dashboard'),
-        ['main', 'admin', 'bottom'].includes(String(body.group_name)) ? String(body.group_name) : 'main',
+        groupKey,
         Math.max(Number(body.sort_order) || 0, 0),
         body.admin_only ? 1 : 0,
         body.enabled === undefined ? 1 : body.enabled ? 1 : 0,

@@ -14,6 +14,7 @@ import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSyst
 import { fetchItemList, polishItem, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
 import { isProxyEngineMode, sendTextViaProxy } from './order-task'
+import { probeRemoteEngine } from './engine-probe'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from './brain'
 import { dispatchNotify } from '../notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from './publisher'
@@ -24,6 +25,8 @@ const HEARTBEAT_INTERVAL_MS = 10_000
 const ITEM_SYNC_MIN_INTERVAL_S = 60
 /** 擦亮/订单同步的门控巡检周期 (每 5 分钟读一次设置, 由各自 interval 决定是否真正执行)。 */
 const MAINTENANCE_TICK_MS = 5 * 60_000
+/** 远程代理心跳失联阈值: 超此时间无 last_seen_at 更新即视为未在服务本后台 (内置接管)。 */
+const REMOTE_STALE_MS = 5 * 60_000
 
 interface EngineRuntime {
   pollTimer: NodeJS.Timeout | null
@@ -93,7 +96,7 @@ export function startBuiltinEngineSupervisor(): void {
   runtime.polishTimer = setInterval(() => void polishTick(), MAINTENANCE_TICK_MS)
   runtime.orderSyncTimer = setInterval(() => void orderSyncTick(), MAINTENANCE_TICK_MS)
   void pollOnce()
-  console.log('[xianyu-engine] 内置监听引擎调度器已启动 (5s 门控巡检 / 10s 心跳 / 60s 商品同步门控 / 5min 擦亮·订单同步门控)')
+  console.log('[xianyu-engine] 内置监听引擎调度器已启动 (5s 门控巡检/远程失联自愈 / 10s 心跳 / 60s 商品同步门控 / 5min 擦亮·订单同步门控)')
 }
 
 export function stopBuiltinEngineSupervisor(): void {
@@ -127,23 +130,42 @@ async function pollOnce(): Promise<void> {
     const builtinActive = active?.slug === 'builtin'
 
     if (!builtinActive) {
-      // 当前使用远程代理: 内置引擎全部账号下线 (多引擎互斥)
-      if (!runtime.standby) {
-        for (const client of runtime.clients.values()) await client.stop()
-        runtime.clients.clear()
-        runtime.cookieCache.clear()
-        runtime.standby = true
-        await db
-          .run(
-            "UPDATE engines SET last_status = 'standby', updated_at = CURRENT_TIMESTAMP WHERE slug = 'builtin'",
-          )
-          .catch(() => {})
-        console.log('[xianyu-engine] 当前引擎为远程代理, 内置引擎转入待命 (账号已全部下线)')
+      // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存): 失联/未在服务时内置引擎
+      // 自动接管, 代理恢复后自动交回 — 消灭「远程引擎失联 → 监听/商品同步/风控全链路
+      // 静默停摆却无人知晓」(v2.1.15 线上实证: 代理进程死后 standby, 商品同步/风控日志全停)。
+      const probe = await probeActiveRemote(db)
+      if (probe.serving) {
+        if (!runtime.standby) {
+          // 交回: 停全部内置客户端转待命 (代理已在服务, 双活会重复回复)
+          for (const client of runtime.clients.values()) await client.stop()
+          runtime.clients.clear()
+          runtime.cookieCache.clear()
+          runtime.standby = true
+          await db
+            .run(
+              "UPDATE engines SET last_status = 'standby', updated_at = CURRENT_TIMESTAMP WHERE slug = 'builtin'",
+            )
+            .catch(() => {})
+          const msg = '远程代理已恢复在服务, 内置引擎交回服务权 (转待命)'
+          console.log(`[xianyu-engine] ${msg}`)
+          await db
+            .run("INSERT INTO system_logs (level, module, message) VALUES ('INFO', 'engine', ?)", [msg])
+            .catch(() => {})
+        }
+        return
       }
-      return
+      // 失联/未在服务 → 内置引擎接管 (engines.is_active 不动, 代理恢复后自动交回)
+      if (runtime.standby) {
+        const msg = `活跃引擎为远程代理但${probe.reason}, 内置引擎自动接管 (代理恢复后自动交回)`
+        console.log(`[xianyu-engine] ${msg}`)
+        await db
+          .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'engine', ?)", [msg])
+          .catch(() => {})
+      }
+      runtime.standby = false
+    } else {
+      runtime.standby = false
     }
-
-    runtime.standby = false
 
     // 待监听账号 = 启用的 cookies
     const accounts = await db.all<any>(
@@ -321,6 +343,46 @@ async function markActionResult(action: EngineAction, sent: boolean, error: stri
     .catch(() => {})
 }
 
+/* ---------------------------------- 引擎健康探测 ---------------------------------- */
+
+/**
+ * 探测当前活跃的远程代理是否真实在服务 (登记地址 /health 实测)。
+ * 返回 serving=false 时 reason 说明原因。未登记地址/探测异常保守视为在服务
+ * (不误杀 — 原待命语义), 此时后台任务链路照常由网关/直连承担。
+ */
+async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise<{ serving: boolean; reason: string }> {
+  try {
+    const row = await db.get<{ host: string; port: number; last_seen_at: string | null }>(
+      `SELECT host, port, last_seen_at FROM engines
+       WHERE is_active = 1 AND type != 'builtin' AND enabled = 1
+         AND host IS NOT NULL AND host != '' AND port IS NOT NULL AND port > 0
+       LIMIT 1`,
+    )
+    if (!row) return { serving: true, reason: '' }
+    // 心跳新鲜度先行: 远程代理真实在服务本后台时, 配置轮询 (≤30s/次) 会持续刷新 last_seen_at。
+    // 进程活着但心跳陈旧 = 代理连的是别的后台 / 上报中断 — 此时本后台监听实际已死,
+    // 不能被 /health 的 engine_active 陈旧真值骗过 (v2.1.16 实测: last_seen 停在 6h 前)。
+    if (row.last_seen_at) {
+      const raw = String(row.last_seen_at)
+      const seenMs = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z')
+      if (Number.isFinite(seenMs)) {
+        const staleMin = Math.round((Date.now() - seenMs) / 60_000)
+        if (Date.now() - seenMs > REMOTE_STALE_MS) {
+          return { serving: false, reason: `心跳陈旧 (${staleMin} 分钟无上报, 代理可能在服务其他后台或上报中断)` }
+        }
+      }
+    }
+    const r = await probeRemoteEngine(String(row.host), Number(row.port))
+    if (!r.ok) return { serving: false, reason: `登记地址健康探测失败 (${r.error || '不可达'})` }
+    if (!r.engine_active) {
+      return { serving: false, reason: '代理进程存活但未在服务 (engine_active=false, 常见为接入令牌不匹配或代理未激活)' }
+    }
+    return { serving: true, reason: '' }
+  } catch {
+    return { serving: true, reason: '' }
+  }
+}
+
 /* ---------------------------------- 状态回写 ---------------------------------- */
 
 async function persistAccountState(cookieId: string, state: AccountState, detail: string): Promise<void> {
@@ -389,7 +451,7 @@ async function heartbeatOnce(): Promise<void> {
 let itemSyncLastRunAt = 0
 
 async function itemSyncTick(): Promise<void> {
-  if (runtime.standby || runtime.itemSyncRunning) return
+  if (runtime.itemSyncRunning) return
   const db = await getDb().catch(() => null)
   if (!db) return
   try {
@@ -410,19 +472,56 @@ async function itemSyncTick(): Promise<void> {
   } catch {}
 }
 
+/**
+ * 同步链路风控如实落账: 命中闲鱼用户验证/风控拦截时记 risk_control_logs (风控日志页可见)
+ * + WARN 系统日志 — 同步不再静默吞风控 (风控日志停止记录的一半根因: 同步 catch{} 无声)。
+ */
+async function recordSyncRisk(db: Awaited<ReturnType<typeof getDb>>, cookieId: string, source: string, message: string): Promise<void> {
+  const m = String(message || '')
+  if (!/FAIL_SYS_USER_VALIDATE|RGV587|SESSION_EXPIRED|风控|验证码|punish/i.test(m)) return
+  await db
+    .run(
+      `INSERT INTO risk_control_logs (cookie_id, event_type, event_description, processing_result, processing_status)
+       VALUES (?, 'token_captcha', ?, '同步链路被风控拦截, 将随下轮同步自动重试', 'handled')`,
+      [cookieId, `[${source}] ${m.slice(0, 480)}`],
+    )
+    .catch(() => {})
+}
+
+async function warnSyncLog(db: Awaited<ReturnType<typeof getDb>>, message: string): Promise<void> {
+  console.log(`[xianyu-engine] ${message}`)
+  await db.run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'item_sync', ?)", [message.slice(0, 500)]).catch(() => {})
+}
+
 async function runItemSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>, maxPages: number): Promise<void> {
-  const cookieIds = [...runtime.clients.keys()]
-  if (!cookieIds.length) return
+  // 全账号 = 启用的 cookies (后台定时任务, 不依赖内置 WS 客户端):
+  // 内置引擎托管/远程代理在服务/远程失联接管三形态下统一从后台拉取 (网关优先→直连兑底)。
+  let accountRows: { id: string; value: string }[] = []
+  try {
+    accountRows = await db.all<{ id: string; value: string }>(
+      `SELECT c.id, c.value FROM cookies c
+       LEFT JOIN cookie_status cs ON cs.cookie_id = c.id
+       WHERE COALESCE(cs.enabled, 1) = 1 AND c.value IS NOT NULL AND c.value != ''`,
+    )
+  } catch {
+    return
+  }
+  if (!accountRows.length) {
+    const msg = '商品同步跳过: 无启用账号 (账号管理页启用账号后自动恢复)'
+    console.log(`[xianyu-engine] ${msg}`)
+    await db.run("INSERT INTO system_logs (level, module, message) VALUES ('INFO', 'item_sync', ?)", [msg]).catch(() => {})
+    return
+  }
   let totalUpserted = 0
   const failed: string[] = []
-  for (const cookieId of cookieIds) {
-    const row = await db.get<any>('SELECT value FROM cookies WHERE id = ?', [cookieId]).catch(() => null)
-    if (!row?.value) continue
+  for (const acct of accountRows) {
+    const cookieId = String(acct.id)
+    const cookieStr = String(acct.value)
     try {
-      const unb = transCookies(String(row.value))['unb'] || ''
+      const unb = transCookies(cookieStr)['unb'] || ''
       if (!unb) continue
-      const { items, finalCookieStr } = await fetchItemList(String(row.value), String(unb), maxPages)
-      if (finalCookieStr && finalCookieStr !== row.value) {
+      const { items, finalCookieStr } = await fetchItemList(cookieStr, String(unb), maxPages)
+      if (finalCookieStr && finalCookieStr !== cookieStr) {
         await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId]).catch(() => {})
         runtime.cookieCache.set(cookieId, finalCookieStr)
         runtime.clients.get(cookieId)?.setCookieStr(finalCookieStr)
@@ -444,13 +543,16 @@ async function runItemSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>, 
           .catch(() => {})
       }
       totalUpserted += items.length
-    } catch {
+    } catch (e: any) {
       failed.push(cookieId)
+      const msg = `账号 ${cookieId} 商品同步失败: ${String(e?.message || e).slice(0, 200)}`
+      await warnSyncLog(db, msg)
+      await recordSyncRisk(db, cookieId, '商品同步', String(e?.message || e))
     }
     // 账号间随机间隔 1~3s, 避免机节拍
     await new Promise((r) => setTimeout(r, 1000 + Math.floor(Math.random() * 2000)))
   }
-  const summary = `商品同步完成: ${totalUpserted} 件 / ${cookieIds.length} 账号${failed.length ? `, 失败 ${failed.length} 个` : ''}`
+  const summary = `商品同步完成: ${totalUpserted} 件 / ${accountRows.length} 账号${failed.length ? `, 失败 ${failed.length} 个` : ''}`
   console.log(`[xianyu-engine] ${summary}`)
   await db
     .run(
@@ -465,7 +567,7 @@ async function runItemSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>, 
 let polishLastRunAt = 0
 
 async function polishTick(): Promise<void> {
-  if (runtime.standby || runtime.polishRunning) return
+  if (runtime.polishRunning) return
   const db = await getDb().catch(() => null)
   if (!db) return
   try {
@@ -487,7 +589,18 @@ async function polishTick(): Promise<void> {
 }
 
 async function runPolishForAllAccounts(db: Awaited<ReturnType<typeof getDb>>): Promise<void> {
-  const cookieIds = [...runtime.clients.keys()]
+  // 与商品同步同语义: 后台定时任务不依赖内置 WS 客户端, 遍历启用账号 (擦亮走网关优先→直连兑底)
+  let cookieIds: string[] = []
+  try {
+    const rows = await db.all<{ id: string }>(
+      `SELECT c.id FROM cookies c
+       LEFT JOIN cookie_status cs ON cs.cookie_id = c.id
+       WHERE COALESCE(cs.enabled, 1) = 1 AND c.value IS NOT NULL AND c.value != ''`,
+    )
+    cookieIds = rows.map((r) => String(r.id))
+  } catch {
+    return
+  }
   if (!cookieIds.length) return
   let polished = 0
   let already = 0
@@ -543,7 +656,7 @@ let orderSyncLastRunAt = 0
 const ORDER_SYNC_MIN_INTERVAL_S = 1800
 
 async function orderSyncTick(): Promise<void> {
-  if (runtime.standby || runtime.orderSyncRunning) return
+  if (runtime.orderSyncRunning) return
   const db = await getDb().catch(() => null)
   if (!db) return
   try {

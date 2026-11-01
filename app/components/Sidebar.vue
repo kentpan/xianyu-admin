@@ -28,28 +28,16 @@
       </button>
     </div>
 
-    <!-- Nav -->
+    <!-- Nav (v2.1.15: 分组动态化 — 分组段 = menu_groups 表排序, 标题取表内 label) -->
     <nav class="flex-1 overflow-y-auto py-3 space-y-0.5 sidebar-scroll" :class="showLabel ? 'px-2' : 'px-1.5'">
-      <template v-for="item in mainItems" :key="item.path">
-        <SidebarItem :item="item" :show-label="showLabel" :active="isActive(item.path)" @navigate="mobileOpen = false" />
-      </template>
-
-      <template v-if="isAdmin">
+      <template v-for="(section, si) in sections" :key="section.key">
         <div v-if="showLabel" class="pt-4 pb-2 px-3">
-          <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">管理员</p>
+          <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">{{ section.label }}</p>
         </div>
-        <div v-else class="pt-2 mt-2 border-t border-slate-200 dark:border-slate-800" />
-        <template v-for="item in adminItems" :key="item.path">
+        <div v-else class="pt-2 mt-2 border-t border-slate-200 dark:border-slate-800" :class="si === 0 ? '!pt-0 !mt-0 !border-t-0' : ''" />
+        <template v-for="item in section.items" :key="item.path">
           <SidebarItem :item="item" :show-label="showLabel" :active="isActive(item.path)" @navigate="mobileOpen = false" />
         </template>
-      </template>
-
-      <div v-if="showLabel" class="pt-4 pb-2 px-3">
-        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">其他</p>
-      </div>
-      <div v-else class="pt-2 mt-2 border-t border-slate-200 dark:border-slate-800" />
-      <template v-for="item in bottomItems" :key="item.path">
-        <SidebarItem :item="item" :show-label="showLabel" :active="isActive(item.path)" @navigate="mobileOpen = false" />
       </template>
     </nav>
 
@@ -76,11 +64,9 @@
 </template>
 
 <script setup lang="ts">
-import { useNav, type NavItem } from '~/composables/useNav'
-import { useAuth } from '~/composables/useAuth'
+import { useNav } from '~/composables/useNav'
 
-const { mainItems, adminItems, bottomItems, isActive } = useNav()
-const { isAdmin } = useAuth()
+const { sections, isActive } = useNav()
 
 const sidebarCollapsed = useState('sidebar_collapsed', () => false)
 const mobileOpen = useState('sidebar_mobile_open', () => false)
