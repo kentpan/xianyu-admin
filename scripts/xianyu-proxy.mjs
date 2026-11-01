@@ -34,7 +34,7 @@
  *                    GET /health 运行状态 + POST /gateway mtop 透传网关, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.9; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.11; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -100,8 +100,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.1.9 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.9'
+// XY_PKG_VERSION 读取, 缺省 2.1.11 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.11'
 
 const ADMIN_URL = String(process.env.XY_ADMIN_URL || '').replace(/\/+$/, '')
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
@@ -130,6 +130,78 @@ const TASKS_URL = `${ADMIN_URL}/api/engine/tasks`
 
 /** 任务轮询间隔秒 (选填, 默认 3): http_fetch 等下发任务的领取频率, 越短后台等得越短 */
 const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
+
+// 启动即打印生效配置全貌: 后台地址是排查「全部超时」的第一现场 —— 配错了/指向了旧
+// 后台, 这一行日志直接可见, 不用再猜。
+log(
+  `启动配置: 后台=${ADMIN_URL} | 接入令牌=${ENGINE_TOKEN.slice(0, 6)}…(长度 ${ENGINE_TOKEN.length}) | 脚本版本=v${SCRIPT_VERSION} | ` +
+    `配置轮询=${DEFAULT_POLL_SECONDS}s | 任务轮询=${DEFAULT_TASK_POLL_SECONDS}s | 透传网关=${PROXY_PORT ? `开启 (端口 ${PROXY_PORT})` : '关闭'} | ` +
+    `配置来源=${dotenvInfo ? dotenvInfo.path : '进程环境变量'}`,
+)
+
+/* -------------- 后台可达性追踪 (失败日志一眼判断: 断在哪一层 / 后台挂了多久) -------------- */
+
+let adminFailStreak = 0 // 对后台请求的连续失败次数 (收到任何 HTTP 响应即清零 — 能回包=后台活着)
+let lastAdminOkAt = 0 // 最近一次成功请求时刻
+const processStartedAt = Date.now()
+
+function fmtClock(ts) {
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 失败日志附注: 连续失败次数 + 持续时长 + 上次成功时刻 (或从未成功), 不成功不恢复期间每次失败都带 */
+function adminHealthNote() {
+  if (adminFailStreak <= 1) return ''
+  const since = lastAdminOkAt
+    ? `上次成功 ${fmtClock(lastAdminOkAt)} (${Math.round((Date.now() - lastAdminOkAt) / 1000)}s 前)`
+    : `启动 ${Math.round((Date.now() - processStartedAt) / 1000)}s 以来没有任何请求成功过`
+  return ` — ⚠ 后台已连续失败 ${adminFailStreak} 次 (${since})`
+}
+
+/**
+ * 超时类失败的自动分层诊断: 依次探测 DNS 解析 → TCP 连通, 把「连不上」与「连上了但对方
+ * 不回 HTTP」区分开 —— 前者是域名错/宕机/防火墙丢包, 后者是后台进程挂起或 CF 到源站故障,
+ * 修复方向完全不同。探测结果直接拼进失败日志, 一眼看出该去修哪里。
+ */
+async function probeReachability(urlStr) {
+  let host = ''
+  let port = 443
+  try {
+    const u = new URL(urlStr)
+    host = u.hostname
+    port = Number(u.port) || (u.protocol === 'http:' ? 80 : 443)
+  } catch {
+    return ''
+  }
+  let ips = []
+  if (net.isIP(host)) {
+    ips = [host] // IP 直连无 DNS 环节, 直接测 TCP
+  } else {
+    try {
+      ips = await new Promise((resolve, reject) =>
+        dns.resolve4(host, (e, a) => (e ? reject(e) : resolve(a || []))),
+      )
+    } catch (e) {
+      return `【诊断】DNS 解析失败 (${host} → ${e?.code || e?.message || '解析不通'}) = 域名写错 / 本机 DNS 故障, 请核对 XY_ADMIN_URL`
+    }
+    if (!ips.length) return `【诊断】DNS 无记录 (${host}) = 域名不存在, 请核对 XY_ADMIN_URL`
+  }
+  const tcpOk = await new Promise((resolve) => {
+    const s = net.connect({ host: ips[0], port })
+    const done = (v) => {
+      try { s.destroy() } catch {}
+      resolve(v)
+    }
+    s.setTimeout(5000)
+    s.on('connect', () => done(true))
+    s.on('timeout', () => done(false))
+    s.on('error', () => done(false))
+  })
+  if (!tcpOk) {
+    return `【诊断】DNS ✓ (${ips[0]}) 但 TCP ${host}:${port} 连不上 = 后台主机宕机 / 安全组或防火墙丢包`
+  }
+  return `【诊断】DNS ✓ (${ips[0]}) / TCP ✓ (${host}:${port} 可连通) = 网络路是通的, 后台就是不回 HTTP → 后台服务没起 / 进程挂死 / CF 到源站故障, 去检查后台`
+}
 
 /* ----------------- 协议常量与纯函数 (与后台 server/utils/xianyu/protocol.ts 同源) ----------------- */
 
@@ -911,31 +983,44 @@ function log(msg) {
 }
 
 
-/** 请求标签: 从 URL 提取 "POST /api/engine/events" 样式短标签, 供日志一眼定位是哪个请求。 */
+/** 请求标签: "POST engine/events @ 后台域名" — 带上请求目标主机, 指错后台一眼可见。 */
 function apiLabel(url) {
   try {
     const u = new URL(url)
-    return `${u.pathname.split('/').filter(Boolean).slice(-2).join('/')}`
+    const path = u.pathname.split('/').filter(Boolean).slice(-2).join('/')
+    return `${path} @ ${u.hostname}`
   } catch {
-    return String(url).slice(0, 60)
+    return String(url).slice(0, 80)
   }
 }
 
-/** 把底层 fetch 错误翻译成人话: 超时/断连/限速/鉴权 一眼可辨, 并附请求标签与耗时。 */
+/** 把底层 fetch 错误翻译成人话: 超时/断连/限速/鉴权 一眼可辨, 并附请求标签与耗时。
+ *  Node fetch 表面只给 "fetch failed", 真实原因 (ETIMEDOUT/ECONNRESET/DNS…) 全藏在
+ *  e.cause 链里 — 此处逐层解包后再匹配, 绝不让日志只留一句 fetch failed。 */
 function describeApiError(e, label, startedAt, timeoutMs) {
   const elapsed = Date.now() - startedAt
-  const raw = String(e?.message || e)
-  const cause = /aborted due to timeout/i.test(raw)
+  const causes = []
+  let cur = e
+  for (let i = 0; i < 4 && cur; i++) {
+    causes.push(String(cur?.message || cur))
+    cur = cur?.cause
+  }
+  const raw = causes.filter(Boolean).join(' → ')
+  const cause = /aborted due to timeout|The operation was aborted|AbortError/i.test(raw)
     ? `超时 (${Math.round(timeoutMs / 1000)}s 无响应, 实际等待 ${(elapsed / 1000).toFixed(1)}s)`
-    : /ECONNRESET|socket hang up/i.test(raw)
-      ? '连接被对端重置 (ECONNRESET)'
-      : /ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(raw)
-        ? 'DNS 解析失败 (域名解析不通)'
-        : /ECONNREFUSED/i.test(raw)
-          ? '连接被拒绝 (端口未监听)'
-          : /CERT|SSL|TLS/i.test(raw)
-            ? 'TLS 证书错误'
-            : raw.slice(0, 120)
+    : /ETIMEDOUT|Connect Timeout|connect.*timed?out/i.test(raw)
+      ? `连接超时 (TCP 握手无响应, 实际等待 ${(elapsed / 1000).toFixed(1)}s) — 网络丢包或对端防火墙丢包`
+      : /ECONNRESET|socket hang up|Undici SocketError/i.test(raw)
+        ? `连接被对端重置 (ECONNRESET${causes.length > 1 ? ` [${causes[1].slice(0, 80)}]` : ''})`
+        : /ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(raw)
+          ? `DNS 解析失败 (域名解析不通 [${causes[1]?.slice(0, 80) || raw.slice(0, 80)}])`
+          : /ECONNREFUSED/i.test(raw)
+            ? '连接被拒绝 (端口未监听, 服务没起)'
+            : /EHOSTUNREACH|ENETUNREACH/i.test(raw)
+              ? '网络不可达 (路由不通)'
+              : /CERT|SSL|TLS/i.test(raw)
+                ? `TLS 证书错误 [${causes[1]?.slice(0, 80) || ''}]`
+                : raw.slice(0, 160)
   return `${label}: ${cause}`
 }
 
@@ -961,9 +1046,16 @@ async function apiCall(url, body, timeoutMs = 30_000) {
     })
   } catch (e) {
     // 网络层失败 (超时/DNS/断连): 带上请求标签与耗时重抛, 调用方日志直接可读
-    throw Object.assign(new Error(describeApiError(e, label, startedAt, timeoutMs)), { label })
+    adminFailStreak += 1
+    throw Object.assign(new Error(describeApiError(e, label, startedAt, timeoutMs)), { label, network: true })
   }
   const elapsed = Date.now() - startedAt
+  // 收到任何 HTTP 响应 (含 429/401/5xx) 都证明网络通、后台进程活着, 连败计数清零
+  if (adminFailStreak > 0) {
+    log(`后台已恢复: 连续失败 ${adminFailStreak} 次后重新收到响应 (${label}, HTTP ${res.status}, 耗时 ${elapsed}ms)`)
+  }
+  adminFailStreak = 0
+  lastAdminOkAt = Date.now()
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('retry-after') || 5) || 5
     throw Object.assign(new Error(`${label}: 后台限速 429, ${retryAfter}s 后重试`), { rateLimited: retryAfter, label })
@@ -1206,12 +1298,16 @@ async function apiCallWithRetry(url, body, timeoutMs = 30_000) {
     return await apiCall(url, body, timeoutMs)
   } catch (e) {
     if (e?.fatal || e?.rateLimited) throw e
-    log(`后台请求失败 (第 1 次尝试): ${e?.message} — 3s 后换新连接重试`)
-    await sleep(3000)
+    // 重试等待期间并行做 DNS/TCP 分层诊断, 探测结果随失败日志输出 (不拖慢重试节奏)
+    const [diag] = await Promise.all([
+      e?.network ? probeReachability(url) : Promise.resolve(''),
+      sleep(3000),
+    ])
+    log(`后台请求失败 (第 1 次尝试): ${e?.message}${diag ? ` ${diag}` : ''}${adminHealthNote()} — 现在换新连接重试`)
     try {
       return await apiCall(url, body, timeoutMs)
     } catch (e2) {
-      log(`后台请求失败 (第 2 次尝试): ${e2?.message} — 放弃本轮`)
+      log(`后台请求失败 (第 2 次尝试): ${e2?.message}${adminHealthNote()} — 放弃本轮`)
       throw e2
     }
   }

@@ -886,8 +886,53 @@ const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = 
   { key: 'auto_polish_interval', value: '86400', description: '商品自动擦亮间隔(秒)' },
 ]
 
+/**
+ * 表结构内容指纹: 建表语句 + 迁移 + 种子数据任一变化都会改变指纹。
+ * 用途: initSchema 冷启动短路 —— 指纹一致 = 结构/迁移/种子全部就位,
+ * 直接返回, 不再逐条跑 70 条 ALTER + 逐条种子 INSERT (云端 D1 每条都是
+ * 一次网络往返, 冷启动曾因此背 80+ 次串行往返 = 9~45s, 代理轮询全部超时)。
+ * 纯 JS FNV-1a (CF Workers 无 node:crypto, 不引入依赖)。
+ */
+function fnv1a(str: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+let _schemaFingerprint = ''
+function schemaFingerprint(): string {
+  if (_schemaFingerprint) return _schemaFingerprint
+  const autoKey = 'sqlite' // 指纹统一用 sqlite 方言, 与驱动无关
+  const normalized = SCHEMA.map((s) => s.replace(/__AUTO__/g, autoKey)).join(';\n')
+  _schemaFingerprint =
+    fnv1a(normalized) +
+    '-' +
+    fnv1a(MIGRATIONS.join('|')) +
+    '-' +
+    fnv1a(JSON.stringify(DEFAULT_SETTINGS)) +
+    '-' +
+    fnv1a(JSON.stringify(BUILTIN_CARD_VARIABLES))
+  return _schemaFingerprint
+}
+
 export async function initSchema(db: DatabaseAdapter): Promise<void> {
   const auto = AUTO[db.driver] || AUTO.sqlite
+
+  // 冷启动短路: 指纹一致 = 全部结构/迁移/种子已就位, 1 次查询即返回。
+  // 首次启动/升级时 system_settings 尚无此行或表不存在 → 全量初始化后写入指纹。
+  // (表不存在时 get 报错 → caught → 指纹视作缺失 → 走全量建表)
+  try {
+    const marker = await db.get<{ value: string }>(
+      "SELECT value FROM system_settings WHERE key_name = 'schema_fingerprint'",
+    )
+    if (marker?.value === schemaFingerprint()) return
+  } catch {
+    /* 表未建: 走全量初始化 */
+  }
+
   // 全量建表语句合并为一次 exec: D1 适配器把多语句打包成一个 batch (单次往返),
   // 云端冷启动从 ~130 次串行往返降为 1 次, 显著缩短首个请求的建立时间
   await db.exec(SCHEMA.map((stmt) => stmt.replace(/__AUTO__/g, auto)).join(';\n'))
@@ -947,14 +992,34 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     )
   }
 
-  // Seed builtin card variables (幂等补种; 用户启停/改说明不覆盖, 删除后按 builtin 定义找回)
+  // Seed builtin card variables (幂等补种; 用户启停/改说明不覆盖, 删除后按 builtin 定义找回):
+  // 先一次读全量 key, 只补插缺失的 (稳态 0 条 INSERT, 不再逐条白跑 N 次往返)
+  const existingVarKeys = new Set(
+    (await db.all<{ var_key: string }>('SELECT var_key FROM card_variables').catch(() => [])).map((r) => r.var_key),
+  )
   for (const v of BUILTIN_CARD_VARIABLES) {
+    if (existingVarKeys.has(v.var_key)) continue
     await db
       .run(
         `INSERT INTO card_variables (var_key, label, category, description, sample_value, builtin, enabled, sort)
-         VALUES (?, ?, ?, ?, '', 1, 1, ?)
-         ON CONFLICT(var_key) DO NOTHING`,
+         VALUES (?, ?, ?, ?, '', 1, 1, ?)`,
         [v.var_key, v.label, v.category, v.description, v.sort],
+      )
+      .catch(() => {})
+  }
+
+  // 写入结构指纹 (幂等, 跨驱动先查后写): 之后每个冷启动实例 1 次查询即短路返回
+  const fp = schemaFingerprint()
+  const fpRow = await db
+    .get<{ key_name: string }>("SELECT key_name FROM system_settings WHERE key_name = 'schema_fingerprint'")
+    .catch(() => null)
+  if (fpRow) {
+    await db.run('UPDATE system_settings SET value = ? WHERE key_name = ?', [fp, 'schema_fingerprint']).catch(() => {})
+  } else {
+    await db
+      .run(
+        "INSERT INTO system_settings (key_name, value, description) VALUES ('schema_fingerprint', ?, '表结构/迁移/种子内容指纹 (自动计算, 勿改)')",
+        [fp],
       )
       .catch(() => {})
   }
