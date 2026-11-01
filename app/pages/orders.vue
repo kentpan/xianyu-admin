@@ -1,12 +1,12 @@
 <template>
   <div class="space-y-5 animate-fade-in">
-    <PageHeader title="订单管理" description="查看 / 同步 / 手动发货 / 导入导出订单">
+    <PageHeader title="订单管理" description="订单列表 / 获取最新订单 / 手动发货 / 导入导出">
       <template #actions>
         <button class="btn-secondary" @click="reload">
           <Icon name="refresh" :class="loading ? 'animate-spin' : ''" /> 刷新
         </button>
         <button class="btn-secondary" :disabled="syncing" @click="syncAll">
-          <Icon name="refresh" :class="syncing ? 'animate-spin' : ''" /> 一键同步
+          <Icon name="refresh" :class="syncing ? 'animate-spin' : ''" /> 获取最新的订单列表
         </button>
         <button class="btn-secondary" @click="openImport">
           <Icon name="upload" /> 导入
@@ -144,13 +144,19 @@
                   </template>
                   <span v-else class="text-slate-400">—</span>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(o.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">
+                  <p>{{ formatTime(o.created_at) }}</p>
+                  <p v-if="o.paid_at" class="text-xs text-slate-400">付款 {{ formatTime(o.paid_at) }}</p>
+                  <p v-if="o.shipped_at" class="text-xs text-slate-400">发货 {{ formatTime(o.shipped_at) }}</p>
+                  <p v-if="o.finished_at" class="text-xs text-slate-400">完成 {{ formatTime(o.finished_at) }}</p>
+                  <p v-if="o.cancelled_at" class="text-xs text-slate-400">取消 {{ formatTime(o.cancelled_at) }}</p>
+                </td>
                 <td>
                   <div class="flex items-center justify-end gap-1" @click.stop>
                     <button class="btn-ghost !px-2 !py-1" title="查看详情" @click="openDetail(o)">
                       <Icon name="eye" />
                     </button>
-                    <button class="btn-ghost !px-2 !py-1" title="同步" @click="refreshOne(o)">
+                    <button class="btn-ghost !px-2 !py-1" title="详情精修 (从闲鱼实查回写)" @click="refreshOne(o)">
                       <Icon name="refresh" />
                     </button>
                     <button class="btn-ghost !px-2 !py-1" title="手动发货" @click="manualShip(o)">
@@ -171,10 +177,22 @@
       <!-- Pagination -->
       <div v-if="total > pageSize" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-slate-700">
         <p class="text-xs text-slate-500">共 {{ total }} 条，第 {{ page }} / {{ totalPages }} 页</p>
-        <div class="flex items-center gap-1">
+        <div class="flex items-center gap-1 flex-wrap">
           <button class="btn-secondary !px-2.5 !py-1.5" :disabled="page <= 1" @click="goPage(page - 1)">
             <Icon name="chevronRight" class="rotate-180" />
           </button>
+          <template v-for="(p, i) in pageItems" :key="`${p}-${i}`">
+            <span v-if="typeof p === 'string'" class="px-1.5 text-slate-400 select-none">{{ p }}</span>
+            <button
+              v-else
+              class="btn-secondary !px-2.5 !py-1.5 min-w-8"
+              :class="p === page ? '!bg-brand-600 !text-white !border-brand-600 hover:!bg-brand-700' : ''"
+              :disabled="p === page"
+              @click="goPage(p)"
+            >
+              {{ p }}
+            </button>
+          </template>
           <button class="btn-secondary !px-2.5 !py-1.5" :disabled="page >= totalPages" @click="goPage(page + 1)">
             <Icon name="chevronRight" />
           </button>
@@ -182,7 +200,7 @@
       </div>
     </div>
 
-    <!-- Detail drawer -->
+    <!-- Detail drawer (只读信息 + 单订单精修编辑) -->
     <DetailDrawer v-model="detailOpen" :eyebrow="'订单详情'" :title="detail?.order_id || '—'">
       <div v-if="detail" class="space-y-5">
         <!-- Status -->
@@ -220,6 +238,22 @@
           <div class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
             <span class="text-slate-400">创建时间</span>
             <span class="col-span-2">{{ formatTime(detail.created_at) }}</span>
+          </div>
+          <div v-if="detail.paid_at" class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
+            <span class="text-slate-400">付款时间</span>
+            <span class="col-span-2">{{ formatTime(detail.paid_at) }}</span>
+          </div>
+          <div v-if="detail.shipped_at" class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
+            <span class="text-slate-400">发货时间</span>
+            <span class="col-span-2">{{ formatTime(detail.shipped_at) }}</span>
+          </div>
+          <div v-if="detail.finished_at" class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
+            <span class="text-slate-400">完成时间</span>
+            <span class="col-span-2">{{ formatTime(detail.finished_at) }}</span>
+          </div>
+          <div v-if="detail.cancelled_at" class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
+            <span class="text-slate-400">取消时间</span>
+            <span class="col-span-2">{{ formatTime(detail.cancelled_at) }}</span>
           </div>
         </div>
 
@@ -430,6 +464,23 @@ const importing = ref(false)
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
+/** 页码列表 (省略号折叠: 始终含首尾页与当前页±1) */
+const pageItems = computed<(number | string)[]>(() => {
+  const tp = totalPages.value
+  const cur = page.value
+  if (tp <= 7) return Array.from({ length: tp }, (_, i) => i + 1)
+  const picks = new Set<number>([1, tp, cur - 1, cur, cur + 1])
+  const arr = [...picks].filter((p) => p >= 1 && p <= tp).sort((a, b) => a - b)
+  const out: (number | string)[] = []
+  let prev = 0
+  for (const p of arr) {
+    if (p - prev > 1) out.push('…')
+    out.push(p)
+    prev = p
+  }
+  return out
+})
+
 async function reload() {
   loading.value = true
   try {
@@ -492,38 +543,37 @@ async function saveDetail() {
   }
 }
 
+/** 单订单详情精修: 从闲鱼实查该订单并回写本地库 */
 async function refreshOne(o: Order) {
   try {
     await refreshOrder(o.order_id)
-    toast.success(`订单 ${o.order_id} 已同步`)
+    toast.success(`订单 ${o.order_id} 详情已精修回写`)
+    reload()
   } catch (e: any) {
-    toast.error(e.message || '同步失败')
+    toast.error(e.message || '详情精修失败')
   }
 }
 
 async function syncAll() {
   syncing.value = true
   try {
-    // 一键同步: 先拉闲鱼卖家订单列表 (全部状态, 含已付款待发货) 入库, 再精修非终态详情
+    // 获取最新的订单列表: 拉闲鱼卖家全部状态订单 (含待发货/已发货) 入库, 纯列表同步
     const r = await refreshAllOrders({ cookie_id: filters.cookie_id || undefined })
     const parts: string[] = []
-    if (r.list_sync) {
-      if (r.list_sync.inserted) parts.push(`新拉取 ${r.list_sync.inserted} 单`)
-      if (r.list_sync.updated) parts.push(`列表更新 ${r.list_sync.updated} 单`)
-      if (r.list_sync.blocked) parts.push(`账号隔离拦截 ${r.list_sync.blocked} 单`)
-      if (r.list_sync.skipped_deleted) parts.push(`已删除屏蔽 ${r.list_sync.skipped_deleted} 单`)
-      if (r.list_sync.errors?.length) parts.push(`异常 ${r.list_sync.errors.length} 条`)
-    }
-    if (r.total) parts.push(`详情精修 ${r.total} 单 (状态更新 ${r.updated}, 无变化 ${r.no_change}${r.failed ? `, 失败 ${r.failed}` : ''})`)
-    if (r.list_sync?.errors?.length && !r.total && !r.list_sync.inserted) {
-      toast.error(`同步失败: ${r.list_sync.errors[0]}`)
+    if (r.inserted) parts.push(`新拉取 ${r.inserted} 单`)
+    if (r.updated) parts.push(`更新 ${r.updated} 单`)
+    if (r.blocked) parts.push(`账号隔离拦截 ${r.blocked} 单`)
+    if (r.skipped_deleted) parts.push(`已删除屏蔽 ${r.skipped_deleted} 单`)
+    const hardError = r.errors?.find((e) => !e.startsWith('账号隔离') && !e.startsWith('已删除屏蔽'))
+    if (hardError) {
+      toast.error(`获取失败: ${hardError}`)
     } else if (!parts.length) {
-      toast.info('暂无订单可同步')
+      toast.info('暂无新订单')
     } else {
       toast.success(parts.join(', '))
     }
   } catch (e: any) {
-    toast.error(e.message || '同步失败')
+    toast.error(e.message || '获取失败')
   } finally {
     syncing.value = false
     reload()

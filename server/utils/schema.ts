@@ -109,7 +109,12 @@ const SCHEMA: string[] = [
     receiver_address TEXT,
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    delivery_claim_at TIMESTAMP,
+    paid_at TIMESTAMP,
+    shipped_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    cancelled_at TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS delivery_rules (
     id __AUTO__,
@@ -667,12 +672,17 @@ const MIGRATIONS: string[] = [
   // 监听引擎: 规则作用域 (账号级隔离) + 订单状态机扩展列
   `ALTER TABLE delivery_rules ADD COLUMN cookie_id VARCHAR(64)`,
   `ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0`,
+  `ALTER TABLE orders ADD COLUMN delivery_claim_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN version INTEGER DEFAULT 1`,
   `ALTER TABLE orders ADD COLUMN buy_num INTEGER DEFAULT 1`,
   `ALTER TABLE orders ADD COLUMN auction_price VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN confirm_fee VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN refund_fee VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN post_fee VARCHAR(32) DEFAULT ''`,
+  `ALTER TABLE orders ADD COLUMN paid_at TIMESTAMP`,
+  `ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP`,
+  `ALTER TABLE orders ADD COLUMN finished_at TIMESTAMP`,
+  `ALTER TABLE orders ADD COLUMN cancelled_at TIMESTAMP`,
   // 监听引擎: 账号级买家互动开关 + 公开资料回写列
   `ALTER TABLE cookies ADD COLUMN auto_rate_enabled INTEGER DEFAULT 0`,
   `ALTER TABLE cookies ADD COLUMN auto_flower_enabled INTEGER DEFAULT 0`,

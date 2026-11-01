@@ -11,7 +11,7 @@ import { getDb } from '../db'
 import { generateEngineToken } from '../engine-auth'
 import { XianyuAccountClient, type AccountState, type ManualTokenOutcome } from './ws-client'
 import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
-import { fetchItemList, polishItem, fetchOrderDetail, fetchSellerOrders } from './mtop'
+import { fetchItemList, polishItem, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
 import { isProxyEngineMode, sendTextViaProxy } from './order-task'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from './brain'
@@ -598,81 +598,12 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
         }
       }
     } catch {
-      // 单账号列表拉取失败不阻断详情刷新
+      // 单账号列表拉取失败不阻断后续账号
     }
     await new Promise((r) => setTimeout(r, 500))
   }
 
-  // 第二步: 非稳定状态订单逐单实查精修 (shipped/completed/cancelled 为终态不刷新, 与 butler needs_refresh 一致)
-  let targets: { order_id: string; cookie_id: string; order_status: string }[] = []
-  try {
-    targets = await db.all<any>(
-      `SELECT order_id, cookie_id, order_status FROM orders
-       WHERE order_status IN ('pending_ship','processing','refunding','unknown') OR order_status IS NULL OR order_status = ''
-       ORDER BY updated_at DESC LIMIT 200`,
-    )
-  } catch {
-    return
-  }
-  if (!targets.length) {
-    await db.run("INSERT INTO system_logs (level, module, message) VALUES ('INFO', 'order_sync', '订单同步完成: 无待刷新订单')").catch(() => {})
-    return
-  }
-  const cookieCache = new Map<string, string>()
-  let updated = 0
-  let noChange = 0
-  let failed = 0
-  for (const t of targets) {
-    const orderId = String(t.order_id)
-    const cookieId = String(t.cookie_id || '')
-    try {
-      let cookieStr = cookieCache.get(cookieId) || ''
-      if (!cookieStr) {
-        const row = await db.get<any>('SELECT value FROM cookies WHERE id = ?', [cookieId]).catch(() => null)
-        if (!row?.value) throw new Error('Cookie 为空')
-        cookieStr = String(row.value)
-        cookieCache.set(cookieId, cookieStr)
-      }
-      const { detail, retMsg, finalCookieStr } = await fetchOrderDetail(cookieStr, orderId)
-      if (finalCookieStr && finalCookieStr !== cookieStr) {
-        cookieCache.set(cookieId, finalCookieStr)
-        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId]).catch(() => {})
-        runtime.cookieCache.set(cookieId, finalCookieStr)
-        runtime.clients.get(cookieId)?.setCookieStr(finalCookieStr)
-      }
-      if (!detail) throw new Error(retMsg || '接口未返回订单数据')
-      if (detail.order_status && detail.order_status !== 'unknown') {
-        await db
-          .run(
-            `UPDATE orders SET order_status = ?,
-             buyer_id = CASE WHEN ? != '' THEN ? ELSE buyer_id END,
-             amount = CASE WHEN ? != '' THEN ? ELSE amount END,
-             receiver_name = CASE WHEN ? != '' THEN ? ELSE receiver_name END,
-             receiver_phone = CASE WHEN ? != '' THEN ? ELSE receiver_phone END,
-             receiver_address = CASE WHEN ? != '' THEN ? ELSE receiver_address END,
-             updated_at = CURRENT_TIMESTAMP
-             WHERE order_id = ?`,
-            [
-              detail.order_status,
-              detail.buyer_id, detail.buyer_id,
-              detail.price, detail.price,
-              detail.receiver_name, detail.receiver_name,
-              detail.receiver_phone, detail.receiver_phone,
-              detail.receiver_address, detail.receiver_address,
-              orderId,
-            ],
-          )
-          .catch(() => {})
-      }
-      if (detail.order_status !== String(t.order_status || 'unknown')) updated++
-      else noChange++
-    } catch {
-      failed++
-    }
-    // 单间 500ms 防风控
-    await new Promise((r) => setTimeout(r, 500))
-  }
-  const summary = `订单同步完成: 共 ${targets.length} 单, 状态更新 ${updated}, 无变化 ${noChange}, 失败 ${failed}`
+  const summary = `订单定时同步完成: 待发货列表已按账号拉取入库 (纯列表同步, 无逐单精修)`
   console.log(`[xianyu-engine] ${summary}`)
   await db
     .run(

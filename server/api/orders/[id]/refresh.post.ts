@@ -3,6 +3,8 @@
  * api = mtop.idle.web.trade.order.detail (与 goofish 订单详情页同源接口),
  * 状态/买家/金额/收货人变化全部落库; 平台风控或接口错误如实返回 502, 不伪造成功。
  */
+import { fetchOrderDetail } from '../../../utils/xianyu/mtop'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)

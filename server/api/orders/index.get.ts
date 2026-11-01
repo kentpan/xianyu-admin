@@ -62,6 +62,7 @@ export default defineEventHandler(
         o.quantity, o.amount, o.order_status, o.cookie_id, o.chat_id,
         o.is_bargain, o.receiver_name, o.receiver_phone, o.receiver_address,
         o.receiver_city, o.created_at, o.updated_at,
+        o.paid_at, o.shipped_at, o.finished_at, o.cancelled_at,
         ii.item_title, c.remark AS cookie_remark
       FROM orders o
       LEFT JOIN item_info ii ON ii.cookie_id = o.cookie_id AND ii.item_id = o.item_id

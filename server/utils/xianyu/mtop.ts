@@ -638,13 +638,26 @@ export async function fetchOrderDetail(
   orderId: string,
 ): Promise<{ detail: XianyuOrderDetail | null; retMsg: string; finalCookieStr: string }> {
   if (!orderId) return { detail: null, retMsg: '缺少订单号', finalCookieStr: cookieStr }
-  const r = await mtopCall<any>(
+  let r = await mtopCall<any>(
     'mtop.idle.web.trade.order.detail',
     { orderId: String(orderId), role: 'seller' },
     cookieStr,
     { method: 'POST' },
   )
-  const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
+  let retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
+  // 瞬时风控重试 (v2.1.12): 闲鱼对该接口限流时返回 FAIL_BIZ_COMMON_SYSTEM_ERROR2
+  // ("闲鱼太累了,休息一会儿吧!") — 系统级瞬时错误, 等 2.5s 重试一次通常即过;
+  // 仅对系统错误重试 (状态/鉴权/参数类错误重试无意义)
+  if (/FAIL_BIZ_COMMON_SYSTEM_ERROR|FAIL_SYS_SYSTEM_ERROR|SYSTEM_ERROR/i.test(retStr)) {
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+    r = await mtopCall<any>(
+      'mtop.idle.web.trade.order.detail',
+      { orderId: String(orderId), role: 'seller' },
+      r.cookieStr || cookieStr,
+      { method: 'POST' },
+    )
+    retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
+  }
   if (!retStr.includes('SUCCESS')) {
     return { detail: null, retMsg: retStr || '订单详情查询失败', finalCookieStr: r.cookieStr }
   }
@@ -718,6 +731,11 @@ export interface SellerOrderItem {
   receiver_name: string
   receiver_phone: string
   receiver_address: string
+  /** 状态时间 (列表接口能提取到的): 空串 = 响应未携带, 不伪造。 */
+  paid_at_text: string
+  shipped_at_text: string
+  finished_at_text: string
+  cancelled_at_text: string
   amount: string
   quantity: string
   is_bargain: boolean
@@ -744,6 +762,25 @@ export interface SellerOrdersPage {
   totalCount: number
   retMsg: string
   finalCookieStr: string
+}
+
+/**
+ * 从订单列表 item 尽力提取状态时间 (付款/发货/完成/取消)。
+ * sold 列表接口各版本携带的时间字段名不统一, 这里按候选键名在
+ * commonData 与 item 顶层做大小写不敏感的浅层扫描; 取到即返回原文
+ * (毫秒时间戳/ISO/"YYYY-MM-DD HH:MM:SS" 均可, 由入库方归一化),
+ * 取不到返回空串 — 绝不用当前时刻冒充状态时间。
+ */
+function pickTimeText(sources: any[], keys: string[]): string {
+  for (const src of sources) {
+    if (!src || typeof src !== 'object') continue
+    for (const [k, v] of Object.entries(src)) {
+      if (!keys.includes(String(k).toLowerCase())) continue
+      if (v === null || v === undefined || v === '' || v === 0) continue
+      return String(v)
+    }
+  }
+  return ''
 }
 
 /** 解析卖家订单列表单条 item (语义对齐 butler _parse_sold_order_item)。 */
@@ -775,6 +812,10 @@ export function parseSoldOrderItem(item: any): SellerOrderItem | null {
     quantity: String(priceVo.buyNum ?? '1'),
     is_bargain: btnList.some((b: any) => b?.tradeAction === 'SKIP_PIN'),
     created_at_text: String(common.createTime || ''),
+    paid_at_text: pickTimeText([common, item], ['paytime', 'paidtime', 'pay_time', 'paid_time']),
+    shipped_at_text: pickTimeText([common, item], ['shiptime', 'shippedtime', 'consigntime', 'delivertime', 'deliverytime', 'sendtime']),
+    finished_at_text: pickTimeText([common, item], ['successtime', 'finishtime', 'confirmtime', 'dealsuccesstime', 'confirmreceivetime', 'receivedtime']),
+    cancelled_at_text: pickTimeText([common, item], ['closetime', 'canceltime', 'closedtime']),
   }
 }
 

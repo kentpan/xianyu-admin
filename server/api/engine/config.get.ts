@@ -41,6 +41,20 @@ export default defineEventHandler(
        WHERE COALESCE(cs.enabled, 1) = 1`,
     )
 
+    // 订单自动同步节奏 (v2.1.12): 后台系统设置为准 (order_sync_enabled/order_sync_interval),
+    // 下发给代理定时触发 POST /api/engine/orders-sync (CF 无长驻进程, 代理是唯一长驻点)
+    const syncSettings = await db
+      .all<{ key_name: string; value: string }>(
+        "SELECT key_name, value FROM system_settings WHERE key_name IN ('order_sync_enabled', 'order_sync_interval')",
+      )
+      .catch(() => [] as { key_name: string; value: string }[])
+    const settingMap = new Map(syncSettings.map((r) => [r.key_name, r.value]))
+    const orderSyncEnabled = String(settingMap.get('order_sync_enabled') ?? 'true') !== 'false'
+    const orderSyncSeconds = Math.min(
+      Math.max(Math.round(Number(settingMap.get('order_sync_interval') || 1800)) || 1800, 600),
+      7200,
+    )
+
     await db
       .run(
         'UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?',
@@ -55,7 +69,12 @@ export default defineEventHandler(
         cookies: a.cookies,
         device_id: a.device_id || '',
       })),
-      intervals: { poll_seconds: 30, heartbeat_seconds: 15 },
+      intervals: {
+        poll_seconds: 30,
+        heartbeat_seconds: 15,
+        order_sync_enabled: orderSyncEnabled,
+        order_sync_seconds: orderSyncSeconds,
+      },
       server_time: Date.now(),
     })
   }),

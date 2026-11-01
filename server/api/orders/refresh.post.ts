@@ -1,18 +1,18 @@
 /**
- * POST /api/orders/refresh — 一键同步订单 (列表拉取 + 详情精修)。
- * Body: { cookie_id?: string, status?: string }
+ * POST /api/orders/refresh — 获取最新的订单列表 (纯列表同步, 无逐单详情精修)。
+ * Body: { cookie_id?: string }
  *
- * 第一步: 按账号拉取闲鱼卖家已售订单列表 (mtop.taobao.idle.trade.merchant.sold.get,
- *         queryCode=ALL, 最多 5 页/150 单), 全部状态订单 upsert 入库 —
- *         交易卡片丢失/解析失败时 "已付款待发货" 订单也能从这里补齐 (用户核心数据)。
- * 第二步: 对本地非终态订单 (pending_ship/processing/refunding/unknown) 逐单调
- *         mtop.idle.web.trade.order.detail 精修 (规格/城市等列表接口不含的字段),
- *         每单间隔 300ms 防风控。
+ * 按账号拉取闲鱼卖家已售订单列表 (mtop.taobao.idle.trade.merchant.sold.get,
+ * queryCode=ALL, 最多 5 页/150 单), 全部状态订单 upsert 入库 — 含待发货/已发货/
+ * 已完成/已取消, created_at 用闲鱼返回的真实下单时间。
  *
- * 返回 { total, updated, no_change, failed, results[], list_sync: { inserted, updated, accounts, errors[] } },
- * 失败单据如实携带错误信息。
+ * 历史: 旧版第二步会对非终态订单逐单调 order.detail "精修" (50~200 单 × 500ms+),
+ * 是一键同步动辄数十秒超时的元凶。按需求详情精修能力已全链路移除,
+ * 本接口只做列表同步, 秒级返回。
+ *
+ * 返回 { inserted, updated, blocked, skipped_deleted, accounts, mode, elapsed_ms, errors[] }。
  */
-import { fetchOrderDetail, fetchSellerOrders, cookieIdentityMismatch } from '../../utils/xianyu/mtop'
+import { fetchSellerOrders, cookieIdentityMismatch } from '../../utils/xianyu/mtop'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
 import { isGatewayMode } from '../../utils/xianyu/gateway'
@@ -23,9 +23,7 @@ export default defineEventHandler(
     const db = await getDb()
     const body = await readBody(event).catch(() => ({}))
     const cookieFilter = String(body?.cookie_id || '').trim()
-    const statusFilter = String(body?.status || '').trim()
 
-    /* ---- 第一步: 订单列表拉取 (全部状态, 含已付款待发货) ---- */
     const accounts = cookieFilter
       ? await db.all<{ id: string; value: string }>('SELECT id, value FROM cookies WHERE id = ?', [cookieFilter]).catch(() => [])
       : await db
@@ -39,15 +37,13 @@ export default defineEventHandler(
     const listErrors: string[] = []
     const MAX_LIST_PAGES = 5
 
-    /* ---- 全局时间预算闸门: 一键同步是同步接口, 必须在请求预算内完成并如实返回 ----
-     * 历史: 逐页任务通道等待 (20s/页) × 5 页 + 逐单详情精修 (200 单) 无总闸,
-     * 代理回报链路抖动时整请求挂起近 2 分钟。现全部环节受 deadline 约束,
-     * 到点如实返回已拉到的部分 + 显性错误, 绝不再无限等。 */
+    /* ---- 全局时间预算闸门: 同步接口必须在请求预算内完成并如实返回 ----
+     * 到点如实返回已拉到的部分 + 显性错误, 绝不无限等。 */
     const REFRESH_BUDGET_MS = 55_000
     const deadline = Date.now() + REFRESH_BUDGET_MS
     const remainMs = () => deadline - Date.now()
 
-    /* ---- 第一步分流: 独立代理模式 → ① 透传网关优先 (引擎登记了公网 IP:端口, CF 直连代理
+    /* ---- 分流: 独立代理模式 → ① 透传网关优先 (引擎登记了公网 IP:端口, CF 直连代理
      *      转发 mtop, 秒级直返) → ② 任务通道兜底 (网关未登记/不可达); 内置引擎 → 本机直连 ---- */
     const proxyMode = await isProxyEngineMode(db)
     const gwMode = await isGatewayMode(db)
@@ -167,117 +163,18 @@ export default defineEventHandler(
       listErrors.push(`已删除屏蔽: 跳过 ${listSkippedDeleted} 条曾手动删除的订单 (不再拉回)`)
     }
 
-    /* ---- 第二步: 非终态订单详情精修 (规格/城市等列表接口不含的字段) ----
-     * 透传网关已登记 (gwMode) 时照常执行: 详情接口经网关转发可达; 仅"代理模式且未登记
-     * 网关"跳过 (详情接口 CF 不可直连, 逐单任务等待在请求预算内不可能完成) ---- */
-    const refineEnabled = (!proxyMode || gwMode) && remainMs() > 15_000
-    if (!refineEnabled && (proxyMode || gwMode) && remainMs() <= 15_000) {
-      listErrors.push('列表同步耗尽时间预算, 详情精修本轮跳过')
-    }
-    const rows = refineEnabled
-      ? await db.all<any>(
-          `SELECT o.order_id, o.cookie_id, o.order_status FROM orders o
-           WHERE o.order_status IN ('pending_ship', 'processing', 'refunding', 'unknown')
-              OR o.order_status IS NULL OR o.order_status = ''
-           ${cookieFilter ? 'AND o.cookie_id = ?' : ''}
-           ORDER BY o.updated_at DESC LIMIT 200`,
-          cookieFilter ? [cookieFilter] : [],
-        )
-      : []
-    const targets = rows.filter((r) => !statusFilter || String(r.order_status || 'unknown') === statusFilter)
-
-    const cookieCache = new Map<string, string>()
-    const results: { order_id: string; changed: boolean; error?: string }[] = []
-    let updated = 0
-    let noChange = 0
-    let failed = 0
-
-    for (const t of targets) {
-      if (remainMs() < 3_000) {
-        results.push({ order_id: '(后续)', changed: false, error: '整体时间预算耗尽, 剩余订单详情精修跳过 (列表数据已入库)' })
-        break
-      }
-      const orderId = String(t.order_id)
-      const cookieId = String(t.cookie_id || '')
-      try {
-        let cookieStr = cookieCache.get(cookieId) || ''
-        if (!cookieStr) {
-          const acct = await db.get<any>('SELECT value FROM cookies WHERE id = ?', [cookieId])
-          if (!acct?.value) throw new Error(`账号 ${cookieId} 不存在或 Cookie 为空`)
-          cookieStr = acct.value
-          cookieCache.set(cookieId, cookieStr)
-        }
-
-        const { detail, retMsg, finalCookieStr } = await fetchOrderDetail(cookieStr, orderId)
-        if (finalCookieStr && finalCookieStr !== cookieStr) {
-          cookieCache.set(cookieId, finalCookieStr)
-          await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId])
-        }
-        if (!detail) throw new Error(retMsg || '闲鱼接口未返回订单数据')
-
-        const sets: string[] = []
-        const params: unknown[] = []
-        if (detail.order_status && detail.order_status !== 'unknown') {
-          sets.push('order_status = ?')
-          params.push(detail.order_status)
-        }
-        if (detail.buyer_id) {
-          sets.push('buyer_id = ?')
-          params.push(detail.buyer_id)
-        }
-        if (detail.price) {
-          sets.push('amount = ?')
-          params.push(detail.price)
-        }
-        if (detail.receiver_name) {
-          sets.push('receiver_name = ?')
-          params.push(detail.receiver_name)
-        }
-        if (detail.receiver_phone) {
-          sets.push('receiver_phone = ?')
-          params.push(detail.receiver_phone)
-        }
-        if (detail.receiver_address) {
-          sets.push('receiver_address = ?')
-          params.push(detail.receiver_address)
-        }
-        sets.push('updated_at = CURRENT_TIMESTAMP')
-        await db.run(`UPDATE orders SET ${sets.join(', ')} WHERE order_id = ?`, [...params, orderId])
-
-        const changed = detail.order_status !== String(t.order_status || 'unknown')
-        if (changed) updated++
-        else noChange++
-        results.push({ order_id: orderId, changed })
-      } catch (e: any) {
-        failed++
-        results.push({ order_id: orderId, changed: false, error: String(e?.message || e) })
-      }
-      // 单间间隔防风控
-      await new Promise((r) => setTimeout(r, 300))
-    }
-
     return ok(
       {
-        total: targets.length,
-        updated,
-        no_change: noChange,
-        failed,
-        results,
+        inserted: listInserted,
+        updated: listUpdated,
+        blocked: listBlocked,
+        skipped_deleted: listSkippedDeleted,
+        accounts: accounts.length,
+        errors: listErrors,
+        mode: gwMode ? 'gateway' : proxyMode ? 'proxy' : 'direct',
         elapsed_ms: REFRESH_BUDGET_MS - remainMs(),
-        list_sync: {
-          inserted: listInserted,
-          updated: listUpdated,
-          blocked: listBlocked,
-          skipped_deleted: listSkippedDeleted,
-          accounts: accounts.length,
-          errors: listErrors,
-          mode: gwMode ? 'gateway' : proxyMode ? 'proxy' : 'direct',
-          detail_refine: refineEnabled
-            ? 'executed'
-            : 'skipped (代理模式未登记网关地址 / 时间预算耗尽: 详情接口不可达或预算不足, 列表字段已含核心数据)',
-        },
       },
-      listInserted || listUpdated ? `订单列表已同步: 新拉取 ${listInserted} 单, 更新 ${listUpdated} 单` : '订单列表已同步',
+      listInserted || listUpdated ? `已获取最新订单列表: 新拉取 ${listInserted} 单, 更新 ${listUpdated} 单` : '已获取最新订单列表',
     )
   }),
 )

@@ -69,14 +69,23 @@ export async function upsertSoldOrder(
   if (await isDeletedOrder(db, String(o.order_id))) return 'deleted'
 
   const createdAt = normalizeCreatedAt(o.created_at_text)
+  // 状态时间 (付款/发货/完成/取消): 列表接口未携带时为空串, 不写入不伪造
+  const statusTimes: Array<[string, string, string]> = [
+    ['paid_at', 'paid_at_text', normalizeCreatedAt(String(o.paid_at_text || ''))],
+    ['shipped_at', 'shipped_at_text', normalizeCreatedAt(String(o.shipped_at_text || ''))],
+    ['finished_at', 'finished_at_text', normalizeCreatedAt(String(o.finished_at_text || ''))],
+    ['cancelled_at', 'cancelled_at_text', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
+  ]
   const before = await db
     .get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
     .catch(() => null)
 
   // 动态拼 created_at: 解析成功才写/回填, 失败时插入走列默认值、更新保留本地
+  const timeCols = statusTimes.filter(([, , v]) => v).map(([col]) => `, ${col}`)
+  const timePlaceholders = statusTimes.filter(([, , v]) => v).map(() => ', ?').join('')
   const cols = `order_id, item_id, buyer_id, order_status, cookie_id, amount, quantity, is_bargain,
-                receiver_name, receiver_phone, receiver_address, version, system_shipped${createdAt ? ', created_at' : ''}`
-  const vals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0${createdAt ? ', ?' : ''}`
+                receiver_name, receiver_phone, receiver_address, version, system_shipped${createdAt ? ', created_at' : ''}${timeCols}`
+  const vals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0${createdAt ? ', ?' : ''}${timePlaceholders}`
   const base = [
     o.order_id,
     o.item_id || '',
@@ -91,6 +100,15 @@ export async function upsertSoldOrder(
     o.receiver_address || '',
   ]
   if (createdAt) base.push(createdAt)
+  for (const [, , v] of statusTimes) {
+    if (v) base.push(v)
+  }
+
+  // 状态时间更新语义: 上游有值才覆盖 (状态只会向前演进, 空值绝不抹掉本地已有时间)
+  const timeUpdateSets = statusTimes
+    .filter(([, , v]) => v)
+    .map(([col]) => `, ${col} = excluded.${col}`)
+    .join('')
 
   await db
     .run(
@@ -106,7 +124,7 @@ export async function upsertSoldOrder(
          receiver_name = CASE WHEN excluded.receiver_name != '' THEN excluded.receiver_name ELSE orders.receiver_name END,
          receiver_phone = CASE WHEN excluded.receiver_phone != '' THEN excluded.receiver_phone ELSE orders.receiver_phone END,
          receiver_address = CASE WHEN excluded.receiver_address != '' THEN excluded.receiver_address ELSE orders.receiver_address END
-         ${createdAt ? ", created_at = excluded.created_at" : ""},
+         ${createdAt ? ", created_at = excluded.created_at" : ""}${timeUpdateSets},
          updated_at = CURRENT_TIMESTAMP`,
       base,
     )

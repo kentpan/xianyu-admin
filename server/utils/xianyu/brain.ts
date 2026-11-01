@@ -46,6 +46,8 @@ interface BrainOptions {
 const orderLocks = new Map<string, Promise<unknown>>()
 const orderCooldown = new Map<string, number>()
 const ORDER_COOLDOWN_MS = 10 * 60 * 1000
+/** 发货认领租期: 兜底实例中途被杀后残留认领的自动过期 (正常失败路径会主动释放) */
+const ORDER_CLAIM_LEASE_MS = 10 * 60 * 1000
 
 /** 卖家手动回复后暂停该会话自动回复 (落库 chat_pauses, 跨引擎/跨实例全局可见; minutes=账号 pause_duration, 0 = 不暂停)。 */
 export async function pauseChatAutoReply(
@@ -1484,9 +1486,36 @@ async function autoDeliver(
     return []
   }
 
+  // DB 级原子发货认领 (v2.1.12): 防重双保险的最后一道闸。
+  // 背景: CF Pages 每个请求一个隔离实例, 内存锁 (orderLocks) 跨实例无效 —— 同一订单
+  // 两个触发事件 (付款卡片重报/提醒发货) 相隔几秒各落在不同实例, 都通过 system_shipped
+  // 检查 (此时首个决策还卡在卡券 delay_seconds 的 sleep 里没落库) → 重复发货两份。
+  // 认领是原子 UPDATE: 抢不到 = 已发货或另一实例决策进行中, 跨实例/跨引擎全局有效。
+  // 认领租期 10 分钟仅兜底实例中途被杀的残留认领; 正常失败路径在下方主动释放, 不阻塞重试。
+  const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ')
+  const claimCutoff = new Date(Date.now() - ORDER_CLAIM_LEASE_MS).toISOString().slice(0, 19).replace('T', ' ')
+  const claim = await db
+    .run(
+      `UPDATE orders SET delivery_claim_at = ?
+       WHERE order_id = ? AND IFNULL(system_shipped, 0) = 0
+         AND (delivery_claim_at IS NULL OR delivery_claim_at < ?)`,
+      [nowStr, orderId, claimCutoff],
+    )
+    .catch(() => ({ changes: 1 })) // DB 异常时放行 (下游仍有 system_shipped 检查兜底)
+  if (!Number(claim.changes)) {
+    logWarn(`[${cookieId}] 订单 ${orderId} 未抢到发货认领 (已发货或另一决策进行中), 跳过本次重复触发`)
+    await addLog(db, cookieId, logMsg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'delivery_in_progress',
+      reply_strategy: 'none',
+      reply_text: `订单 ${orderId} 正在发货或刚发过 (并发触发被防重认领拦截)`,
+    })
+    return []
+  }
+
   const run = (async () => {
     try {
-      return await (async () => {
+      const result = await (async () => {
     const buyerId = ctx.buyerId || order?.buyer_id || ''
     const chatId = ctx.chatId || order?.chat_id || ''
 
@@ -1833,7 +1862,18 @@ async function autoDeliver(
     )
     return deliveryLogId ? actions.map((a) => ({ ...a, log_id: deliveryLogId })) : actions
       })()
+      // 失败路径释放发货认领 (无规则/卡券发完/发货失败): 不阻塞后续事件重试;
+      // 成功时 system_shipped=1 已永久拦截, 认领保留与否均无影响
+      const shippedAfter = await db
+        .get<{ system_shipped: number }>('SELECT system_shipped FROM orders WHERE order_id = ?', [orderId])
+        .catch(() => null)
+      if (Number(shippedAfter?.system_shipped ?? 0) !== 1) {
+        await db.run('UPDATE orders SET delivery_claim_at = NULL WHERE order_id = ?', [orderId]).catch(() => {})
+      }
+      return result
     } catch (e: any) {
+      // 异常路径同样释放认领, 保证代理重报/买家提醒可安全重试
+      await db.run('UPDATE orders SET delivery_claim_at = NULL WHERE order_id = ?', [orderId]).catch(() => {})
       // (v2.1.6) 发货全链路异常兜底: mtop 网关/任务/直连全挂、DB 异常等场景不再炸决策
       // (曾致: 占位被删 → 代理「决策超时失效」无限重报 → 不发货+无日志死循环)。
       // 落 delivery_failed 决策日志 + 通知, 决策正常终结, 代理重报后由防重链安全重试。
