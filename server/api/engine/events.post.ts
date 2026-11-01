@@ -4,8 +4,9 @@
  * 鉴权: 标准 `Authorization: Bearer <token>` (engines.token, 逐引擎独立)。
  * 限速: 每令牌令牌桶 120 次/分钟 (突发 40), 超限 429 + Retry-After。
  *
- * 代理只做纯粹的消息监听与转发, 不持有任何业务状态:
- *   - 上报: 账号连接状态 / 风控事件 / 解密后的聊天与交易消息 / 动作执行结果 (转发, 不决策)
+ * 代理只做纯粹的网关与透传 (零业务解析), 不持有任何业务状态:
+ *   - 上报: 账号连接状态 / 风控事件 / 原始同步包条目 (sync_item, base64 原文不动) /
+ *     动作执行结果 (转发, 不决策; 所有闲鱼数据解析只在后台)
  *   - 回收: 本后台大脑 (回复链/发货链) 决策出的动作列表, 代理按 delay_ms 人化执行
  *
  * 两种决策模式 (按代理版本自动协商):
@@ -23,8 +24,11 @@
  * {
  *   "status": { "accounts": [{ "id": "xy_1", "state": "listening", "detail": "" }] },   // 可选
  *   "events": [
+ *     { "type": "sync_item", "account": "xy_1", "event_id", "data": "<base64 原文>" },
+ *       // ↑ 纯透传代理上报的原始同步包条目: 后台用 protocol.parseSyncItem 解码后
+ *       //   与内置引擎走完全相同的 chat/system 决策链 (解析主权在后台)
  *     { "type": "chat",   "account": "xy_1", "event_id", "chat_id", "sender_user_id", "sender_nick",
- *       "content", "item_id", "create_time", "session_type", "is_self" },
+ *       "content", "item_id", "create_time", "session_type", "is_self" },   // 旧版代理兼容
  *     { "type": "system", "account": "xy_1", "event_id", "red_reminder", "item_id", "buyer_id",
  *       "order_id", "chat_id" },
  *     { "type": "risk",   "account": "xy_1", "event_id", "description" },
@@ -42,6 +46,8 @@ import { dispatchNotify } from '../../utils/notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from '../../utils/xianyu/publisher'
 import { consumeRate } from '../../utils/rate-limit'
 import { parseLosslessJson } from '../../utils/xianyu/lossless-json'
+import { parseSyncItem, type ParsedMessage } from '../../utils/xianyu/protocol'
+import { parseCookieStr } from '../../utils/xianyu/mtop'
 
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
@@ -118,8 +124,8 @@ export default defineEventHandler(
     const pullMode = (getHeader(event, 'x-engine-pull') || '') === '1'
     const pending: string[] = []
 
-    for (const ev of events) {
-      // ---- 任务执行结果回报 (engine_tasks 通道): fetch_orders 等代理侧执行的落库任务 ----
+    for (let ev of events) {
+      // ---- 任务执行结果回报 (engine_tasks 通道): http_fetch/send_message 等代理侧执行结果 ----
       // (必须在 account 守卫之前: task_result 不携带账号且不走去重/决策链)
       if (ev.type === 'task_result') {
         const taskId = Number(ev.task_id || 0)
@@ -164,6 +170,15 @@ export default defineEventHandler(
             }
           }
           continue
+        }
+
+        // ---- 纯透传代理的原始同步包条目: 解码主权在后台 (与内置引擎 parseSyncItem 同源)。
+        // base64 原文不动地到达这里 → 后台解码 → 转成与旧版代理等价的 chat/system 事件走
+        // 同一条去重/决策链 (__parsed 携带完整解析结果, 卡片标题/金额/图片判定不丢真) ----
+        if (ev.type === 'sync_item') {
+          const parsed = await decodeSyncEvent(db, account, String(ev?.data || ''))
+          if (!parsed) continue
+          ev = { ...parsedToEvent(parsed), account, event_id: ev.event_id }
         }
 
         // ---- 任务执行结果回报 (engine_tasks 通道): 已前移至 account 守卫之前 (task_result 不带账号) ----
@@ -259,6 +274,55 @@ export default defineEventHandler(
 
 /* ----------------------- 快速 ACK 模式: 后台决策与拉取回收 ----------------------- */
 
+/**
+ * 纯透传代理的 sync_item 解码: 账号 myId 取自库内 Cookie 的 unb (与内置引擎同源),
+ * protocol.parseSyncItem 为唯一解析层 (含卡片更新消息/交易卡片/订单号提取, 无损 JSON)。
+ * 解析失败/平台引导消息返回 null → 静默跳过 (与内置引擎 receiveLoop 同语义)。
+ */
+async function decodeSyncEvent(
+  db: Awaited<ReturnType<typeof getDb>>,
+  account: string,
+  data: string,
+): Promise<ParsedMessage> {
+  if (!data) return null
+  const row = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [account]).catch(() => null)
+  const myId = parseCookieStr(String(row?.value || '')).get('unb') || ''
+  try {
+    return parseSyncItem(String(data), myId)
+  } catch {
+    return null
+  }
+}
+
+/** 后台解析结果 → 与旧版代理语义等价的 chat/system 事件 (字段全量保留, raw 保真)。 */
+function parsedToEvent(parsed: ParsedMessage): Record<string, any> {
+  if (parsed.kind === 'chat') {
+    return {
+      type: 'chat',
+      chat_id: parsed.chatId,
+      sender_user_id: parsed.senderUserId,
+      sender_nick: parsed.senderNick,
+      content: parsed.content,
+      item_id: parsed.itemId,
+      create_time: parsed.createTime,
+      session_type: parsed.sessionType,
+      is_self: parsed.isSelf,
+      __parsed: parsed,
+    }
+  }
+  return {
+    type: 'system',
+    red_reminder: parsed.redReminder,
+    item_id: parsed.itemId,
+    buyer_id: parsed.buyerId,
+    order_id: parsed.orderId,
+    chat_id: parsed.chatId,
+    card_title: parsed.cardTitle,
+    amount: parsed.amount,
+    __parsed: parsed,
+  }
+}
+
 /** 单个 chat/system 事件的大脑决策 (事件发布 + 消息落库 + 回复/发货链), 内联与后台共用 */
 async function decideEvent(
   db: Awaited<ReturnType<typeof getDb>>,
@@ -267,7 +331,9 @@ async function decideEvent(
   account: string,
 ): Promise<EngineAction[]> {
   if (ev.type === 'chat') {
-    const parsed = {
+    // sync_item 链路携带后台真实解析结果 (__parsed, raw 为解码后消息); 旧版代理
+    // 事件按字段重建 (raw = 事件体)
+    const parsed: any = ev.__parsed ?? {
       kind: 'chat' as const,
       chatId: String(ev.chat_id || ''),
       senderUserId: String(ev.sender_user_id || ''),
@@ -284,15 +350,15 @@ async function decideEvent(
     void persistChatMessage(account, parsed)
     return handleChatEvent(account, parsed, { source: engine.slug })
   }
-  const parsed = {
+  const parsed: any = ev.__parsed ?? {
     kind: 'system' as const,
     redReminder: String(ev.red_reminder || ''),
     itemId: String(ev.item_id || ''),
     buyerId: String(ev.buyer_id || ''),
     orderId: String(ev.order_id || ''),
     chatId: String(ev.chat_id || ''),
-    cardTitle: '',
-    amount: '',
+    cardTitle: String(ev.card_title || ''),
+    amount: String(ev.amount || ''),
     raw: ev,
   }
   publishSystemEvent(account, parsed, engine.slug)

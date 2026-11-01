@@ -170,6 +170,16 @@ function mtopToken(jar: Map<string, string>): string {
   return tk.split('_')[0] || ''
 }
 
+/**
+ * mtop HTTP 传输层抽象: 默认 mtopFetch (代理透传网关优先 → 本机直连)。
+ * 任务通道 (order-task) 注入自己的实现: 把请求打包为 http_fetch 任务由代理原样
+ * 转发 — sign/轮换/token 重试等业务逻辑仍全部留在本模块, 传输通道可插拔。
+ */
+export type MtopTransport = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string },
+) => Promise<{ status: number; text: string; setCookie: string[] }>
+
 /** mtop 调用结果。 */
 export interface MtopResult<T = any> {
   data: T
@@ -192,7 +202,7 @@ export async function mtopCall<T = any>(
   api: string,
   data: object,
   cookieStr: string,
-  opts: { v?: string; method?: string; headers?: Record<string, string>; extraParams?: Record<string, string> } = {},
+  opts: { v?: string; method?: string; headers?: Record<string, string>; extraParams?: Record<string, string>; transport?: MtopTransport } = {},
 ): Promise<MtopResult<T>> {
   const v = opts.v || '1.0'
   const method = opts.method || 'POST'
@@ -219,7 +229,8 @@ export async function mtopCall<T = any>(
   })
   const body = `data=${encodeURIComponent(dataStr)}`
 
-  const res = await mtopFetch(`${url}?${params.toString()}`, {
+  const transport = opts.transport ?? mtopFetch
+  const res = await transport(`${url}?${params.toString()}`, {
     method,
     headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: cookieHeader(jar) },
     body: method === 'POST' ? body : undefined,
@@ -250,7 +261,7 @@ export async function mtopCall<T = any>(
       spm_cnt: 'a21ybx.home.0.0',
       ...opts.extraParams,
     })
-    const retryRes = await mtopFetch(`${url}?${retryParams.toString()}`, {
+    const retryRes = await transport(`${url}?${retryParams.toString()}`, {
       method,
       headers: { ...MTOP_HEADERS, ...opts.headers, Cookie: newCookieStr },
       body: method === 'POST' ? body : undefined,
@@ -769,6 +780,7 @@ export async function fetchSellerOrders(
   cookieStr: string,
   page: number,
   queryCode: 'ALL' | 'NOT_SHIP' = 'ALL',
+  opts: { transport?: MtopTransport } = {},
 ): Promise<SellerOrdersPage> {
   const empty: SellerOrdersPage = { items: [], nextPage: false, totalCount: 0, retMsg: '', finalCookieStr: cookieStr }
   if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
@@ -782,6 +794,7 @@ export async function fetchSellerOrders(
         Referer: 'https://seller.goofish.com/',
       },
       extraParams: { valueType: 'string', spm_cnt: 'a21107h.42826273.0.0' },
+      transport: opts.transport,
     },
   )
   const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''

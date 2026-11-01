@@ -2,14 +2,18 @@
 /**
  * xianyu-proxy.mjs — 闲鱼监听独立代理 (单文件, 零 npm 依赖, Node ≥ 20)。
  *
- * 定位: 与 xianyu-admin 后台配套的"纯消息监听与转发"进程。所有业务规则
- * (关键词/AI 回复链/卡券/订单) 只存在于后台; 代理只做:
+ * 定位: 纯粹的网关与透传服务 (无状态, 零业务解析)。所有闲鱼数据的解码/解析/业务
+ * 规则 (关键词/AI 回复链/卡券/订单) 只存在于后台 — 无论走不走本代理, 后台都用自己的
+ * 同一套解析层 (协议解码/无损 JSON), 代理永不做第二遍。本脚本只做:
  *   1. GET  /api/engine/config  — 拉取账号连接配置 (30s 轮询, 非活动自动下线)
- *   2. 对每个启用账号建立闲鱼消息长连接 (协议与后台内置引擎同源)
- *   3. POST /api/engine/events  — 上报连接状态/聊天/交易/风控事件, 回收决策动作
+ *   2. 对每个启用账号建立闲鱼消息长连接 (连接保活: 注册/心跳/ack/token 刷新)
+ *   3. POST /api/engine/events  — 原样转发 WS 同步包条目 (base64 不动) + 连接状态/风控,
+ *      回收决策动作; 所有解析在后台完成
  *   4. 按 delay_ms 人化执行动作 (发文本/发图片, 串行队列 + 滑动窗口限速)
- *   5. GET  /api/engine/tasks   — 领取后台下发任务 (fetch_orders: 订单拉取 — CF Pages
- *      出口到 h5api 被墙, 一键同步/付款拉单借代理本地执行, 结果经 task_result 回报)
+ *   5. GET  /api/engine/tasks   — 领取后台下发任务: http_fetch (后台构造好的签名 HTTP
+ *      请求原样转发, 原始响应文本原样回报, 不读不改) / send_message (WS 发文本)
+ *   6. POST /gateway 透传网关 (选填, XY_PROXY_PORT) — 同语义: 后台构造请求, 本机转发,
+ *      原始响应回传
  *
  * 部署: 上传本文件到任意能出网的机器 (Node ≥ 20; Node 20 若无内置 WebSocket
  * 请在同目录 `npm i ws`), 配好环境变量后 `node xianyu-proxy.mjs`。
@@ -17,7 +21,7 @@
  *
  * 两种用法 (同一脚本, 区别只在是否填 XY_PROXY_PORT):
  *   ① 任务模式 (默认, 不填 XY_PROXY_PORT): 代理主动外呼后台 — 配置轮询 + WS 消息监听
- *      + 任务通道 (订单拉取 fetch_orders 走任务领取/回报), 无需公网入站端口。
+ *      + 任务通道 (http_fetch 透传走任务领取/回报), 无需公网入站端口。
  *   ② 任务模式 + 透传网关 (填 XY_PROXY_PORT): 在 ① 基础上, 同端口额外开启
  *      POST /gateway 透传网关 — 后台 (CF Pages) 直连本机转发 mtop 请求 (解决 CF 出口
  *      到 h5api 被墙 500 超时), 需服务器公网固定 IP + 防火墙放行端口, 引擎行登记该地址。
@@ -30,6 +34,12 @@
  *                    GET /health 运行状态 + POST /gateway mtop 透传网关, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.9; /health 的 script_version 上报;
+ *                    单文件部署同目录没有 package.json, 版本号从这里配)
+ *
+ * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
+ * 这些字段全是短字符串/安全范围整数, 不含闲鱼业务 ID; 同步包内层 data (base64) 从不
+ * 解开 — 订单号等业务 ID 的精度主权 100% 在后台解析层。
  *
  * 风控硬约束 (与后台内置引擎完全同源):
  *   设备指纹持久化 (后台下发 cookies.device_id) / 心跳与重连随机抖动 /
@@ -48,9 +58,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /* --------------------------------- 配置 --------------------------------- */
-
-// 版本号唯一真源 = package.json 的 version 字段 (health 接口 script_version 自动读取)
-const PKG = '2.1.9'
 
 /**
  * .env 文件加载(零依赖, dotenv 同语义: 真实环境变量优先, 文件值不覆盖已有 env)。
@@ -92,6 +99,10 @@ const dotenvInfo = (() => {
   return null
 })()
 
+// 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
+// XY_PKG_VERSION 读取, 缺省 2.1.9 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.9'
+
 const ADMIN_URL = String(process.env.XY_ADMIN_URL || '').replace(/\/+$/, '')
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
@@ -117,7 +128,7 @@ const CONFIG_URL = `${ADMIN_URL}/api/engine/config`
 const EVENTS_URL = `${ADMIN_URL}/api/engine/events`
 const TASKS_URL = `${ADMIN_URL}/api/engine/tasks`
 
-/** 任务轮询间隔秒 (选填, 默认 3): fetch_orders 等下发任务的领取频率, 越短后台等得越短 */
+/** 任务轮询间隔秒 (选填, 默认 3): http_fetch 等下发任务的领取频率, 越短后台等得越短 */
 const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
 
 /* ----------------- 协议常量与纯函数 (与后台 server/utils/xianyu/protocol.ts 同源) ----------------- */
@@ -273,247 +284,29 @@ function generateDeviceId(userId) {
   return chars.join('') + '-' + userId
 }
 
-/* --------------------- 无损 JSON 解析 (与后台 lossless-json.ts 同源) ---------------------
- * 闲鱼下行中 orderId/itemId/buyerId 等字段是 16~19 位数字字面量, JSON.parse 的 double 化
- * 会静默丢精度 (结尾 0 的错误订单号 → 自动发货落错单/平台报订单状态不正确)。本代理独立
- * 于后台进程运行, 解析层必须同样无损: 超安全整数范围的整数字面量按原文保留为字符串。 */
+/* --------------------- 透传网关白名单/头过滤 (任务通道与 /gateway 共用) ---------------------
+ * 仅传输策略 (目标限定闲鱼/淘系域名), 无任何报文内容解析。 */
 
-function isUnsafeIntegerLiteral(lit) {
-  const digits = lit.startsWith('-') ? lit.slice(1) : lit
-  if (digits.length > 16) return true
-  if (digits.length < 15) return false
-  const num = Number(lit)
-  return num > Number.MAX_SAFE_INTEGER || num < -Number.MAX_SAFE_INTEGER
-}
+const GATEWAY_ALLOWED_HOSTS = [
+  'h5api.m.goofish.com',
+  'goofish.com',
+  'fishy.m.taobao.com',
+  'wuliao.m.taobao.com',
+  'taobao.com',
+  'tmall.com',
+]
+const gwAllowed = (h) => GATEWAY_ALLOWED_HOSTS.some((d) => h === d || h.endsWith('.' + d))
+// 逐跳头/鉴权头不透传 (由 Node fetch 自行生成)
+const GATEWAY_SKIP_HEADERS = new Set(['host', 'connection', 'content-length', 'keep-alive', 'transfer-encoding', 'upgrade', 'accept-encoding', 'authorization'])
+const GATEWAY_TIMEOUT_MS = 25_000
 
-function parseLosslessJson(text) {
-  const s = String(text ?? '')
-  const n = s.length
-  let i = 0
-  const skipWs = () => {
-    while (i < n) {
-      const c = s.charCodeAt(i)
-      if (c === 32 || c === 9 || c === 10 || c === 13) i++
-      else break
-    }
-  }
-  const expectWord = (word) => {
-    if (s.startsWith(word, i)) i += word.length
-    else throw new Error(`Unexpected token at position ${i}`)
-  }
-  const readString = () => {
-    const start = i
-    i++
-    let out = ''
-    while (i < n) {
-      const c = s[i]
-      if (c === '"') { i++; return out }
-      if (c === '\\') {
-        const e = s[i + 1]
-        i += 2
-        if (e === '"') out += '"'
-        else if (e === '\\') out += '\\'
-        else if (e === '/') out += '/'
-        else if (e === 'b') out += '\b'
-        else if (e === 'f') out += '\f'
-        else if (e === 'n') out += '\n'
-        else if (e === 'r') out += '\r'
-        else if (e === 't') out += '\t'
-        else if (e === 'u') {
-          const hex = s.slice(i, i + 4)
-          if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`Bad unicode escape at position ${i}`)
-          out += String.fromCharCode(parseInt(hex, 16))
-          i += 4
-        } else throw new Error(`Bad escape '\\${e ?? ''}' at position ${i - 2}`)
-        continue
-      }
-      out += c
-      i++
-    }
-    throw new Error(`Unterminated string starting at position ${start}`)
-  }
-  const readNumber = () => {
-    const start = i
-    if (s[i] === '-') i++
-    while (i < n && s[i] >= '0' && s[i] <= '9') i++
-    let isInt = true
-    if (s[i] === '.') {
-      isInt = false
-      i++
-      while (i < n && s[i] >= '0' && s[i] <= '9') i++
-    }
-    if (s[i] === 'e' || s[i] === 'E') {
-      isInt = false
-      i++
-      if (s[i] === '+' || s[i] === '-') i++
-      while (i < n && s[i] >= '0' && s[i] <= '9') i++
-    }
-    const lit = s.slice(start, i)
-    if (!lit || lit === '-') throw new Error(`Invalid number at position ${start}`)
-    if (isInt && isUnsafeIntegerLiteral(lit)) return lit
-    return Number(lit)
-  }
-  const readValue = () => {
-    skipWs()
-    if (i >= n) throw new Error('Unexpected end of JSON input')
-    const c = s[i]
-    if (c === '{') {
-      i++
-      const out = {}
-      skipWs()
-      if (i < n && s[i] === '}') { i++; return out }
-      for (;;) {
-        skipWs()
-        if (i >= n || s[i] !== '"') throw new Error(`Expected string key at position ${i}`)
-        const k = readString()
-        skipWs()
-        if (s[i] !== ':') throw new Error(`Expected ':' at position ${i}`)
-        i++
-        out[k] = readValue()
-        skipWs()
-        if (s[i] === ',') { i++; continue }
-        if (s[i] === '}') { i++; return out }
-        throw new Error(`Expected ',' or '}' at position ${i}`)
-      }
-    }
-    if (c === '[') {
-      i++
-      const out = []
-      skipWs()
-      if (s[i] === ']') { i++; return out }
-      for (;;) {
-        out.push(readValue())
-        skipWs()
-        if (s[i] === ',') { i++; continue }
-        if (s[i] === ']') { i++; return out }
-        throw new Error(`Expected ',' or ']' at position ${i}`)
-      }
-    }
-    if (c === '"') return readString()
-    if (c === 't') { expectWord('true'); return true }
-    if (c === 'f') { expectWord('false'); return false }
-    if (c === 'n') { expectWord('null'); return null }
-    if (c === '-' || (c >= '0' && c <= '9')) return readNumber()
-    throw new Error(`Unexpected token '${c}' at position ${i}`)
-  }
-  const value = readValue()
-  skipWs()
-  if (i !== n) throw new Error(`Unexpected non-whitespace content at position ${i}`)
-  return value
-}
+/* --------------------- 原始同步包条目上报 (纯透传) ---------------------
+ * 同步包内层 data (base64) 从不解开, 原样上报后台 — 后台用自己的解析层统一解码
+ * (与内置引擎同源同语义), 保证有代理/无代理/网关/任务通道四种部署形态下解析结果
+ * 完全一致; 本代理零业务解析, 也就不存在第二套解析语义需要同步维护。 */
 
-/* --------------------- MessagePack 解码 (与后台 protocol.ts 同源) --------------------- */
-
-class MsgPackReader {
-  pos = 0
-  constructor(data) {
-    this.data = data
-  }
-
-  need(n) {
-    if (this.pos + n > this.data.length) throw new Error('unexpected end of msgpack data')
-  }
-  readByte() {
-    this.need(1)
-    return this.data[this.pos++]
-  }
-  readBytes(n) {
-    this.need(n)
-    const out = this.data.subarray(this.pos, this.pos + n)
-    this.pos += n
-    return out
-  }
-  u16() {
-    return (this.readByte() << 8) | this.readByte()
-  }
-  u32() {
-    return ((this.u16() << 16) | this.u16()) >>> 0
-  }
-  u64() {
-    const hi = this.u32()
-    const lo = this.u32()
-    const v = hi * 0x1_0000_0000 + lo
-    // 超安全整数 (19 位订单号等) 按原文保留为字符串, 与无损 JSON 解析同语义
-    if (v <= Number.MAX_SAFE_INTEGER) return v
-    return ((BigInt(hi) << 32n) | BigInt(lo)).toString()
-  }
-  str(n) {
-    return new TextDecoder('utf-8').decode(this.readBytes(n))
-  }
-  readValue() {
-    const b = this.readByte()
-    if (b <= 0x7f) return b
-    if (b >= 0xe0) return b - 0x100
-    if (b >= 0x80 && b <= 0x8f) return this.readMap(b & 0x0f)
-    if (b >= 0x90 && b <= 0x9f) return this.readArray(b & 0x0f)
-    if (b >= 0xa0 && b <= 0xbf) return this.str(b & 0x1f)
-    switch (b) {
-      case 0xc0: return null
-      case 0xc2: return false
-      case 0xc3: return true
-      case 0xc4: return this.readBytes(this.readByte())
-      case 0xc5: return this.readBytes(this.u16())
-      case 0xc6: return this.readBytes(this.u32())
-      case 0xca: {
-        const view = new DataView(this.readBytes(4).slice().buffer)
-        return view.getFloat32(0, false)
-      }
-      case 0xcb: {
-        const view = new DataView(this.readBytes(8).slice().buffer)
-        return view.getFloat64(0, false)
-      }
-      case 0xcc: return this.readByte()
-      case 0xcd: return this.u16()
-      case 0xce: return this.u32()
-      case 0xcf: return this.u64()
-      case 0xd0: return (this.readByte() << 24) >> 24
-      case 0xd1: return (this.u16() << 16) >> 16
-      case 0xd2: return (this.u32() | 0)
-      case 0xd3: return this.u64()
-      case 0xd9: return this.str(this.readByte())
-      case 0xda: return this.str(this.u16())
-      case 0xdb: return this.str(this.u32())
-      case 0xdc: return this.readArray(this.u16())
-      case 0xdd: return this.readArray(this.u32())
-      case 0xde: return this.readMap(this.u16())
-      case 0xdf: return this.readMap(this.u32())
-      default: throw new Error(`unknown msgpack format byte: 0x${b.toString(16)}`)
-    }
-  }
-  readArray(n) {
-    return Array.from({ length: n }, () => this.readValue())
-  }
-  readMap(n) {
-    const out = {}
-    for (let i = 0; i < n; i++) {
-      const k = this.readValue()
-      out[String(k)] = this.readValue()
-    }
-    return out
-  }
-}
-
-function decodeMessagePack(bytes) {
-  return new MsgPackReader(bytes).readValue()
-}
-
-function decodeSyncData(data) {
-  const cleaned = String(data || '').replace(/[\u0100-\uffff]/g, '')
-  let bytes
-  try {
-    bytes = Uint8Array.from(atob(cleaned), (c) => c.charCodeAt(0))
-  } catch {
-    const padded = cleaned + '='.repeat((4 - (cleaned.length % 4)) % 4)
-    bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
-  }
-  const asText = new TextDecoder('utf-8').decode(bytes)
-  try {
-    return parseLosslessJson(asText)
-  } catch {
-    const decoded = decodeMessagePack(bytes)
-    if (decoded && typeof decoded === 'object') return decoded
-    return parseLosslessJson(String(decoded))
-  }
+function syncItemId(cookieId, data) {
+  return 'm:' + createHash('sha1').update([cookieId, data].join('|')).digest('hex')
 }
 
 /* --------------------- 报文构造 (与后台 protocol.ts 同源) --------------------- */
@@ -639,177 +432,6 @@ function isSyncPackage(message) {
   }
 }
 
-function extractOrderId(message) {
-  try {
-    const contentJsonStr = String(message?.['1']?.['6']?.['3']?.['5'] ?? '')
-    if (contentJsonStr) {
-      let card = null
-      try {
-        card = parseLosslessJson(contentJsonStr)
-      } catch {}
-      if (card) {
-        const ex = card?.dxCard?.item?.main?.exContent
-        const main = card?.dxCard?.item?.main
-        const dyn = card?.dynamicOperation?.changeContent?.dxCard?.item?.main
-        for (const url of [ex?.button?.targetUrl, main?.targetUrl, dyn?.exContent?.button?.targetUrl, dyn?.targetUrl]) {
-          if (typeof url !== 'string' || !url) continue
-          const m = url.match(/orderId=(\d+)/) || url.match(/order_detail\?id=(\d+)/)
-          if (m) return m[1]
-        }
-      }
-    }
-    const raw = JSON.stringify(message)
-    const patterns = [
-      /orderId[=:](\d{10,})/,
-      /order_detail\?id=(\d{10,})/,
-      /bizOrderId[=:](\d{10,})/,
-      /"id"\s*:\s*"?(\d{10,})"?/,
-    ]
-    for (const p of patterns) {
-      const m = raw.match(p)
-      if (m) return m[1]
-    }
-    return ''
-  } catch {
-    return ''
-  }
-}
-
-function parseTradeCard(message) {
-  try {
-    const contentJsonStr = String(message?.['1']?.['6']?.['3']?.['5'] ?? '')
-    if (!contentJsonStr) return { title: '', amount: '' }
-    let card = null
-    try {
-      card = parseLosslessJson(contentJsonStr)
-    } catch {
-      return { title: '', amount: '' }
-    }
-    const ex = card?.dxCard?.item?.main?.exContent || {}
-    const title = String(ex.title || '')
-    let amount = ''
-    for (const key of ['price', 'priceText', 'amount', 'payAmount']) {
-      const v = ex[key]
-      if (v != null && String(v).trim()) {
-        amount = String(v).replace(/[¥￥\s]/g, '')
-        break
-      }
-    }
-    if (!amount) {
-      const priceList = Array.isArray(ex.priceList) ? ex.priceList : []
-      for (const p of priceList) {
-        const t = String(p?.text || p?.price || '')
-        if (/[\d.]/.test(t)) {
-          amount = t.replace(/[¥￥\s]/g, '')
-          break
-        }
-      }
-    }
-    if (!amount) {
-      const m = contentJsonStr.match(/[¥￥]\s*([0-9]+(?:\.[0-9]{1,2})?)/)
-      if (m) amount = m[1]
-    }
-    return { title, amount }
-  } catch {
-    return { title: '', amount: '' }
-  }
-}
-
-function extractItemId(message) {
-  try {
-    const url = message?.['1']?.['10']?.reminderUrl
-    if (typeof url === 'string' && url.includes('itemId=')) {
-      return url.split('itemId=')[1].split('&')[0] || ''
-    }
-  } catch {}
-  try {
-    const m3 = message?.['3']
-    if (m3 && typeof m3 === 'object') {
-      for (const seg of [m3.extension, m3.bizData]) {
-        if (seg && typeof seg === 'object') {
-          const v = seg.itemId || seg.item_id
-          if (v != null && String(v).trim()) return String(v)
-        }
-      }
-      for (const value of Object.values(m3)) {
-        if (value && typeof value === 'object') {
-          const v = value.itemId || value.item_id
-          if (v != null && String(v).trim()) return String(v)
-        }
-      }
-      const content = m3.content
-      if (typeof content === 'string' && content) {
-        const m = content.match(/(\d{10,})/)
-        if (m) return m[1]
-      }
-    }
-  } catch {}
-  return ''
-}
-
-function parseSyncItem(data, myId) {
-  const message = decodeSyncData(data)
-  if (!message || typeof message !== 'object' || Array.isArray(message)) return null
-  if ('chatType' in message) return null
-
-  const redReminder = message?.['3']?.redReminder || ''
-  const itemId = extractItemId(message)
-  const card = parseTradeCard(message)
-
-  const m1 = message['1']
-  const m10 = m1 && typeof m1 === 'object' ? m1['10'] : null
-  if (!m10 || typeof m10 !== 'object') {
-    if (redReminder) {
-      return {
-        kind: 'system',
-        redReminder,
-        itemId,
-        buyerId: '',
-        orderId: extractOrderId(message),
-        chatId: '',
-        cardTitle: card.title,
-        amount: card.amount,
-        raw: message,
-      }
-    }
-    return null
-  }
-
-  const senderUserId = String(m10.senderUserId ?? '')
-  const senderNick = String(m10.senderNick ?? m10.reminderTitle ?? '未知用户')
-  const content = String(m10.reminderContent ?? '')
-  const chatIdRaw = String(m1['2'] ?? '')
-  const chatId = chatIdRaw.split('@')[0] || chatIdRaw
-  const createTime = Number(m1['5'] ?? 0)
-
-  if (redReminder && !content) {
-    return {
-      kind: 'system',
-      redReminder,
-      itemId,
-      buyerId: senderUserId,
-      orderId: extractOrderId(message),
-      chatId,
-      cardTitle: card.title,
-      amount: card.amount,
-      raw: message,
-    }
-  }
-
-  return {
-    kind: 'chat',
-    chatId,
-    senderUserId,
-    senderNick,
-    content,
-    itemId,
-    createTime,
-    sessionType: String(m10.sessionType ?? '1'),
-    isSelf: senderUserId === myId,
-    raw: message,
-  }
-}
-
 function classifyTokenError(retList) {
   const joined = (retList || []).join(' ')
   if (!joined) return 'unknown'
@@ -916,117 +538,6 @@ function backoffDelay(failures) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
-}
-
-/* ------------- 订单拉取执行器 (与后台 mtop.ts fetchSellerOrders 同源复刻) ------------- */
-
-/** 闲鱼订单中文状态 → 后台状态码 (与后台 SELLER_ORDER_STATUS_MAP 同源)。 */
-const SELLER_ORDER_STATUS_MAP = {
-  待付款: 'pending_payment',
-  待发货: 'pending_ship',
-  已发货: 'shipped',
-  交易成功: 'completed',
-  交易关闭: 'cancelled',
-  退款中: 'refunding',
-  退款成功: 'refunded',
-  已退款: 'refunded',
-  退款关闭: 'cancelled',
-}
-
-/** 解析卖家订单列表单条 item (与后台 parseSoldOrderItem 同源复刻)。 */
-function parseSoldOrderItem(item) {
-  const common = item?.commonData || {}
-  const orderId = String(common.orderId || '')
-  if (!orderId) return null
-  const buyer = item?.buyerInfoVO || {}
-  const priceVo = item?.priceVO || {}
-  const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
-  const rawStatus = String(common.orderStatus || '')
-  return {
-    order_id: orderId,
-    order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
-    item_id: String(common.itemId || ''),
-    buyer_id: String(buyer.buyerId || ''),
-    buyer_nick: String(buyer.userNick || ''),
-    receiver_name: String(buyer.name || ''),
-    receiver_phone: String(buyer.phone || ''),
-    receiver_address: String(buyer.address || ''),
-    amount: String(priceVo.totalPrice ?? ''),
-    quantity: String(priceVo.buyNum ?? '1'),
-    is_bargain: btnList.some((b) => b?.tradeAction === 'SKIP_PIN'),
-    created_at_text: String(common.createTime || ''),
-  }
-}
-
-/**
- * 拉取卖家订单列表单页 (api=mtop.taobao.idle.trade.merchant.sold.get, 与后台同源):
- * 卖家端接口校验来源, Origin/Referer 必须为 seller.goofish.com, 且 query 需带 valueType=string。
- * 代理在可达闲鱼的机器上执行, 解决 CF Pages 出口到 h5api 被墙的一键同步/付款拉单需求。
- */
-async function fetchSellerOrdersPage(cookieStr, page, queryCode) {
-  const empty = { items: [], nextPage: false, retMsg: '' }
-  if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
-  const api = 'mtop.taobao.idle.trade.merchant.sold.get'
-  const dataVal = JSON.stringify({ pageNumber: page, rowsPerPage: 30, orderIds: '', queryCode, orderSearchParam: '{}' })
-
-  const callOnce = async (useCookie) => {
-    const cookies = transCookies(useCookie)
-    const h5tk = cookies['_m_h5_tk'] || ''
-    const signToken = h5tk ? h5tk.split('_')[0] : ''
-    const t = String(Date.now())
-    const params = new URLSearchParams({
-      jsv: '2.7.2',
-      appKey: SIGN_APP_KEY,
-      t,
-      sign: md5Sign(t, signToken, dataVal),
-      v: '1.0',
-      type: 'originaljson',
-      dataType: 'json',
-      timeout: '20000',
-      api,
-      sessionOption: 'AutoLoginOnly',
-      spm_cnt: 'a21107h.42826273.0.0',
-      valueType: 'string',
-    })
-    return await fetch(`https://h5api.m.goofish.com/h5/${api}/1.0/?${params.toString()}`, {
-      method: 'POST',
-      headers: {
-        ...mtopHeaders(useCookie),
-        Origin: 'https://seller.goofish.com',
-        Referer: 'https://seller.goofish.com/',
-      },
-      body: new URLSearchParams({ data: dataVal }).toString(),
-      signal: AbortSignal.timeout(20_000),
-    })
-  }
-
-  let res = await callOnce(cookieStr)
-  // 无损解析: 卖家订单列表响应体里的 19 位订单号数字字面量不可 double 化 (一键同步/付款拉单同源)
-  const parseBody = async (r) => parseLosslessJson(await r.text().catch(() => ''))
-  let json = await parseBody(res).catch(() => ({}))
-  const retArr = Array.isArray(json?.ret) ? json.ret : []
-  const retStr = retArr.join(' ')
-  // token 过期: 用响应轮换后的 _m_h5_tk 重试一次 (与后台 mtopCall 同语义)
-  if (retStr.includes('FAIL_SYS_TOKEN_EXOIRED') || retStr.includes('FAIL_SYS_TOKEN_EXPIRED')) {
-    const merged = { ...transCookies(cookieStr) }
-    try {
-      const setCookies = res.headers.getSetCookie?.() || []
-      for (const sc of setCookies) {
-        const [pair] = sc.split(';')
-        const eq = pair.indexOf('=')
-        if (eq > 0) merged[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim()
-      }
-    } catch {}
-    const retryCookie = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
-    res = await callOnce(retryCookie)
-    json = await parseBody(res).catch(() => ({}))
-  }
-  const ret = Array.isArray(json?.ret) ? json.ret.join(' ') : ''
-  if (!ret.includes('SUCCESS')) return { ...empty, retMsg: ret || '卖家订单列表查询失败' }
-  const module = json?.data?.module || {}
-  const rawItems = Array.isArray(module.items) ? module.items : []
-  const items = rawItems.map(parseSoldOrderItem).filter((x) => !!x)
-  return { items, nextPage: String(module.nextPage ?? 'false') === 'true', retMsg: '' }
 }
 
 async function createWsSocket(url, headers) {
@@ -1232,9 +743,11 @@ class XianyuAccountClient {
         this.lastDownstreamAt = Date.now()
         const raw = typeof ev.data === 'string' ? ev.data : ''
         if (!raw) return
+        // 传输层编帧: 外层帧 JSON 只读 mid/ack/syncPushPackage 结构 (短字符串/安全范围
+        // 整数, 不含闲鱼业务 ID); 同步包内层 data (base64) 原样上报, 零业务解析
         let message
         try {
-          message = parseLosslessJson(raw)
+          message = JSON.parse(raw)
         } catch {
           return
         }
@@ -1256,14 +769,10 @@ class XianyuAccountClient {
             const items = message.body.syncPushPackage.data || []
             for (const item of items) {
               if (!item?.data) continue
+              // 纯透传: 内层 base64 不动, 解码/业务解析全部在后台 (与内置引擎同一套)
               try {
-                const parsed = parseSyncItem(item.data, this.myId)
-                if (!parsed) continue
-                if (parsed.kind === 'chat') this.sink.onChat(this.cookieId, parsed)
-                else this.sink.onSystem(this.cookieId, parsed)
-              } catch (e) {
-                log(`账号 ${this.cookieId} 同步包解析失败: ${e?.message}`)
-              }
+                this.sink.onSyncItem(this.cookieId, String(item.data))
+              } catch {}
             }
           }
         } catch (e) {
@@ -1384,8 +893,6 @@ class XianyuAccountClient {
 
 const clients = new Map()
 const latestCookies = new Map()
-/** 最近一次 config 下发的账号表 (id → {cookies,...}): 任务执行时取 Cookie 的兜底源 */
-const lastAccountsConfig = new Map()
 let engineActive = false
 let pollSeconds = DEFAULT_POLL_SECONDS
 let heartbeatSeconds = 15
@@ -1589,50 +1096,20 @@ async function executeActions(actions) {
   }
 }
 
-/* ------------- 事件幂等 id (同一消息/交易卡片在重连重放与上报重试间保持稳定) ------------- */
-
-function chatEventId(cookieId, msg) {
-  return 'c:' + createHash('sha1')
-    .update([cookieId, msg.chatId || '', msg.senderUserId || '', msg.content || '', msg.createTime || 0, msg.itemId || '', msg.isSelf ? 1 : 0].join('|'))
-    .digest('hex')
-}
-
-function systemEventId(cookieId, msg) {
-  return 's:' + createHash('sha1')
-    .update([cookieId, msg.redReminder || '', msg.itemId || '', msg.buyerId || '', msg.orderId || '', msg.chatId || ''].join('|'))
-    .digest('hex')
-}
+/* ------------- 事件幂等 id (同一条原始同步包条目在重连重放与上报重试间保持稳定) ------------- */
 
 const sink = {
   onState(cookieId, state, detail) {
     accountStates.set(cookieId, { state, detail })
     if (state !== 'disabled') enqueueReport({ type: '__state__' })
   },
-  onChat(cookieId, msg) {
+  onSyncItem(cookieId, data) {
+    // 纯透传: 原始 base64 条目不动, 幂等 id 由 (账号, 原文) 哈希得出 — 解码/去重决策全在后台
     enqueueReport({
-      type: 'chat',
+      type: 'sync_item',
       account: cookieId,
-      event_id: chatEventId(cookieId, msg),
-      chat_id: msg.chatId,
-      sender_user_id: msg.senderUserId,
-      sender_nick: msg.senderNick,
-      content: msg.content,
-      item_id: msg.itemId,
-      create_time: msg.createTime,
-      session_type: msg.sessionType,
-      is_self: msg.isSelf,
-    })
-  },
-  onSystem(cookieId, msg) {
-    enqueueReport({
-      type: 'system',
-      account: cookieId,
-      event_id: systemEventId(cookieId, msg),
-      red_reminder: msg.redReminder,
-      item_id: msg.itemId,
-      buyer_id: msg.buyerId,
-      order_id: msg.orderId,
-      chat_id: msg.chatId,
+      event_id: syncItemId(cookieId, data),
+      data,
     })
   },
   onRisk(cookieId, description) {
@@ -1716,8 +1193,6 @@ async function pollConfigOnce() {
     const wanted = new Map(
       (Array.isArray(cfg.accounts) ? cfg.accounts : []).map((a) => [a.id && String(a.id), accountEntryFromConfig(a)]),
     )
-    lastAccountsConfig.clear()
-    for (const [id, entry] of wanted) lastAccountsConfig.set(id, entry)
 
     for (const [id] of [...clients]) {
       if (!wanted.has(id)) await stopClient(id)
@@ -1826,41 +1301,46 @@ async function configLoop() {
   }
 }
 
-/* ------------- 任务通道: 后台下发的需“可达闲鱼的机器执行”的工作 (fetch_orders 等) -------------
- * 背景: CF Pages 出口到闲鱼 mtop 网关 (h5api) 被墙, 一键同步/付款拉单的远程拉单在
- * 服务端直连必 500 超时 — 后台把任务写入 engine_tasks 表, 代理从此处领取并本地执行,
- * 结果经 events task_result 回报 (后台轮询任务行取回)。代理主动外呼后台, 无需入站端口。 */
+/* ------------- 任务通道: 后台下发的需“可达闲鱼的机器执行”的工作 (http_fetch/send_message) -------------
+ * 背景: CF Pages 出口到闲鱼 mtop 网关 (h5api) 被墙 — 后台把任务写入 engine_tasks 表,
+ * 代理从此处领取并本地转发, 结果经 events task_result 回报 (后台轮询任务行取回)。
+ * http_fetch 是纯透传: 请求由后台构造并签名, 代理原样转发, 原始响应文本原样回报 —
+ * 代理不读不改不解析, 解析主权 100% 在后台。 */
 
 /**
- * 执行 fetch_orders 任务: 按账号 Cookie 拉卖家订单列表 (ALL/NOT_SHIP, 逐页 400ms 限速)。
- * 返回 { ok, data }: data.items = 标准化订单数组 (后台直接 upsert 入库)。
+ * 执行 http_fetch 任务: 逐个转发后台构造好的 HTTP 请求 (白名单限闲鱼/淘系域名),
+ * 回报原始响应 { status, text, set_cookie }。不解析不重试不重签 — 业务逻辑全在后台。
  */
-async function executeFetchOrdersTask(payload) {
-  const cookieId = String(payload?.cookie_id || '')
-  const queryCode = payload?.query_code === 'NOT_SHIP' ? 'NOT_SHIP' : 'ALL'
-  const pages = Math.min(Math.max(Number(payload?.pages) || 1, 1), 5)
-  const cookieStr = latestCookies.get(cookieId) || String(lastAccountsConfig.get(cookieId)?.cookies || '')
-  if (!cookieStr) {
-    return { ok: false, data: { errors: [`账号 ${cookieId || '未知'} 本地无 Cookie (等待配置下发后重试)`] } }
+async function executeHttpFetchTask(payload) {
+  const requests = Array.isArray(payload?.requests) ? payload.requests.slice(0, 5) : []
+  if (!requests.length) return { ok: false, data: { error: '任务缺少 requests 请求列表' } }
+  const responses = []
+  for (const req of requests) {
+    let target
+    try {
+      target = new URL(String(req?.url || ''))
+    } catch {
+      return { ok: false, data: { error: '请求 URL 非法', responses } }
+    }
+    if (!/^https?:$/.test(target.protocol) || !gwAllowed(target.hostname)) {
+      return { ok: false, data: { error: `目标不在透传白名单 (仅闲鱼/淘系域名): ${target.hostname.slice(0, 80)}`, responses } }
+    }
+    const headers = {}
+    for (const [k, v] of Object.entries(req?.headers || {})) if (v && !GATEWAY_SKIP_HEADERS.has(String(k).toLowerCase())) headers[k] = String(v)
+    const method = String(req?.method || 'GET').toUpperCase()
+    const body = method === 'GET' || method === 'HEAD' ? undefined : String(req?.body || '')
+    const timeoutMs = Math.min(Math.max(Math.round(Number(req?.timeout_ms) || 20_000), 3_000), GATEWAY_TIMEOUT_MS)
+    try {
+      const upstream = await fetch(target, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
+      const text = (await upstream.text()).slice(0, 4 * 1024 * 1024)
+      responses.push({ status: upstream.status, text, set_cookie: upstream.headers.getSetCookie ? upstream.headers.getSetCookie() : [] })
+      log(`透传任务: ${method} ${target.host}${target.pathname.slice(0, 64)} → ${upstream.status}`)
+    } catch (e) {
+      return { ok: false, data: { error: `透传请求失败: ${String(e?.message || e).slice(0, 160)}`, responses } }
+    }
+    if (requests.length > 1) await sleep(400)
   }
-  // 会话身份校验: cookie 内 unb (账号 uid) 与账号 id 不符 = Cookie 属于其他账号会话,
-  // 拉单必拉到他人店铺订单 — 显性报错拒绝, 防串号 (与后台 cookieIdentityMismatch 同语义)
-  const unb = /(?:^|;\s*)unb=([^;]+)/.exec(cookieStr)?.[1]?.trim() || ''
-  const uid = cookieId.startsWith('xy_') ? cookieId.slice(3) : cookieId
-  if (unb && uid && unb !== uid) {
-    return { ok: false, data: { errors: [`Cookie 身份与账号不符 (cookie unb=${unb}, 账号 ${cookieId}) — Cookie 属于其他账号会话, 已拦截拉单防串号; 请重新扫码登录该账号`] } }
-  }
-  const items = []
-  let page = 1
-  while (page <= pages) {
-    const pg = await fetchSellerOrdersPage(cookieStr, page, queryCode)
-    if (pg.retMsg) return { ok: false, data: { items, errors: [String(pg.retMsg).slice(0, 200)] } }
-    items.push(...pg.items)
-    if (!pg.nextPage || !pg.items.length) break
-    page++
-    await sleep(400)
-  }
-  return { ok: true, data: { items } }
+  return { ok: true, data: { responses } }
 }
 
 /**
@@ -1895,11 +1375,11 @@ async function pollTasksOnce() {
     const taskId = Number(task?.id || 0)
     if (!taskId) continue
     let payload = {}
-    try { payload = parseLosslessJson(String(task?.payload || '{}')) } catch {}
+    try { payload = JSON.parse(String(task?.payload || '{}')) } catch {}
     let result
     try {
-      result = task?.type === 'fetch_orders'
-        ? await executeFetchOrdersTask(payload)
+      result = task?.type === 'http_fetch'
+        ? await executeHttpFetchTask(payload)
         : task?.type === 'send_message'
           ? await executeSendMessageTask(payload)
           : { ok: false, data: { errors: [`未知任务类型: ${String(task?.type).slice(0, 32)}`] } }
@@ -1947,19 +1427,7 @@ async function statusHeartbeatLoop() {
 /* --------------------- 健康检查 + POST 透传网关 (选填, XY_PROXY_PORT) --------------------- */
 
 if (PROXY_PORT > 0) {
-  // 透传网关目标白名单: 仅闲鱼/淘系域名, 不做开放代理
-  const GATEWAY_ALLOWED_HOSTS = [
-    'h5api.m.goofish.com',
-    'goofish.com',
-    'fishy.m.taobao.com',
-    'wuliao.m.taobao.com',
-    'taobao.com',
-    'tmall.com',
-  ]
-  const gwAllowed = (h) => GATEWAY_ALLOWED_HOSTS.some((d) => h === d || h.endsWith('.' + d))
-  // 逐跳头/鉴权头不透传 (由 Node fetch 自行生成)
-  const GATEWAY_SKIP_HEADERS = new Set(['host', 'connection', 'content-length', 'keep-alive', 'transfer-encoding', 'upgrade', 'accept-encoding', 'authorization'])
-  const GATEWAY_TIMEOUT_MS = 25_000
+  // 白名单/头过滤/超时上限为模块级常量 (与任务通道共用), 此处只负责 HTTP 服务壳
   const readGatewayBody = (req, max = 512 * 1024) =>
     new Promise((resolve, reject) => {
       const chunks = []
@@ -1983,7 +1451,7 @@ if (PROXY_PORT > 0) {
       res.end(
         JSON.stringify({
           ok: true,
-          script_version: `v${PKG.version}`,
+          script_version: `v${SCRIPT_VERSION}`,
           engine_active: engineActive,
           gateway: true,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),

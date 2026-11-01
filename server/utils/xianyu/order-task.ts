@@ -14,7 +14,8 @@
  * CF serverless 同一动因 (与扫码登录会话落库 qr_login_sessions 相同): 任务行落库,
  * 跨实例/多进程可见, 内存队列不可用。
  */
-import type { SellerOrderItem } from './mtop'
+import type { MtopTransport, SellerOrderItem } from './mtop'
+import { fetchSellerOrders } from './mtop'
 import { parseLosslessJson } from './lossless-json'
 import { getDb } from '../db'
 
@@ -122,30 +123,90 @@ async function dispatchProxyTask(
 export interface FetchOrdersTaskOptions {
   /** 卖家订单列表查询码: ALL=全部状态 (一键同步), NOT_SHIP=待发货 (付款拉单兜底)。 */
   queryCode?: 'ALL' | 'NOT_SHIP'
-  /** 拉取页数 (每页 30 单, 代理侧逐页 400ms 限速)。 */
+  /** 拉取页数 (每页 30 单, 逐页任务透传, 页间由代理 400ms 限速)。 */
   pages?: number
-  /** 等待代理回报超时毫秒 (CF 请求预算内: 一键同步 20s / 付款拉单兜底 12s)。 */
+  /** 整体时间预算毫秒 (CF 请求预算内: 一键同步 20s / 付款拉单兜底 12s), 逐页扣减。 */
   timeoutMs?: number
 }
 
 /**
- * 下发 fetch_orders 任务并等待代理回报 (订单列表拉取)。
- * 超时/失败不抛异常 — errors 数组如实携带原因, items 可能为空 (部分页成功时非空)。
+ * 任务通道透传传输层: 把一次 mtop HTTP 请求 (后台已构造并签名) 打包为 http_fetch
+ * 任务, 代理原样转发并回报原始响应文本 — 代理零解析, 响应回到本模块后经 mtopCall
+ * 的无损解析层解析 (订单号精度主权在后台, 与直连/网关模式完全同源同语义)。
+ */
+function taskChannelTransport(
+  db: Awaited<ReturnType<typeof getDb>>,
+  timeoutMs: number,
+): MtopTransport {
+  return async (url, init) => {
+    const r = await dispatchProxyTask(
+      db,
+      'http_fetch',
+      { requests: [{ url, method: init.method, headers: init.headers, body: init.body || '' }] },
+      timeoutMs,
+    )
+    if (!r.ok) throw new Error(r.errors[0] || '代理透传任务执行失败')
+    const resp = r.data?.responses?.[0]
+    if (!resp) throw new Error('代理透传任务未返回响应')
+    return {
+      status: Number(resp.status || 0),
+      text: String(resp.text || ''),
+      setCookie: Array.isArray(resp.set_cookie) ? resp.set_cookie.map(String) : [],
+    }
+  }
+}
+
+/**
+ * 经任务通道拉取卖家订单列表 (逐页透传): Cookie 以数据库为唯一真源, 请求由后台
+ * mtopCall 构造并签名 (含 _m_h5_tk 轮换/token 过期重试), 代理只做原样转发, 响应
+ * 由后台无损解析并标准化。超时/失败不抛异常 — errors 如实携带原因, items 可能为空。
  */
 export async function fetchOrdersViaProxy(
   db: Awaited<ReturnType<typeof getDb>>,
   cookieId: string,
   opts: FetchOrdersTaskOptions = {},
 ): Promise<ProxyOrdersResult> {
-  const r = await dispatchProxyTask(
-    db,
-    'fetch_orders',
-    { cookie_id: String(cookieId), query_code: opts.queryCode === 'NOT_SHIP' ? 'NOT_SHIP' : 'ALL', pages: Math.min(Math.max(opts.pages || 1, 1), 5) },
-    opts.timeoutMs || 20_000,
-  )
-  const items: SellerOrderItem[] = Array.isArray(r.data?.items) ? r.data.items : []
-  const taskErrors: string[] = Array.isArray(r.data?.errors) ? r.data.errors.map(String) : []
-  return { items, errors: [...r.errors, ...taskErrors], viaProxy: true }
+  const items: SellerOrderItem[] = []
+  const errors: string[] = []
+  const id = String(cookieId)
+  const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [id]).catch(() => null)
+  let cookieStr = String(acct?.value || '')
+  if (!cookieStr) return { items, errors: [`账号 ${id} Cookie 为空 (数据库无该账号凭证)`], viaProxy: true }
+
+  const budgetMs = Math.min(Math.max(opts.timeoutMs || 20_000, 3_000), TASK_TIMEOUT_CAP_MS)
+  const deadline = Date.now() + budgetMs
+  const pages = Math.min(Math.max(opts.pages || 1, 1), 5)
+  const queryCode = opts.queryCode === 'NOT_SHIP' ? 'NOT_SHIP' : 'ALL'
+  let page = 1
+  while (page <= pages) {
+    const remain = deadline - Date.now()
+    if (remain < 3_000) {
+      errors.push('任务通道整体时间预算耗尽 (代理未及时领取/回报), 已拉取部分页')
+      break
+    }
+    const pg = await fetchSellerOrders(cookieStr, page, queryCode, {
+      transport: taskChannelTransport(db, remain),
+    }).catch((e: any) => ({
+      items: [] as SellerOrderItem[],
+      nextPage: false,
+      totalCount: 0,
+      retMsg: String(e?.message || e).slice(0, 200),
+      finalCookieStr: cookieStr,
+    }))
+    if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
+    if (pg.retMsg) {
+      errors.push(String(pg.retMsg).slice(0, 200))
+      break
+    }
+    items.push(...pg.items)
+    if (!pg.nextPage || !pg.items.length) break
+    page++
+  }
+  // _m_h5_tk 轮换回写 (与直连/网关模式同语义), 保证下次请求用最新签名凭证
+  if (cookieStr !== String(acct?.value || '')) {
+    await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, id]).catch(() => {})
+  }
+  return { items, errors, viaProxy: true }
 }
 
 /**
