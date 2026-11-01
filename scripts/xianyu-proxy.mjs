@@ -49,6 +49,9 @@ import { fileURLToPath } from 'node:url'
 
 /* --------------------------------- 配置 --------------------------------- */
 
+// 版本号唯一真源 = package.json 的 version 字段 (health 接口 script_version 自动读取)
+const PKG = '2.1.9'
+
 /**
  * .env 文件加载(零依赖, dotenv 同语义: 真实环境变量优先, 文件值不覆盖已有 env)。
  * 为什么必须有: Wispbyte/Pterodactyl 等面板的「环境变量」编辑页实际只把变量写进
@@ -270,6 +273,135 @@ function generateDeviceId(userId) {
   return chars.join('') + '-' + userId
 }
 
+/* --------------------- 无损 JSON 解析 (与后台 lossless-json.ts 同源) ---------------------
+ * 闲鱼下行中 orderId/itemId/buyerId 等字段是 16~19 位数字字面量, JSON.parse 的 double 化
+ * 会静默丢精度 (结尾 0 的错误订单号 → 自动发货落错单/平台报订单状态不正确)。本代理独立
+ * 于后台进程运行, 解析层必须同样无损: 超安全整数范围的整数字面量按原文保留为字符串。 */
+
+function isUnsafeIntegerLiteral(lit) {
+  const digits = lit.startsWith('-') ? lit.slice(1) : lit
+  if (digits.length > 16) return true
+  if (digits.length < 15) return false
+  const num = Number(lit)
+  return num > Number.MAX_SAFE_INTEGER || num < -Number.MAX_SAFE_INTEGER
+}
+
+function parseLosslessJson(text) {
+  const s = String(text ?? '')
+  const n = s.length
+  let i = 0
+  const skipWs = () => {
+    while (i < n) {
+      const c = s.charCodeAt(i)
+      if (c === 32 || c === 9 || c === 10 || c === 13) i++
+      else break
+    }
+  }
+  const expectWord = (word) => {
+    if (s.startsWith(word, i)) i += word.length
+    else throw new Error(`Unexpected token at position ${i}`)
+  }
+  const readString = () => {
+    const start = i
+    i++
+    let out = ''
+    while (i < n) {
+      const c = s[i]
+      if (c === '"') { i++; return out }
+      if (c === '\\') {
+        const e = s[i + 1]
+        i += 2
+        if (e === '"') out += '"'
+        else if (e === '\\') out += '\\'
+        else if (e === '/') out += '/'
+        else if (e === 'b') out += '\b'
+        else if (e === 'f') out += '\f'
+        else if (e === 'n') out += '\n'
+        else if (e === 'r') out += '\r'
+        else if (e === 't') out += '\t'
+        else if (e === 'u') {
+          const hex = s.slice(i, i + 4)
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`Bad unicode escape at position ${i}`)
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 4
+        } else throw new Error(`Bad escape '\\${e ?? ''}' at position ${i - 2}`)
+        continue
+      }
+      out += c
+      i++
+    }
+    throw new Error(`Unterminated string starting at position ${start}`)
+  }
+  const readNumber = () => {
+    const start = i
+    if (s[i] === '-') i++
+    while (i < n && s[i] >= '0' && s[i] <= '9') i++
+    let isInt = true
+    if (s[i] === '.') {
+      isInt = false
+      i++
+      while (i < n && s[i] >= '0' && s[i] <= '9') i++
+    }
+    if (s[i] === 'e' || s[i] === 'E') {
+      isInt = false
+      i++
+      if (s[i] === '+' || s[i] === '-') i++
+      while (i < n && s[i] >= '0' && s[i] <= '9') i++
+    }
+    const lit = s.slice(start, i)
+    if (!lit || lit === '-') throw new Error(`Invalid number at position ${start}`)
+    if (isInt && isUnsafeIntegerLiteral(lit)) return lit
+    return Number(lit)
+  }
+  const readValue = () => {
+    skipWs()
+    if (i >= n) throw new Error('Unexpected end of JSON input')
+    const c = s[i]
+    if (c === '{') {
+      i++
+      const out = {}
+      skipWs()
+      if (i < n && s[i] === '}') { i++; return out }
+      for (;;) {
+        skipWs()
+        if (i >= n || s[i] !== '"') throw new Error(`Expected string key at position ${i}`)
+        const k = readString()
+        skipWs()
+        if (s[i] !== ':') throw new Error(`Expected ':' at position ${i}`)
+        i++
+        out[k] = readValue()
+        skipWs()
+        if (s[i] === ',') { i++; continue }
+        if (s[i] === '}') { i++; return out }
+        throw new Error(`Expected ',' or '}' at position ${i}`)
+      }
+    }
+    if (c === '[') {
+      i++
+      const out = []
+      skipWs()
+      if (s[i] === ']') { i++; return out }
+      for (;;) {
+        out.push(readValue())
+        skipWs()
+        if (s[i] === ',') { i++; continue }
+        if (s[i] === ']') { i++; return out }
+        throw new Error(`Expected ',' or ']' at position ${i}`)
+      }
+    }
+    if (c === '"') return readString()
+    if (c === 't') { expectWord('true'); return true }
+    if (c === 'f') { expectWord('false'); return false }
+    if (c === 'n') { expectWord('null'); return null }
+    if (c === '-' || (c >= '0' && c <= '9')) return readNumber()
+    throw new Error(`Unexpected token '${c}' at position ${i}`)
+  }
+  const value = readValue()
+  skipWs()
+  if (i !== n) throw new Error(`Unexpected non-whitespace content at position ${i}`)
+  return value
+}
+
 /* --------------------- MessagePack 解码 (与后台 protocol.ts 同源) --------------------- */
 
 class MsgPackReader {
@@ -300,7 +432,10 @@ class MsgPackReader {
   u64() {
     const hi = this.u32()
     const lo = this.u32()
-    return hi * 0x1_0000_0000 + lo
+    const v = hi * 0x1_0000_0000 + lo
+    // 超安全整数 (19 位订单号等) 按原文保留为字符串, 与无损 JSON 解析同语义
+    if (v <= Number.MAX_SAFE_INTEGER) return v
+    return ((BigInt(hi) << 32n) | BigInt(lo)).toString()
   }
   str(n) {
     return new TextDecoder('utf-8').decode(this.readBytes(n))
@@ -373,11 +508,11 @@ function decodeSyncData(data) {
   }
   const asText = new TextDecoder('utf-8').decode(bytes)
   try {
-    return JSON.parse(asText)
+    return parseLosslessJson(asText)
   } catch {
     const decoded = decodeMessagePack(bytes)
     if (decoded && typeof decoded === 'object') return decoded
-    return JSON.parse(String(decoded))
+    return parseLosslessJson(String(decoded))
   }
 }
 
@@ -510,7 +645,7 @@ function extractOrderId(message) {
     if (contentJsonStr) {
       let card = null
       try {
-        card = JSON.parse(contentJsonStr)
+        card = parseLosslessJson(contentJsonStr)
       } catch {}
       if (card) {
         const ex = card?.dxCard?.item?.main?.exContent
@@ -546,7 +681,7 @@ function parseTradeCard(message) {
     if (!contentJsonStr) return { title: '', amount: '' }
     let card = null
     try {
-      card = JSON.parse(contentJsonStr)
+      card = parseLosslessJson(contentJsonStr)
     } catch {
       return { title: '', amount: '' }
     }
@@ -866,7 +1001,9 @@ async function fetchSellerOrdersPage(cookieStr, page, queryCode) {
   }
 
   let res = await callOnce(cookieStr)
-  let json = await res.json().catch(() => ({}))
+  // 无损解析: 卖家订单列表响应体里的 19 位订单号数字字面量不可 double 化 (一键同步/付款拉单同源)
+  const parseBody = async (r) => parseLosslessJson(await r.text().catch(() => ''))
+  let json = await parseBody(res).catch(() => ({}))
   const retArr = Array.isArray(json?.ret) ? json.ret : []
   const retStr = retArr.join(' ')
   // token 过期: 用响应轮换后的 _m_h5_tk 重试一次 (与后台 mtopCall 同语义)
@@ -882,7 +1019,7 @@ async function fetchSellerOrdersPage(cookieStr, page, queryCode) {
     } catch {}
     const retryCookie = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
     res = await callOnce(retryCookie)
-    json = await res.json().catch(() => ({}))
+    json = await parseBody(res).catch(() => ({}))
   }
   const ret = Array.isArray(json?.ret) ? json.ret.join(' ') : ''
   if (!ret.includes('SUCCESS')) return { ...empty, retMsg: ret || '卖家订单列表查询失败' }
@@ -1097,7 +1234,7 @@ class XianyuAccountClient {
         if (!raw) return
         let message
         try {
-          message = JSON.parse(raw)
+          message = parseLosslessJson(raw)
         } catch {
           return
         }
@@ -1706,6 +1843,13 @@ async function executeFetchOrdersTask(payload) {
   if (!cookieStr) {
     return { ok: false, data: { errors: [`账号 ${cookieId || '未知'} 本地无 Cookie (等待配置下发后重试)`] } }
   }
+  // 会话身份校验: cookie 内 unb (账号 uid) 与账号 id 不符 = Cookie 属于其他账号会话,
+  // 拉单必拉到他人店铺订单 — 显性报错拒绝, 防串号 (与后台 cookieIdentityMismatch 同语义)
+  const unb = /(?:^|;\s*)unb=([^;]+)/.exec(cookieStr)?.[1]?.trim() || ''
+  const uid = cookieId.startsWith('xy_') ? cookieId.slice(3) : cookieId
+  if (unb && uid && unb !== uid) {
+    return { ok: false, data: { errors: [`Cookie 身份与账号不符 (cookie unb=${unb}, 账号 ${cookieId}) — Cookie 属于其他账号会话, 已拦截拉单防串号; 请重新扫码登录该账号`] } }
+  }
   const items = []
   let page = 1
   while (page <= pages) {
@@ -1751,7 +1895,7 @@ async function pollTasksOnce() {
     const taskId = Number(task?.id || 0)
     if (!taskId) continue
     let payload = {}
-    try { payload = JSON.parse(String(task?.payload || '{}')) } catch {}
+    try { payload = parseLosslessJson(String(task?.payload || '{}')) } catch {}
     let result
     try {
       result = task?.type === 'fetch_orders'
@@ -1839,7 +1983,7 @@ if (PROXY_PORT > 0) {
       res.end(
         JSON.stringify({
           ok: true,
-          script_version: 'v2.1.6',
+          script_version: `v${PKG.version}`,
           engine_active: engineActive,
           gateway: true,
           accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state })),

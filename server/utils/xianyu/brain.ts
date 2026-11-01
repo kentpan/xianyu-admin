@@ -17,7 +17,7 @@ import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
 import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
-import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders } from './mtop'
+import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders, cookieIdentityMismatch } from './mtop'
 import { upsertSoldOrders } from './order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
 import { isGatewayMode } from './gateway'
@@ -150,6 +150,46 @@ async function emitReplyActions(
   return actions.map((a) => ({ ...a, log_id: logId }))
 }
 
+/**
+ * 延迟回复 (v2.1.9): 关键词回复/指定商品回复命中后延迟 N 秒再发送 (默认 10s, 上限 55s
+ * — 决策预算 150s 与代理拉取窗口内, 与发货链 60s 上限同源语义)。
+ * 延迟窗口内卖家手动回复 (APP/后台, isSelf 事件落 manual_reply_pause 决策日志 / 触发
+ * 会话人工暂停) → 立即取消本次自动回复, 避免人工对话中自动回复插话。
+ * 窗口起点取进入等待的时刻 (since), 之后该会话出现任何人工回复痕迹即取消。
+ *
+ * @returns true = 继续发送 (emitReplyActions 内仍有暂停二次检测); false = 已取消 (决策日志已落)
+ */
+async function delayedReplyWait(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  msg: ParsedChatMessage,
+  opts: BrainOptions,
+  delaySeconds: number,
+  strategy: string,
+): Promise<boolean> {
+  const delay = Math.min(Math.max(Math.round(Number(delaySeconds) || 0), 0), 55)
+  if (delay <= 0) return true
+  const since = new Date(Date.now()).toISOString().slice(0, 19).replace('T', ' ')
+  await sleep(delay * 1000)
+  const manual = await db
+    .get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM auto_reply_logs
+       WHERE cookie_id = ? AND chat_id = ? AND decision_reason = 'manual_reply_pause' AND created_at >= ?`,
+      [cookieId, msg.chatId, since],
+    )
+    .catch(() => null)
+  if (Number(manual?.n || 0) > 0 || (await chatPaused(db, cookieId, msg.chatId))) {
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'manual_reply_pause',
+      reply_strategy: strategy,
+      reply_text: `延迟回复窗口内检测到人工回复, 已取消自动回复 (延迟 ${delay}s)`,
+    })
+    return false
+  }
+  return true
+}
+
 /* ---------------------------------- 常量 (语义对齐 butler handle_message) ---------------------------------- */
 
 /**
@@ -255,6 +295,10 @@ async function pickOrderIdFromRemote(
   buyerId: string,
 ): Promise<{ orderId: string; source: string }> {
   try {
+    // 会话身份校验: Cookie 与账号不符 = 串号, 远程拉单必拉到他人店铺订单 — 直接拒绝
+    const acct = await db.get<any>('SELECT value FROM cookies WHERE id = ?', [cookieId]).catch(() => null)
+    const mismatch = acct?.value ? cookieIdentityMismatch(cookieId, String(acct.value)) : ''
+    if (mismatch) return { orderId: '', source: mismatch }
     // 引擎模式分流: ① 透传网关优先 (引擎登记了公网 IP:端口 — CF 直连代理转发 mtop,
     // 秒级直返); ② 任务通道兜底 (代理主动外呼后台, 无需公网入站); 内置引擎 → 本机直连
     if (await isProxyEngineMode(db)) {
@@ -521,6 +565,7 @@ export async function handleChatEvent(
     return []
   }
   if (keywordHit.actions.length) {
+    if (!(await delayedReplyWait(db, cookieId, msg, opts, keywordHit.delaySeconds ?? 10, 'keyword'))) return []
     return emitReplyActions(db, cookieId, msg, opts, keywordHit.actions, {
       reply_strategy: 'keyword',
       matched_keyword: keywordHit.keyword || '',
@@ -538,12 +583,13 @@ export async function handleChatEvent(
   }
 
   // 3) 指定商品回复
-  const itemReply = await db.get<{ reply_content: string }>(
-    'SELECT reply_content FROM item_replay WHERE cookie_id = ? AND item_id = ? ORDER BY id DESC LIMIT 1',
+  const itemReply = await db.get<{ reply_content: string; delay_seconds: number }>(
+    'SELECT reply_content, delay_seconds FROM item_replay WHERE cookie_id = ? AND item_id = ? ORDER BY id DESC LIMIT 1',
     [cookieId, msg.itemId],
   )
   if (itemReply?.reply_content) {
     const text = applyVars(itemReply.reply_content, vars)
+    if (!(await delayedReplyWait(db, cookieId, msg, opts, Number(itemReply.delay_seconds ?? 10), 'item_replay'))) return []
     return emitReplyActions(db, cookieId, msg, opts, [textAction(cookieId, msg, text, 0)], {
       reply_strategy: 'default',
       reply_text: text,
@@ -918,6 +964,7 @@ interface KeywordHit {
   keyword?: string
   actions: EngineAction[]
   preview?: string
+  delaySeconds?: number
 }
 
 async function matchKeywordReply(
@@ -927,7 +974,7 @@ async function matchKeywordReply(
   vars: Record<string, string>,
 ): Promise<KeywordHit> {
   const rows = await db.all<any>(
-    'SELECT keyword, reply, item_id, type, image_url FROM keywords WHERE cookie_id = ?',
+    'SELECT keyword, reply, item_id, type, image_url, delay_seconds FROM keywords WHERE cookie_id = ?',
     [cookieId],
   )
   const content = msg.content.toLowerCase()
@@ -948,13 +995,20 @@ async function matchKeywordReply(
           keyword: row.keyword,
           actions: [imageAction(cookieId, msg, row.image_url, 0)],
           preview: `[图片] ${row.image_url}`,
+          delaySeconds: Number(row.delay_seconds ?? 10),
         }
       }
       if (!row.reply || !String(row.reply).trim()) {
         return { result: 'empty', keyword: row.keyword, actions: [] }
       }
       const text = applyVars(String(row.reply), vars)
-      return { result: 'hit', keyword: row.keyword, actions: [textAction(cookieId, msg, text, 0)], preview: text }
+      return {
+        result: 'hit',
+        keyword: row.keyword,
+        actions: [textAction(cookieId, msg, text, 0)],
+        preview: text,
+        delaySeconds: Number(row.delay_seconds ?? 10),
+      }
     }
   }
   return { result: 'none', actions: [] }
@@ -1403,6 +1457,21 @@ async function autoDeliver(
       decision_reason: 'already_shipped',
       reply_strategy: 'none',
       reply_text: `订单 ${orderId} 已发货, 不重复发货 (status=${localStatus || '未知'})`,
+    })
+    return []
+  }
+
+  // 待付款拦截 (v2.1.9): 本地状态明确为 pending_payment (拍下未付款) 时, 平台无需邮寄发货
+  // 必然报 ORDER_STATUS_ERROR::订单状态不正确, 且任何模式都不应向未付款买家发卡。
+  // 正常链路 (付款卡片/等待卖家发货卡片) 均会先落 pending_ship, 唯有乱序重放会带着
+  // 待付款状态闯到这里 — 拒绝并留痕, 付款确认事件到达后自动重试。
+  if (localStatus === 'pending_payment') {
+    logWarn(`[${cookieId}] 订单 ${orderId} 本地状态为待付款 (付款未确认), 拒绝自动发货`)
+    await addLog(db, cookieId, logMsg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'delivery_failed',
+      reply_strategy: 'none',
+      reply_text: `订单 ${orderId} 仍为待付款状态, 已拦截发货 (付款确认后将自动重试)`,
     })
     return []
   }

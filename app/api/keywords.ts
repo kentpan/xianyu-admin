@@ -10,6 +10,7 @@ export interface Keyword {
   image_url: string | null
   delay_min?: number
   delay_max?: number
+  delay_seconds?: number
   created_at: string
   item_title?: string | null
 }
@@ -22,6 +23,7 @@ export interface CreateKeywordPayload {
   image_url: string
   delay_min?: number | string
   delay_max?: number | string
+  delay_seconds?: number | string
 }
 
 export type UpdateKeywordPayload = CreateKeywordPayload

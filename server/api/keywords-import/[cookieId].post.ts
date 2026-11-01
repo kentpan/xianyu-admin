@@ -16,10 +16,11 @@ export default defineEventHandler(
         const reply = (k.reply || '').toString().trim()
         if (!keyword || (!reply && !k.image_url)) continue
         const type = (k.type || 'text').toString() === 'image' ? 'image' : 'text'
+        const delay_seconds = Math.min(Math.max(Math.round(Number(k.delay_seconds ?? 10) || 0), 0), 300)
         await db.run(
-          `INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [cookieId, keyword, reply, (k.item_id || '').toString().trim(), type, (k.image_url || '').toString().trim() || null],
+          `INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url, delay_seconds)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [cookieId, keyword, reply, (k.item_id || '').toString().trim(), type, (k.image_url || '').toString().trim() || null, delay_seconds],
         )
         inserted++
       }

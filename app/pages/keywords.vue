@@ -179,6 +179,11 @@
           <textarea v-model="form.reply" rows="2" class="input" placeholder="图片说明文字"></textarea>
         </div>
         <div>
+          <label class="label">延迟回复 (秒)</label>
+          <input v-model.number="form.delay_seconds" type="number" min="0" max="300" class="input" placeholder="10" />
+          <p class="text-xs text-slate-400 mt-1">命中后延迟指定秒数再发送 (0 = 立即发送)，默认 10 秒；延迟期间您手动回复则立即取消本次自动回复</p>
+        </div>
+        <div>
           <label class="label">关联商品 (可选)</label>
           <select v-model="form.item_id" class="input">
             <option value="">通用 (对所有商品生效)</option>
@@ -658,7 +663,7 @@ function onCookieChange() {
 
 function openCreate() {
   editing.value = false
-  form.value = { id: null, keyword: '', reply: '', item_id: '', type: 'text', image_url: '' }
+  form.value = { id: null, keyword: '', reply: '', item_id: '', type: 'text', image_url: '', delay_seconds: 10 }
   modalOpen.value = true
 }
 
@@ -671,6 +676,7 @@ function openEdit(k: Keyword) {
     item_id: k.item_id,
     type: k.type,
     image_url: k.image_url || '',
+    delay_seconds: k.delay_seconds ?? 10,
   }
   modalOpen.value = true
 }
@@ -696,6 +702,7 @@ async function save() {
       item_id: form.value.item_id,
       type: form.value.type,
       image_url: form.value.image_url,
+      delay_seconds: Math.max(Number(form.value.delay_seconds) || 0, 0),
     }
     if (editing.value) {
       await updateKeyword(currentCookieId.value, form.value.id, payload)

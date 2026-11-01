@@ -75,9 +75,10 @@ export default defineEventHandler(
           valid = false
           reason = '页面标记 isLogin=false'
         } else if (unbFromCookie) {
-          // Ambiguous HTML but unb is present → optimistically valid
+          // Ambiguous HTML but unb is present → 弱判定: 不能实锤会话有效 (曾误导排查:
+          // Session 实际已过期仍报「有效」), 文案必须如实传达不确定性
           valid = true
-          reason = 'cookie 含 unb（页面无明确登录标记）'
+          reason = '弱判定: cookie 含 unb 但页面无明确登录标记, 会话未必有效 (以实际拉单/收发消息为准)'
         } else {
           valid = false
           reason = '页面无登录信息且 cookie 缺少 unb'

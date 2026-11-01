@@ -5,6 +5,7 @@ export interface ItemReply {
   item_id: string
   cookie_id: string
   reply_content: string
+  delay_seconds?: number
   created_at: string
   updated_at: string
   item_title?: string | null
@@ -15,6 +16,7 @@ export interface ItemReply {
 
 export interface UpsertItemReplyPayload {
   reply_content: string
+  delay_seconds?: number
 }
 
 export function getItemReplies() {

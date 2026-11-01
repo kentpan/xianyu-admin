@@ -51,6 +51,7 @@ const SCHEMA: string[] = [
     image_url TEXT,
     delay_min REAL DEFAULT 0,
     delay_max REAL DEFAULT 0,
+    delay_seconds INTEGER DEFAULT 10,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS item_info (
@@ -138,6 +139,7 @@ const SCHEMA: string[] = [
     item_id VARCHAR(64) NOT NULL,
     cookie_id VARCHAR(64) NOT NULL,
     reply_content TEXT NOT NULL,
+    delay_seconds INTEGER DEFAULT 10,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -839,6 +841,9 @@ const MIGRATIONS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_enginetasks_status ON engine_tasks(status, engine_id, id)`,
   // 任务行生命周期 (查询侧守护, 不用 trigger): 领取/写入超过 120s 仍 pending/running
   // 一律判 expired (代理中断/无代理在线), 由 order-task 轮询侧与 tasks 领取侧顺手清理
+  // 延迟回复 (v2.1.9): 关键词/指定商品回复延迟秒数 (默认 10s), 窗口内人工回复则取消
+  `ALTER TABLE keywords ADD COLUMN delay_seconds INTEGER DEFAULT 10`,
+  `ALTER TABLE item_replay ADD COLUMN delay_seconds INTEGER DEFAULT 10`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

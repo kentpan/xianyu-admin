@@ -73,7 +73,7 @@
                 </td>
                 <td class="max-w-[140px] truncate text-slate-500 dark:text-slate-400">{{ log.matched_keyword || '-' }}</td>
                 <td class="max-w-[260px]">
-                  <p class="truncate" :class="log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'">
+                  <p class="whitespace-pre-wrap break-words" :class="log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'">
                     {{ log.error_message || log.reply_text || '-' }}
                   </p>
                 </td>

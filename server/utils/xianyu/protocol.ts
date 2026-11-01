@@ -121,13 +121,17 @@ class MsgPackReader {
   u32(): number {
     return ((this.u16() << 16) | this.u16()) >>> 0
   }
-  u64(): number {
+  u64(): number | string {
     const hi = this.u32()
     const lo = this.u32()
-    return hi * 0x1_0000_0000 + lo
+    const v = hi * 0x1_0000_0000 + lo
+    // 超安全整数 (19 位订单号等) 按原文保留为字符串, 与无损 JSON 解析同语义;
+    // 时间戳 (pts/createTime ≈ 1e12~1e15) 在安全范围内不受影响
+    if (v <= Number.MAX_SAFE_INTEGER) return v
+    return ((BigInt(hi) << 32n) | BigInt(lo)).toString()
   }
-  i64(): number {
-    // 负数与大于 2^53 的值在闲鱼消息中不出现, 按 u64 语义处理足够
+  i64(): number | string {
+    // 负数在闲鱼消息中不出现, 按 u64 语义处理足够
     return this.u64()
   }
   str(n: number): string {

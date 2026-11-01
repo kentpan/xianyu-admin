@@ -9,7 +9,7 @@ export default defineEventHandler(
     const params: any[] = []
     let sql = `
       SELECT
-        r.id, r.item_id, r.cookie_id, r.reply_content, r.created_at, r.updated_at,
+        r.id, r.item_id, r.cookie_id, r.reply_content, r.delay_seconds, r.created_at, r.updated_at,
         ii.item_title, ii.item_price, ii.item_category,
         c.remark AS cookie_remark,
         ias.ai_enabled, ias.ai_config_id, ac.name AS ai_config_name

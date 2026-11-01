@@ -12,7 +12,7 @@
  * 返回 { total, updated, no_change, failed, results[], list_sync: { inserted, updated, accounts, errors[] } },
  * 失败单据如实携带错误信息。
  */
-import { fetchOrderDetail, fetchSellerOrders } from '../../utils/xianyu/mtop'
+import { fetchOrderDetail, fetchSellerOrders, cookieIdentityMismatch } from '../../utils/xianyu/mtop'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
 import { isGatewayMode } from '../../utils/xianyu/gateway'
@@ -44,6 +44,13 @@ export default defineEventHandler(
 
     if (proxyMode || gwMode) {
       for (const acct of accounts) {
+        // 会话身份校验: Cookie unb 与账号 id 不符 = 串号 (Cookie 属于其他账号会话),
+        // 拉回来的将是他人店铺订单 — 显性报错拦截, 绝不入库
+        const mismatch = cookieIdentityMismatch(String(acct.id), String(acct.value || ''))
+        if (mismatch) {
+          listErrors.push(`${acct.id}: ${mismatch}`)
+          continue
+        }
         let done = false
         // ① 透传网关优先: mtopFetch 内部自动把请求转发给代理网关 (sign/cookie 轮换仍在后台完成)
         if (gwMode) {
@@ -87,6 +94,12 @@ export default defineEventHandler(
       }
     } else {
       for (const acct of accounts) {
+        // 会话身份校验 (同上): 防串号 Cookie 静默拉入他人订单
+        const mismatch = cookieIdentityMismatch(String(acct.id), String(acct.value || ''))
+        if (mismatch) {
+          listErrors.push(`${acct.id}: ${mismatch}`)
+          continue
+        }
         let cookieStr = String(acct.value || '')
         let page = 1
         while (page <= MAX_LIST_PAGES) {

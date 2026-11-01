@@ -14,12 +14,13 @@ export default defineEventHandler(
     const item_id = (body.item_id || '').toString().trim()
     const type = (body.type || 'text').toString() === 'image' ? 'image' : 'text'
     const image_url = (body.image_url || '').toString().trim() || null
-    // 回复随机延时 (秒; 都空/0=立即, min==max=固定, min<max=高斯随机)
+    // 延迟回复 (秒, 默认 10): 命中后延迟发送, 窗口内人工回复则取消 (brain.delayedReplyWait)
+    const delay_seconds = Math.min(Math.max(Math.round(Number(body.delay_seconds ?? 10) || 0), 0), 300)
 
     const r = await db.run(
-      `INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [cookieId, keyword, reply, item_id, type, image_url],
+      `INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url, delay_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [cookieId, keyword, reply, item_id, type, image_url, delay_seconds],
     )
 
     return ok({ id: r.lastInsertId }, '关键词已添加')

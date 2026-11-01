@@ -460,6 +460,7 @@ CREATE TABLE item_replay (
     item_id VARCHAR(64) NOT NULL,
     cookie_id VARCHAR(64) NOT NULL,
     reply_content TEXT NOT NULL,
+    delay_seconds INTEGER DEFAULT 10,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
@@ -474,6 +475,7 @@ CREATE TABLE keywords (
     image_url TEXT,
     delay_min REAL DEFAULT 0,
     delay_max REAL DEFAULT 0,
+    delay_seconds INTEGER DEFAULT 10,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 

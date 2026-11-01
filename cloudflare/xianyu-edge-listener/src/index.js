@@ -146,7 +146,10 @@ class MsgPackReader {
   u64() {
     const hi = this.u32()
     const lo = this.u32()
-    return hi * 0x1_0000_0000 + lo
+    const v = hi * 0x1_0000_0000 + lo
+    // 超安全整数 (19 位订单号等) 按原文保留为字符串, 与无损 JSON 解析同语义
+    if (v <= Number.MAX_SAFE_INTEGER) return v
+    return ((BigInt(hi) << 32n) | BigInt(lo)).toString()
   }
   str(n) {
     return new TextDecoder('utf-8').decode(this.readBytes(n))

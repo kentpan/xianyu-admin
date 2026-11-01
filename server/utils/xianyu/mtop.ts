@@ -49,6 +49,33 @@ export function parseCookieStr(cookieStr: string): Map<string, string> {
   return jar
 }
 
+/** 从 cookie_id ("xy_2214722801206") 提取账号 uid (去 xy_ 前缀)。 */
+export function cookieIdUid(cookieId: string): string {
+  const id = String(cookieId || '')
+  return id.startsWith('xy_') ? id.slice(3) : id
+}
+
+/**
+ * Cookie 会话身份校验: cookie 内 unb (淘宝账号 uid) 必须与账号 id 一致。
+ *
+ * 背景 (线上实锤事故): sold.get 等卖家接口按「请求 Cookie 的会话」返回数据 ——
+ * 当 cookies 表里存的 Cookie 实际属于另一个账号 (手动粘贴串号 / 共享会话 /
+ * 多点登录被顶号后旧凭证残留) 时, 卖家订单列表拉回来的全是他人店铺的订单,
+ * 且被静默 upsert 到本账号名下。此校验在拉单入口拦截串号 Cookie, 让问题
+ * 显性报错而不是静默污染订单库。
+ *
+ * @returns 串号错误文案; '' = 通过 (unb 缺失的极旧 cookie 无法判定, 放行)
+ */
+export function cookieIdentityMismatch(cookieId: string, cookieStr: string): string {
+  const unb = parseCookieStr(cookieStr).get('unb') || ''
+  const uid = cookieIdUid(cookieId)
+  if (!unb || !uid) return ''
+  if (unb !== uid) {
+    return `Cookie 身份与账号不符 (cookie unb=${unb}, 账号 ${cookieId}) — Cookie 属于其他账号会话, 已拦截同步防串号; 请到「账号管理」删除该账号后重新扫码登录`
+  }
+  return ''
+}
+
 /** 把 jar 序列化为 cookie 字符串。 */
 export function cookieHeader(jar: Map<string, string>): string {
   return Array.from(jar.entries())

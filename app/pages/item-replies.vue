@@ -169,6 +169,11 @@
           <textarea v-model="form.reply_content" rows="5" class="input" placeholder="该商品的专属自动回复内容"></textarea>
           <p class="text-xs text-slate-400 mt-1">支持多行文本；可用变量: {send_user_name} 买家昵称、{send_user_id} 买家ID、{send_message} 消息内容、{item_id} 商品ID</p>
         </div>
+        <div>
+          <label class="label">延迟回复 (秒)</label>
+          <input v-model.number="form.delay_seconds" type="number" min="0" max="300" class="input" placeholder="10" />
+          <p class="text-xs text-slate-400 mt-1">命中后延迟指定秒数再发送 (0 = 立即发送)，默认 10 秒；延迟期间您手动回复则立即取消本次自动回复</p>
+        </div>
       </div>
       <template #footer>
         <button class="btn-secondary" @click="modalOpen = false">取消</button>
@@ -205,7 +210,7 @@ const keyword = ref('')
 
 const modalOpen = ref(false)
 const editing = ref(false)
-const form = ref<any>({ cookie_id: '', item_id: '', reply_content: '' })
+const form = ref<any>({ cookie_id: '', item_id: '', reply_content: '', delay_seconds: 10 })
 
 const aiModalOpen = ref(false)
 const aiSaving = ref(false)
@@ -257,13 +262,13 @@ async function reload() {
 
 function openCreate() {
   editing.value = false
-  form.value = { cookie_id: filterCookieId.value || '', item_id: '', reply_content: '' }
+  form.value = { cookie_id: filterCookieId.value || '', item_id: '', reply_content: '', delay_seconds: 10 }
   modalOpen.value = true
 }
 
 function openEdit(r: ItemReply) {
   editing.value = true
-  form.value = { cookie_id: r.cookie_id, item_id: r.item_id, reply_content: r.reply_content }
+  form.value = { cookie_id: r.cookie_id, item_id: r.item_id, reply_content: r.reply_content, delay_seconds: r.delay_seconds ?? 10 }
   modalOpen.value = true
 }
 
@@ -334,7 +339,7 @@ async function save() {
     await upsertItemReply(
       form.value.cookie_id,
       form.value.item_id,
-      { reply_content: form.value.reply_content },
+      { reply_content: form.value.reply_content, delay_seconds: Math.max(Number(form.value.delay_seconds) || 0, 0) },
     )
     toast.success(editing.value ? '回复已更新' : '回复已添加')
     modalOpen.value = false
