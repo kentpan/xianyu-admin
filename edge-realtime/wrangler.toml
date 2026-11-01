@@ -17,6 +17,8 @@
 #   class_name = "EdgeRealtimeDO"
 #   script_name = "xianyu-admin-realtime"   # = 本文件 name
 
+# 注意: 项目名称唯一真源 = package.json 的 name 字段(本 Worker 名 = name + '-realtime');
+# CI 部署时由 workflow 从 deploy.config.js realtime.workerName(留空则自动拼接)生成。
 name = "xianyu-admin-realtime"
 main = "index.js"
 compatibility_date = "2026-08-01"

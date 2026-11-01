@@ -9,6 +9,7 @@
  *   4. 风控挑战 (FAIL_SYS_USER_VALIDATE/RGV587) → 冷却阶梯 5/10/20/30 分钟, 冷却期零请求
  *   5. 发送人化队列 — 随机间隔 0.8~2.5s, 滑动窗口限速 12 条/分钟, 每条消息必 ack
  */
+import { parseLosslessJson } from './lossless-json'
 import {
   WEBSOCKET_URL,
   TOKEN_API,
@@ -398,7 +399,7 @@ export class XianyuAccountClient {
         if (!raw) return
         let message: any
         try {
-          message = JSON.parse(raw)
+          message = parseLosslessJson(raw)
         } catch {
           return
         }

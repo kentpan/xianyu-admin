@@ -1,13 +1,20 @@
 // 调用方仓库根目录 deploy.config.js 契约(可重用工作流由此读取全部部署配置)
+// 项目名称唯一真源 = package.json 的 name 字段 —— projectName/d1Name 均自动读取, 不再手写。
+// 注意: 工作流以 data:URL 方式按 ESM import 本文件(data:URL 下 import.meta.url 相对解析
+// 不可用), 因此这里用 process.cwd() 定位 package.json(工作流执行目录恒为仓库根)。
+import { readFileSync } from 'node:fs'
+
+const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+
 export default {
   scriptsRepository: 'kentpan/actions-scripts-base', // 脚本宿主仓库; 同仓方式=运行时临时拉取源, 跨仓方式=base 工作流脚本来源
   scriptsRef: '', // 脚本分支/tag; 留空 = 默认分支
   target: 'CLOUDFLARE', // 发布目标(默认 CLOUDFLARE)
-  
-  projectName: 'xianyu-admin', // Cloudflare 项目名(必填)
+
+  projectName: pkg.name, // Cloudflare 项目名(必填) ← package.json name
   deployType: 'pages', // pages | workers | both(默认 pages)
   accountId: '', // 可选; 留空自动探测
-  d1Name: 'xianyu-admin', // D1 库名; 留空 = 不使用 D1 数据库
+  d1Name: pkg.name, // D1 库名; 留空 = 不使用 D1 数据库 ← package.json name
   d1Id: '', // 可选; 已知 ID 直接复用(跳过创建)
   kvName: '', // KV 命名空间名; 留空 = 不使用 KV 数据库
   kvId: '', // 可选; 已知 ID 直接复用

@@ -15,6 +15,7 @@
  * 跨实例/多进程可见, 内存队列不可用。
  */
 import type { SellerOrderItem } from './mtop'
+import { parseLosslessJson } from './lossless-json'
 import { getDb } from '../db'
 
 export interface ProxyOrdersResult {
@@ -97,7 +98,7 @@ async function dispatchProxyTask(
     if (row.status === 'done' || row.status === 'failed') {
       let data: any = null
       try {
-        data = row.result ? JSON.parse(String(row.result)) : null
+        data = row.result ? parseLosslessJson(String(row.result)) : null
       } catch {
         data = null
       }

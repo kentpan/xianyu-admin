@@ -7,6 +7,7 @@
 
 import { createHash } from 'node:crypto'
 import { registerUA, resolveChromeUA } from './chrome-ua'
+import { parseLosslessJson } from './lossless-json'
 
 export const APP_KEY = '444e9908a51d1cb236a27862abc769c9'
 export const SIGN_APP_KEY = '34839810'
@@ -206,11 +207,11 @@ export function decodeSyncData(data: string): any {
   }
   const asText = new TextDecoder('utf-8').decode(bytes)
   try {
-    return JSON.parse(asText)
+    return parseLosslessJson(asText)
   } catch {
     const decoded = decodeMessagePack(bytes)
     if (decoded && typeof decoded === 'object') return decoded
-    return JSON.parse(String(decoded))
+    return parseLosslessJson(String(decoded))
   }
 }
 
@@ -409,7 +410,7 @@ export function extractOrderId(message: any): string {
     if (contentJsonStr) {
       let card: any = null
       try {
-        card = JSON.parse(contentJsonStr)
+        card = parseLosslessJson(contentJsonStr)
       } catch {}
       if (card) {
         const ex = card?.dxCard?.item?.main?.exContent
@@ -459,7 +460,7 @@ export function parseTradeCard(message: any): { title: string; amount: string } 
     if (!contentJsonStr) return { title: '', amount: '' }
     let card: any = null
     try {
-      card = JSON.parse(contentJsonStr)
+      card = parseLosslessJson(contentJsonStr)
     } catch {
       return { title: '', amount: '' }
     }
@@ -543,7 +544,7 @@ function extractItemIdFromMeta(meta: any): string {
     }
   } catch {}
   try {
-    const ext = typeof meta?.extJson === 'string' && meta.extJson ? JSON.parse(meta.extJson) : null
+    const ext = typeof meta?.extJson === 'string' && meta.extJson ? parseLosslessJson(meta.extJson) : null
     if (ext?.itemId != null && String(ext.itemId).trim()) return String(ext.itemId)
   } catch {}
   return ''

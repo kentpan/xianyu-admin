@@ -5,8 +5,10 @@
 //   启动:     pm2 start ecosystem.config.cjs
 //   开机自启:  pm2 save && pm2 startup   (一次性, 按提示执行输出的命令)
 //   日常运维:  pm2 logs xianyu-admin | pm2 restart xianyu-admin | pm2 stop xianyu-admin | pm2 delete xianyu-admin
+//     (进程名跟随 package.json name, 上述命令中的 xianyu-admin 以实际 name 为准)
 //
 // 说明:
+//   - 项目名称唯一真源 = package.json 的 name 字段, 此处自动读取不再手写
 //   - script=npm + args=start → 执行 package.json 的 start
 //     (node --env-file-if-exists=.env .output/server/index.mjs)
 //   - 端口: 由项目根 .env 的 PORT=3730 决定(--env-file 加载), pm2 层绝不注入
@@ -14,9 +16,11 @@
 //   - ADMIN_SECRET / JWT_SECRET / DATABASE_URL 同样由 .env 提供。
 //   - instances=1 强制单实例(SQLite 单写者, 绝不能 cluster 多实例同写一个库)。
 // ============================================================================
+const pkg = require('./package.json')
+
 module.exports = {
   apps: [{
-    name: 'xianyu-admin',
+    name: pkg.name,
     cwd: __dirname,
     script: 'npm',
     args: 'start',

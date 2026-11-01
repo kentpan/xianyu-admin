@@ -41,6 +41,7 @@ import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from
 import { dispatchNotify } from '../../utils/notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from '../../utils/xianyu/publisher'
 import { consumeRate } from '../../utils/rate-limit'
+import { parseLosslessJson } from '../../utils/xianyu/lossless-json'
 
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
@@ -59,7 +60,16 @@ export default defineEventHandler(
       throw new ApiError(429, `事件上报过于频繁, 请 ${rl.retryAfterSeconds}s 后重试`)
     }
 
-    const body = await readBody(event) || {}
+    // 代理回报体可能携带 19 位订单号数字字面量, h3 readBody 内置 JSON.parse 会丢精度 →
+    // 读原文无损解析 (订单号精度根治点之一)
+    const rawBody = await readRawBody(event).catch(() => '')
+    const body = (() => {
+      try {
+        return parseLosslessJson(String(rawBody || '{}'))
+      } catch {
+        return {}
+      }
+    })()
 
     // 新版代理的决策结果拉取通道 (快速 ACK 模式的回收)
     if (Array.isArray(body.pull) && body.pull.length) {

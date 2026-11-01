@@ -16,6 +16,7 @@
  */
 import crypto from 'node:crypto'
 import { relayMtopRequest } from './gateway'
+import { parseLosslessJson } from './lossless-json'
 
 /** 闲鱼 H5 appKey (全项目硬编码值)。 */
 const APP_KEY = '34839810'
@@ -77,13 +78,22 @@ function getSetCookies(res: Response): string[] {
   }
 }
 
-/** mtop 响应 JSON 宽松解析 (空体/非 JSON 返空对象, 与 res.json().catch 同语义)。 */
+/** mtop 响应 JSON 宽松解析 (空体/非 JSON 返空对象, 与 res.json().catch 同语义)。
+ *  无损解析: 超安全整数范围的订单号等数字字面量按原文保留为字符串 (订单号精度丢失根治点)。 */
 function parseMtopJson(text: string): any {
   try {
-    return JSON.parse(text)
+    return parseLosslessJson(text)
   } catch {
     return {}
   }
+}
+
+/** 请求载荷里的 ID 数值化: 能无损往返才转 number, 否则原样字符串 (避免 Number() 精度丢失)。 */
+function numericIdOrSelf(v: unknown): number | string {
+  const s = String(v ?? '').trim()
+  if (!s) return 0
+  const num = Number(s)
+  return Number.isSafeInteger(num) && String(num) === s ? num : s
 }
 
 /**
@@ -526,7 +536,7 @@ export async function freeshippingOrder(
   buyerId: string,
 ): Promise<{ success: boolean; message: string; finalCookieStr: string }> {
   if (!orderId) return { success: false, message: '缺少订单号', finalCookieStr: cookieStr }
-  const data = { bizOrderId: String(orderId), itemId: Number(itemId) || String(itemId), buyerId: Number(buyerId) || String(buyerId) }
+  const data = { bizOrderId: String(orderId), itemId: numericIdOrSelf(itemId), buyerId: numericIdOrSelf(buyerId) }
   const r = await mtopCall<any>('mtop.idle.groupon.activity.seller.freeshipping', data, cookieStr, {
     method: 'POST',
   })
