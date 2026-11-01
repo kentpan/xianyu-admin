@@ -15,7 +15,6 @@ export default defineEventHandler(
 
     const db = await getDb()
     const placeholders = ids.map(() => '?').join(',')
-
     if (action === 'export') {
       const rows = await db.all(
         `SELECT * FROM orders WHERE order_id IN (${placeholders})`,
@@ -42,11 +41,14 @@ export default defineEventHandler(
       let affected = 0
       await db.transaction(async () => {
         for (const id of ids) {
+          const row = await db.get<{ cookie_id: string }>('SELECT cookie_id FROM orders WHERE order_id=?', [id]).catch(() => null)
           const r = await db.run('DELETE FROM orders WHERE order_id=?', [id])
           affected += r.changes
+          // 登记删除屏蔽: 否则下一轮订单同步会原样拉回, 表现为「删不掉」
+          if (r.changes > 0) await rememberDeletedOrder(db, String(id), String(row?.cookie_id || ''))
         }
       })
-      return ok({ affected }, `已批量删除 ${affected} 条订单`)
+      return ok({ affected }, `已批量删除 ${affected} 条订单 (同步不再拉回)`)
     }
   }),
 )

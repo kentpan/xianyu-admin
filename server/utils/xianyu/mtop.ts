@@ -713,6 +713,8 @@ export interface SellerOrderItem {
   item_id: string
   buyer_id: string
   buyer_nick: string
+  /** 卖家身份 (响应中能提取到的: 卖家 uid); 空串 = 响应未携带, 无法判定。 */
+  seller_id: string
   receiver_name: string
   receiver_phone: string
   receiver_address: string
@@ -753,12 +755,19 @@ export function parseSoldOrderItem(item: any): SellerOrderItem | null {
   const priceVo = item?.priceVO || {}
   const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
   const rawStatus = String(common.orderStatus || '')
+  // 卖家身份提取 (尽力而为): 响应中任一已知位置携带卖家 uid 都取到,
+  // 供入库前账号隔离复核 (与账号 uid 不符的订单不入库); 取不到则空串放行
+  const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
+  const sellerId = String(
+    common.sellerId || common.seller_id || sellerVO.userId || sellerVO.sellerId || sellerVO.userNumberId || item?.sellerId || '',
+  ).trim()
   return {
     order_id: orderId,
     order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
     item_id: String(common.itemId || ''),
     buyer_id: String(buyer.buyerId || ''),
     buyer_nick: String(buyer.userNick || ''),
+    seller_id: sellerId,
     receiver_name: String(buyer.name || ''),
     receiver_phone: String(buyer.phone || ''),
     receiver_address: String(buyer.address || ''),

@@ -117,6 +117,7 @@
                 <th>买家</th>
                 <th>金额</th>
                 <th>状态</th>
+                <th class="hidden lg:table-cell">所属账号</th>
                 <th>收货人</th>
                 <th>创建时间</th>
                 <th class="text-right">操作</th>
@@ -133,6 +134,9 @@
                 <td>{{ o.buyer_id || '—' }}</td>
                 <td><span class="font-medium text-slate-700 dark:text-slate-200">¥{{ o.amount || '0' }}</span></td>
                 <td><OrderStatusBadge :status="o.order_status" /></td>
+                <td class="hidden lg:table-cell text-slate-500 dark:text-slate-400 max-w-[140px]">
+                  <p class="truncate">{{ o.cookie_remark || o.cookie_id || '—' }}</p>
+                </td>
                 <td>
                   <template v-if="o.receiver_name">
                     <p class="text-slate-700 dark:text-slate-200">{{ o.receiver_name }}</p>
@@ -506,7 +510,9 @@ async function syncAll() {
     if (r.list_sync) {
       if (r.list_sync.inserted) parts.push(`新拉取 ${r.list_sync.inserted} 单`)
       if (r.list_sync.updated) parts.push(`列表更新 ${r.list_sync.updated} 单`)
-      if (r.list_sync.errors?.length) parts.push(`列表拉取异常 ${r.list_sync.errors.length} 账号`)
+      if (r.list_sync.blocked) parts.push(`账号隔离拦截 ${r.list_sync.blocked} 单`)
+      if (r.list_sync.skipped_deleted) parts.push(`已删除屏蔽 ${r.list_sync.skipped_deleted} 单`)
+      if (r.list_sync.errors?.length) parts.push(`异常 ${r.list_sync.errors.length} 条`)
     }
     if (r.total) parts.push(`详情精修 ${r.total} 单 (状态更新 ${r.updated}, 无变化 ${r.no_change}${r.failed ? `, 失败 ${r.failed}` : ''})`)
     if (r.list_sync?.errors?.length && !r.total && !r.list_sync.inserted) {

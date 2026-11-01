@@ -98,6 +98,8 @@ export interface RefreshAllResult {
   list_sync?: {
     inserted: number
     updated: number
+    blocked: number
+    skipped_deleted: number
     accounts: number
     errors: string[]
   }

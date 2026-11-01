@@ -844,6 +844,14 @@ const MIGRATIONS: string[] = [
   // 延迟回复 (v2.1.9): 关键词/指定商品回复延迟秒数 (默认 10s), 窗口内人工回复则取消
   `ALTER TABLE keywords ADD COLUMN delay_seconds INTEGER DEFAULT 10`,
   `ALTER TABLE item_replay ADD COLUMN delay_seconds INTEGER DEFAULT 10`,
+  // 删除订单屏蔽表 (v2.1.9): 用户删除的订单号登记于此, 订单同步 (列表拉取/卡片兜底)
+  // 命中即跳过 —— 否则删除后被下一轮同步原样恢复, 表现为「删都删不掉」
+  `CREATE TABLE IF NOT EXISTS deleted_orders (
+    order_id VARCHAR(64) PRIMARY KEY,
+    cookie_id VARCHAR(64) DEFAULT '',
+    reason VARCHAR(255) DEFAULT 'user_delete',
+    deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

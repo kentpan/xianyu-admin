@@ -34,8 +34,18 @@ export default defineEventHandler(
 
     let listInserted = 0
     let listUpdated = 0
+    let listBlocked = 0
+    let listSkippedDeleted = 0
     const listErrors: string[] = []
     const MAX_LIST_PAGES = 5
+
+    /* ---- 全局时间预算闸门: 一键同步是同步接口, 必须在请求预算内完成并如实返回 ----
+     * 历史: 逐页任务通道等待 (20s/页) × 5 页 + 逐单详情精修 (200 单) 无总闸,
+     * 代理回报链路抖动时整请求挂起近 2 分钟。现全部环节受 deadline 约束,
+     * 到点如实返回已拉到的部分 + 显性错误, 绝不再无限等。 */
+    const REFRESH_BUDGET_MS = 55_000
+    const deadline = Date.now() + REFRESH_BUDGET_MS
+    const remainMs = () => deadline - Date.now()
 
     /* ---- 第一步分流: 独立代理模式 → ① 透传网关优先 (引擎登记了公网 IP:端口, CF 直连代理
      *      转发 mtop, 秒级直返) → ② 任务通道兜底 (网关未登记/不可达); 内置引擎 → 本机直连 ---- */
@@ -44,6 +54,10 @@ export default defineEventHandler(
 
     if (proxyMode || gwMode) {
       for (const acct of accounts) {
+        if (remainMs() < 5_000) {
+          listErrors.push(`整体时间预算耗尽 (${REFRESH_BUDGET_MS / 1000}s), 未拉取的账号已跳过: ${acct.id}`)
+          break
+        }
         // 会话身份校验: Cookie unb 与账号 id 不符 = 串号 (Cookie 属于其他账号会话),
         // 拉回来的将是他人店铺订单 — 显性报错拦截, 绝不入库
         const mismatch = cookieIdentityMismatch(String(acct.id), String(acct.value || ''))
@@ -58,6 +72,10 @@ export default defineEventHandler(
             let cookieStr = String(acct.value || '')
             let page = 1
             while (page <= MAX_LIST_PAGES) {
+              if (remainMs() < 4_000) {
+                listErrors.push(`${acct.id}: 整体时间预算耗尽, 第 ${page} 页起未拉取`)
+                break
+              }
               const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
               if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
                 cookieStr = pg.finalCookieStr
@@ -71,6 +89,8 @@ export default defineEventHandler(
                 const r = await upsertSoldOrders(db, String(acct.id), pg.items)
                 listInserted += r.inserted
                 listUpdated += r.updated
+                listBlocked += r.blocked
+                listSkippedDeleted += r.skippedDeleted
               }
               if (!pg.nextPage || !pg.items.length) break
               page++
@@ -83,17 +103,27 @@ export default defineEventHandler(
         }
         // ② 任务通道兜底 (代理主动外呼后台, 无需公网入站; 网关未登记或不可达时唯一通路)
         if (!done && proxyMode) {
-          const r = await fetchOrdersViaProxy(db, String(acct.id), { queryCode: 'ALL', pages: MAX_LIST_PAGES, timeoutMs: 20_000 })
+          const r = await fetchOrdersViaProxy(db, String(acct.id), {
+            queryCode: 'ALL',
+            pages: MAX_LIST_PAGES,
+            timeoutMs: Math.min(20_000, Math.max(3_000, remainMs())),
+          })
           if (r.errors.length) listErrors.push(`${acct.id}: ${r.errors.join('; ').slice(0, 200)}`)
           if (r.items.length) {
             const ur = await upsertSoldOrders(db, String(acct.id), r.items)
             listInserted += ur.inserted
             listUpdated += ur.updated
+            listBlocked += ur.blocked
+            listSkippedDeleted += ur.skippedDeleted
           }
         }
       }
     } else {
       for (const acct of accounts) {
+        if (remainMs() < 4_000) {
+          listErrors.push(`整体时间预算耗尽 (${REFRESH_BUDGET_MS / 1000}s), 未拉取的账号已跳过: ${acct.id}`)
+          break
+        }
         // 会话身份校验 (同上): 防串号 Cookie 静默拉入他人订单
         const mismatch = cookieIdentityMismatch(String(acct.id), String(acct.value || ''))
         if (mismatch) {
@@ -103,6 +133,10 @@ export default defineEventHandler(
         let cookieStr = String(acct.value || '')
         let page = 1
         while (page <= MAX_LIST_PAGES) {
+          if (remainMs() < 4_000) {
+            listErrors.push(`${acct.id}: 整体时间预算耗尽, 第 ${page} 页起未拉取`)
+            break
+          }
           const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
           if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
             cookieStr = pg.finalCookieStr
@@ -116,6 +150,8 @@ export default defineEventHandler(
             const r = await upsertSoldOrders(db, String(acct.id), pg.items)
             listInserted += r.inserted
             listUpdated += r.updated
+            listBlocked += r.blocked
+            listSkippedDeleted += r.skippedDeleted
           }
           if (!pg.nextPage || !pg.items.length) break
           page++
@@ -124,10 +160,20 @@ export default defineEventHandler(
       }
     }
 
+    if (listBlocked > 0) {
+      listErrors.push(`账号隔离: 拦截 ${listBlocked} 条非本账号订单 (响应中卖家身份与账号 uid 不符, 未入库)`)
+    }
+    if (listSkippedDeleted > 0) {
+      listErrors.push(`已删除屏蔽: 跳过 ${listSkippedDeleted} 条曾手动删除的订单 (不再拉回)`)
+    }
+
     /* ---- 第二步: 非终态订单详情精修 (规格/城市等列表接口不含的字段) ----
      * 透传网关已登记 (gwMode) 时照常执行: 详情接口经网关转发可达; 仅"代理模式且未登记
      * 网关"跳过 (详情接口 CF 不可直连, 逐单任务等待在请求预算内不可能完成) ---- */
-    const refineEnabled = !proxyMode || gwMode
+    const refineEnabled = (!proxyMode || gwMode) && remainMs() > 15_000
+    if (!refineEnabled && (proxyMode || gwMode) && remainMs() <= 15_000) {
+      listErrors.push('列表同步耗尽时间预算, 详情精修本轮跳过')
+    }
     const rows = refineEnabled
       ? await db.all<any>(
           `SELECT o.order_id, o.cookie_id, o.order_status FROM orders o
@@ -147,6 +193,10 @@ export default defineEventHandler(
     let failed = 0
 
     for (const t of targets) {
+      if (remainMs() < 3_000) {
+        results.push({ order_id: '(后续)', changed: false, error: '整体时间预算耗尽, 剩余订单详情精修跳过 (列表数据已入库)' })
+        break
+      }
       const orderId = String(t.order_id)
       const cookieId = String(t.cookie_id || '')
       try {
@@ -213,15 +263,18 @@ export default defineEventHandler(
         no_change: noChange,
         failed,
         results,
+        elapsed_ms: REFRESH_BUDGET_MS - remainMs(),
         list_sync: {
           inserted: listInserted,
           updated: listUpdated,
+          blocked: listBlocked,
+          skipped_deleted: listSkippedDeleted,
           accounts: accounts.length,
           errors: listErrors,
           mode: gwMode ? 'gateway' : proxyMode ? 'proxy' : 'direct',
           detail_refine: refineEnabled
             ? 'executed'
-            : 'skipped (代理模式未登记网关地址: 详情接口 CF 不可直连, 列表字段已含核心数据)',
+            : 'skipped (代理模式未登记网关地址 / 时间预算耗尽: 详情接口不可达或预算不足, 列表字段已含核心数据)',
         },
       },
       listInserted || listUpdated ? `订单列表已同步: 新拉取 ${listInserted} 单, 更新 ${listUpdated} 单` : '订单列表已同步',

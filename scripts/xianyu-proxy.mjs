@@ -911,30 +911,73 @@ function log(msg) {
 }
 
 
+/** 请求标签: 从 URL 提取 "POST /api/engine/events" 样式短标签, 供日志一眼定位是哪个请求。 */
+function apiLabel(url) {
+  try {
+    const u = new URL(url)
+    return `${u.pathname.split('/').filter(Boolean).slice(-2).join('/')}`
+  } catch {
+    return String(url).slice(0, 60)
+  }
+}
+
+/** 把底层 fetch 错误翻译成人话: 超时/断连/限速/鉴权 一眼可辨, 并附请求标签与耗时。 */
+function describeApiError(e, label, startedAt, timeoutMs) {
+  const elapsed = Date.now() - startedAt
+  const raw = String(e?.message || e)
+  const cause = /aborted due to timeout/i.test(raw)
+    ? `超时 (${Math.round(timeoutMs / 1000)}s 无响应, 实际等待 ${(elapsed / 1000).toFixed(1)}s)`
+    : /ECONNRESET|socket hang up/i.test(raw)
+      ? '连接被对端重置 (ECONNRESET)'
+      : /ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(raw)
+        ? 'DNS 解析失败 (域名解析不通)'
+        : /ECONNREFUSED/i.test(raw)
+          ? '连接被拒绝 (端口未监听)'
+          : /CERT|SSL|TLS/i.test(raw)
+            ? 'TLS 证书错误'
+            : raw.slice(0, 120)
+  return `${label}: ${cause}`
+}
+
 async function apiCall(url, body, timeoutMs = 30_000) {
-  const res = await fetch(url, {
-    method: body ? 'POST' : 'GET',
-    headers: {
-      Authorization: `Bearer ${ENGINE_TOKEN}`,
-      'Content-Type': 'application/json',
-      // 后台接口必须带浏览器 UA: 空 UA 的数据中心请求会被 CF 边缘 bot 防护拖入慢路径
-      // (实测无 UA 的 POST 20s+ 无响应, Chrome UA 2~6s 返回) — 上报超时直接原因之一
-      'User-Agent': resolveChromeUA().ua,
-      // 声明拉取能力: 后台对聊天/交易事件快速 ACK (占位后挂后台决策), 本代理按 event_id 轮询回收
-      // 决策不再阻塞上报响应, 消灭「AI 慢 → 上报超时 → 回队重试 → 重复决策」风暴
-      'x-engine-pull': '1',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs),
-  })
+  const label = `${body ? 'POST' : 'GET'} ${apiLabel(url)}`
+  const startedAt = Date.now()
+  let res
+  try {
+    res = await fetch(url, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        Authorization: `Bearer ${ENGINE_TOKEN}`,
+        'Content-Type': 'application/json',
+        // 后台接口必须带浏览器 UA: 空 UA 的数据中心请求会被 CF 边缘 bot 防护拖入慢路径
+        // (实测无 UA 的 POST 20s+ 无响应, Chrome UA 2~6s 返回) — 上报超时直接原因之一
+        'User-Agent': resolveChromeUA().ua,
+        // 声明拉取能力: 后台对聊天/交易事件快速 ACK (占位后挂后台决策), 本代理按 event_id 轮询回收
+        // 决策不再阻塞上报响应, 消灭「AI 慢 → 上报超时 → 回队重试 → 重复决策」风暴
+        'x-engine-pull': '1',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (e) {
+    // 网络层失败 (超时/DNS/断连): 带上请求标签与耗时重抛, 调用方日志直接可读
+    throw Object.assign(new Error(describeApiError(e, label, startedAt, timeoutMs)), { label })
+  }
+  const elapsed = Date.now() - startedAt
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('retry-after') || 5) || 5
-    throw Object.assign(new Error(`后台限速, ${retryAfter}s 后重试`), { rateLimited: retryAfter })
+    throw Object.assign(new Error(`${label}: 后台限速 429, ${retryAfter}s 后重试`), { rateLimited: retryAfter, label })
   }
   if (res.status === 401 || res.status === 403) {
-    throw Object.assign(new Error(`鉴权失败 (${res.status}): 令牌无效/引擎被停用, 请核对 XY_ENGINE_TOKEN`), { fatal: true })
+    throw Object.assign(new Error(`${label}: 鉴权失败 (${res.status}): 令牌无效/引擎被停用, 请核对 XY_ENGINE_TOKEN`), { fatal: true, label })
   }
-  if (!res.ok) throw new Error(`后台响应异常 ${res.status}`)
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    throw Object.assign(
+      new Error(`${label}: 后台响应异常 HTTP ${res.status} (${elapsed}ms)${errText ? ` — ${errText.slice(0, 160)}` : ''}`),
+      { label },
+    )
+  }
   const json = await res.json().catch(() => ({}))
   return json?.data ?? json ?? {}
 }
@@ -965,6 +1008,10 @@ async function flushReports() {
   }
   lastFlushAt = now
   const events = reportQueue.splice(0, 100)
+  // 事件批次画像: 条数 / 类型分布 / 首尾 event_id, 失败日志一眼可定位是哪批什么事件
+  const typeCount = {}
+  for (const ev of events) typeCount[String(ev?.type || '?')] = (typeCount[String(ev?.type || '?')] || 0) + 1
+  const eventSummary = `${events.length}条 [${Object.entries(typeCount).map(([t, n]) => `${t}×${n}`).join(' ')}]`
   const status = {
     accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state, detail: s.detail || '' })),
   }
@@ -984,10 +1031,10 @@ async function flushReports() {
     }
     reportQueue.unshift(...events)
     if (e?.rateLimited) {
-      log(`上报被限速: ${e.message}`)
+      log(`上报失败: POST events (${eventSummary}, 队列回队后 ${reportQueue.length} 条) — ${e.message}`)
       await sleep(Math.min(e.rateLimited * 1000, 30_000))
     } else {
-      log(`上报失败: ${e?.message} — 事件已回队重试`)
+      log(`上报失败: POST events 批次 ${eventSummary} (队列回队后 ${reportQueue.length} 条) — ${e?.message} — 已回队等待重试`)
       await sleep(3000)
     }
     scheduleFlush(500)
@@ -1152,14 +1199,21 @@ async function stopClient(id) {
  * (实测同域名静态与接口均 ~半数请求超时, 而 TCP/边缘 trace 全通), 单次失败不
  * 代表不可达 —— 3s 后立即换新连接重试一次, 把高丢包链路下的轮空率压到最低。
  * 致命(鉴权)与限速错误不重试, 原样上抛。配置轮询/事件上报/决策拉取共用。
+ * 每次失败都打详细日志: 哪个请求 / 第几次尝试 / 失败原因 (超时带无响应时长)。
  */
 async function apiCallWithRetry(url, body, timeoutMs = 30_000) {
   try {
     return await apiCall(url, body, timeoutMs)
   } catch (e) {
     if (e?.fatal || e?.rateLimited) throw e
+    log(`后台请求失败 (第 1 次尝试): ${e?.message} — 3s 后换新连接重试`)
     await sleep(3000)
-    return await apiCall(url, body, timeoutMs)
+    try {
+      return await apiCall(url, body, timeoutMs)
+    } catch (e2) {
+      log(`后台请求失败 (第 2 次尝试): ${e2?.message} — 放弃本轮`)
+      throw e2
+    }
   }
 }
 
@@ -1222,10 +1276,10 @@ async function pollConfigOnce() {
       process.exit(1)
     }
     if (e?.rateLimited) {
-      log(`配置拉取被限速: ${e.message}`)
+      log(`配置拉取失败: GET engine/config — ${e.message}`)
       return
     }
-    log(`配置拉取失败: ${e?.message} — 下轮重试`)
+    log(`配置拉取失败: GET engine/config (连续第 ${configFailStreak + 1} 次) — ${e?.message} — 下轮重试`)
     // 连续失败自动网络自检(第 2 次触发, 此后每 10 次复查): 定位 DNS/TCP/SNI 过滤/整机断路
     configFailStreak += 1
     if (configFailStreak === 2 || configFailStreak % 10 === 0) await diagnoseNetwork()
@@ -1311,7 +1365,7 @@ async function configLoop() {
  * 执行 http_fetch 任务: 逐个转发后台构造好的 HTTP 请求 (白名单限闲鱼/淘系域名),
  * 回报原始响应 { status, text, set_cookie }。不解析不重试不重签 — 业务逻辑全在后台。
  */
-async function executeHttpFetchTask(payload) {
+async function executeHttpFetchTask(payload, taskId = 0) {
   const requests = Array.isArray(payload?.requests) ? payload.requests.slice(0, 5) : []
   if (!requests.length) return { ok: false, data: { error: '任务缺少 requests 请求列表' } }
   const responses = []
@@ -1330,13 +1384,20 @@ async function executeHttpFetchTask(payload) {
     const method = String(req?.method || 'GET').toUpperCase()
     const body = method === 'GET' || method === 'HEAD' ? undefined : String(req?.body || '')
     const timeoutMs = Math.min(Math.max(Math.round(Number(req?.timeout_ms) || 20_000), 3_000), GATEWAY_TIMEOUT_MS)
+    const startedAt = Date.now()
     try {
       const upstream = await fetch(target, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
       const text = (await upstream.text()).slice(0, 4 * 1024 * 1024)
       responses.push({ status: upstream.status, text, set_cookie: upstream.headers.getSetCookie ? upstream.headers.getSetCookie() : [] })
-      log(`透传任务: ${method} ${target.host}${target.pathname.slice(0, 64)} → ${upstream.status}`)
+      const ms = Date.now() - startedAt
+      const kb = (text.length / 1024).toFixed(1)
+      log(`透传任务${taskId ? ` #${taskId}` : ''}: ${method} ${target.host}${target.pathname.slice(0, 64)} → ${upstream.status} (${ms}ms, ${kb}KB)`)
     } catch (e) {
-      return { ok: false, data: { error: `透传请求失败: ${String(e?.message || e).slice(0, 160)}`, responses } }
+      const ms = Date.now() - startedAt
+      const raw = String(e?.message || e)
+      const cause = /aborted due to timeout/i.test(raw) ? `超时 (${Math.round(timeoutMs / 1000)}s 无响应)` : raw.slice(0, 140)
+      log(`透传任务${taskId ? ` #${taskId}` : ''}: ${method} ${target.host}${target.pathname.slice(0, 64)} 失败 (${ms}ms) — ${cause}`)
+      return { ok: false, data: { error: `透传请求失败: ${cause}`, responses } }
     }
     if (requests.length > 1) await sleep(400)
   }
@@ -1368,7 +1429,8 @@ async function pollTasksOnce() {
     resp = await apiCallWithRetry(TASKS_URL, undefined, 15_000)
   } catch (e) {
     if (e?.fatal) throw e
-    return // 网络抖动: 下轮重试 (任务过期由后台守护, 无需本地补路)
+    log(`任务领取失败: GET engine/tasks — ${e?.message} — 下轮重试 (已领取任务不受影响, 任务过期由后台守护)`)
+    return
   }
   const tasks = Array.isArray(resp?.tasks) ? resp.tasks : []
   for (const task of tasks) {
@@ -1379,20 +1441,34 @@ async function pollTasksOnce() {
     let result
     try {
       result = task?.type === 'http_fetch'
-        ? await executeHttpFetchTask(payload)
+        ? await executeHttpFetchTask(payload, taskId)
         : task?.type === 'send_message'
           ? await executeSendMessageTask(payload)
           : { ok: false, data: { errors: [`未知任务类型: ${String(task?.type).slice(0, 32)}`] } }
     } catch (e) {
       result = { ok: false, data: { errors: [String(e?.message || e).slice(0, 200)] } }
     }
-    try {
-      await apiCallWithRetry(EVENTS_URL, {
-        events: [{ type: 'task_result', task_id: taskId, ok: !!result.ok, data: result.data || {} }],
-      }, 30_000)
-    } catch (e) {
-      if (e?.fatal) throw e
-      log(`任务 ${taskId} 结果回报失败 (后台轮询将判过期): ${e?.message}`)
+    // 回报带重试 (3 次 × 15s): 任务结果是订单同步/手动发送的同步等待依据,
+    // 回报丢失 = 后台等满超时才拿到空结果 = 一键同步「挂起感」的直接来源之一
+    let reported = false
+    let lastErr = ''
+    for (let attempt = 1; attempt <= 3 && !reported && !stopped; attempt++) {
+      try {
+        await apiCall(EVENTS_URL, {
+          events: [{ type: 'task_result', task_id: taskId, ok: !!result.ok, data: result.data || {} }],
+        }, 15_000)
+        reported = true
+      } catch (e) {
+        lastErr = e?.message
+        if (e?.fatal) throw e
+        if (attempt < 3) {
+          log(`任务 #${taskId} (${task?.type}) 结果回报失败 (第 ${attempt}/3 次): ${lastErr} — 2s 后重试`)
+          await sleep(2000)
+        }
+      }
+    }
+    if (!reported) {
+      log(`任务 #${taskId} (${task?.type}) 结果回报彻底失败 (3 次均失败): ${lastErr} — 后台轮询将判过期, 请检查到后台的链路`)
     }
   }
 }
