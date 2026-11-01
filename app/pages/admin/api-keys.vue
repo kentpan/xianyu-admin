@@ -150,7 +150,7 @@ Content-Type: application/json
         <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">验证成功 → 200 { "success": true, "msg": "验证成功", "data": { "code": "...", "card_name": "...", "order_id": "...", "item_id": "...", "buyer_id": "...", "used_at": "..." } }
 验证失败 → 200 { "success": false, "msg": "验证失败: 卡密不存在/已被使用/格式错误", "data": {} }
 鉴权/停用/过期/限速 → 401/403/429 { "success": false, "msg": "原因", "data": {} }</pre>
-        <p>验证成功后卡密立即失效（可在「卡券管理 → 卡密生成记录」查看全部核销状态）；每个 Key 独立限速（默认 30 次/60 秒，超限 429）+ 可配置有效期（到期后 403）。</p>
+        <p>验证成功后卡密立即失效（可在「卡券管理 → 卡密生成/消费记录」查看全部核销状态与消费留痕）；每个 Key 独立限速（默认 30 次/60 秒，超限 429）+ 可配置有效期（到期后 403）。</p>
       </div>
     </div>
 

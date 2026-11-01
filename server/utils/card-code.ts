@@ -47,6 +47,7 @@ export function renderCodeTemplate(template: string | null | undefined, code: st
 
 /**
  * 卡密生成落库 (时间/卡券/账号/商品/订单/买家, status=unused 待核销)。
+ * source: ''=真实发货, 'test'=卡密发货测试 (测试卡密同样可被消费 API 核销, 记录带测试标签)。
  * 优先落 preferredCode (extract 阶段预生成并已渲染进文案); 唯一冲突时重新生成重试,
  * 返回最终生效的卡密 (与文案一致), 失败不阻断发货。
  */
@@ -55,13 +56,14 @@ export async function persistCardCode(
   card: CardCodeConfig & { id: number; name: string },
   ctx: { cookieId?: string; itemId?: string; orderId?: string; buyerId?: string },
   preferredCode?: string,
+  source = '',
 ): Promise<string | null> {
   let code = String(preferredCode || '') || generateCardCode(card)
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       await db.run(
-        `INSERT INTO card_code_logs (card_id, card_name, code, cookie_id, item_id, order_id, buyer_id, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'unused')`,
+        `INSERT INTO card_code_logs (card_id, card_name, code, cookie_id, item_id, order_id, buyer_id, status, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'unused', ?)`,
         [
           card.id || 0,
           String(card.name || '').slice(0, 128),
@@ -70,6 +72,7 @@ export async function persistCardCode(
           String(ctx.itemId || ''),
           String(ctx.orderId || ''),
           String(ctx.buyerId || ''),
+          source === 'test' ? 'test' : '',
         ],
       )
       return code
@@ -98,6 +101,7 @@ export interface ConsumeOutcome {
     buyer_id: string
     status: string
     used_at: string | null
+    source?: string
   }
 }
 
@@ -128,7 +132,7 @@ export async function consumeCardCode(
     return {
       valid: false,
       reason: `卡密已被使用 (使用时间 ${row.used_at || '未知'})`,
-      row: { id: row.id, code, card_name: row.card_name, order_id: row.order_id, item_id: row.item_id, buyer_id: row.buyer_id, status: row.status, used_at: row.used_at },
+      row: { id: row.id, code, card_name: row.card_name, order_id: row.order_id, item_id: row.item_id, buyer_id: row.buyer_id, status: row.status, used_at: row.used_at, source: row.source || '' },
     }
   }
   const usedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
@@ -144,6 +148,51 @@ export async function consumeCardCode(
   return {
     valid: true,
     reason: '验证通过',
-    row: { id: row.id, code, card_name: row.card_name, order_id: row.order_id, item_id: row.item_id, buyer_id: row.buyer_id, status: 'used', used_at: usedAt },
+    row: { id: row.id, code, card_name: row.card_name, order_id: row.order_id, item_id: row.item_id, buyer_id: row.buyer_id, status: 'used', used_at: usedAt, source: row.source || '' },
+  }
+}
+
+export interface CardConsumeEntry {
+  codeId?: number
+  code: string
+  cardName?: string
+  orderId?: string
+  itemId?: string
+  buyerId?: string
+  apiKeyId?: number
+  apiKeyName?: string
+  ip?: string
+  result: 'success' | 'failed'
+  message?: string
+  /** 来源标记: 从被核销卡密的 card_code_logs.source 带出 ('test'=测试卡密核销) */
+  source?: string
+}
+
+/**
+ * 消费留痕: 每次外部核销请求 (成功/失败) 落 card_consume_logs 一条。
+ * 与核销主流程解耦 — 留痕失败只打日志, 不阻塞核销响应 (核销原子性由 consumeCardCode 保证)。
+ */
+export async function recordCardConsume(db: DatabaseAdapter, entry: CardConsumeEntry): Promise<void> {
+  try {
+    await db.run(
+      `INSERT INTO card_consume_logs (code_id, code, card_name, order_id, item_id, buyer_id, api_key_id, api_key_name, ip, result, message, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        entry.codeId || 0,
+        String(entry.code || '').slice(0, 64),
+        String(entry.cardName || '').slice(0, 128),
+        String(entry.orderId || ''),
+        String(entry.itemId || ''),
+        String(entry.buyerId || ''),
+        entry.apiKeyId || 0,
+        String(entry.apiKeyName || '').slice(0, 128),
+        String(entry.ip || '').slice(0, 64),
+        entry.result === 'success' ? 'success' : 'failed',
+        String(entry.message || '').slice(0, 240),
+        entry.source === 'test' ? 'test' : '',
+      ],
+    )
+  } catch (e: any) {
+    console.error('[card-code] consume log failed:', String(e?.message || e))
   }
 }

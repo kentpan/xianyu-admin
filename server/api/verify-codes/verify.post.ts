@@ -1,3 +1,5 @@
+import { consumeCardCode, recordCardConsume } from '../../utils/card-code'
+
 /**
  * POST /api/verify-codes/verify — 卡密核销 (开放接口, 业务方 Bearer 鉴权)。
  *
@@ -9,6 +11,9 @@
  *   { "success": true,  "msg": "验证成功",       "data": { 卡密/订单/商品/买家 回执 } }
  *   { "success": false, "msg": "验证失败: 原因",  "data": {} }
  *   401/403/429        → { "success": false, "msg": "鉴权/停用/过期/限速原因", "data": {} }
+ *
+ * 消费留痕: 每次请求 (成功/失败) 落 card_consume_logs 一条, 在「卡券管理 → 卡密生成/消费记录」可查。
+ * 来源标记: 被核销卡密若为「卡密发货测试」生成 (source='test'), 本次消费记录同样带「测试」标签。
  */
 export default defineEventHandler(async (event) => {
   let identity: Awaited<ReturnType<typeof requireApiKey>>
@@ -26,6 +31,20 @@ export default defineEventHandler(async (event) => {
 
     const db = await getDb()
     const outcome = await consumeCardCode(db, rawCode, identity.id, ip)
+    await recordCardConsume(db, {
+      codeId: outcome.row?.id,
+      code: rawCode.trim(),
+      cardName: outcome.row?.card_name,
+      orderId: outcome.row?.order_id,
+      itemId: outcome.row?.item_id,
+      buyerId: outcome.row?.buyer_id,
+      apiKeyId: identity.id,
+      apiKeyName: identity.name,
+      ip,
+      result: outcome.valid ? 'success' : 'failed',
+      message: outcome.reason.slice(0, 240),
+      source: outcome.row?.source,
+    })
     await logApiKeyCall(identity.id, 'verify-codes/verify', outcome.valid, 200, outcome.reason.slice(0, 200), event)
     setResponseStatus(event, 200)
 
@@ -42,6 +61,7 @@ export default defineEventHandler(async (event) => {
           status: 'used',
           used_at: outcome.row?.used_at || null,
           verified_by: identity.name,
+          source: outcome.row?.source || '',
         },
       }
     }
@@ -57,6 +77,7 @@ export default defineEventHandler(async (event) => {
             buyer_id: outcome.row.buyer_id,
             status: outcome.row.status,
             used_at: outcome.row.used_at,
+            source: outcome.row.source || '',
           }
         : {},
     }

@@ -116,14 +116,32 @@
       </template>
     </div>
 
-    <!-- 卡密生成记录 -->
+    <!-- 卡密生成/消费记录 -->
     <div class="card overflow-hidden">
       <div class="px-4 py-3 border-b border-slate-100 dark:border-slate-700 flex items-center justify-between gap-3 flex-wrap">
         <h3 class="font-semibold text-slate-900 dark:text-white flex items-center gap-2">
-          <Icon name="key" class="text-brand-500" /> 卡密生成记录
-          <span class="badge bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-300">共 {{ codeLogTotal }} 条</span>
+          <Icon name="key" class="text-brand-500" /> 卡密生成/消费记录
+          <span class="badge bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-300">共 {{ codeLogTab === 'gen' ? codeLogTotal : consumeLogTotal }} 条</span>
         </h3>
         <div class="flex items-center gap-2 flex-wrap">
+          <div class="flex rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
+            <button
+              class="px-3 py-1.5 text-sm font-medium transition-colors"
+              :class="codeLogTab === 'gen' ? 'bg-brand-50 text-brand-700 dark:bg-brand-900/20 dark:text-brand-300' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800'"
+              @click="switchCodeLogTab('gen')"
+            >生成记录</button>
+            <button
+              class="px-3 py-1.5 text-sm font-medium transition-colors border-l border-slate-200 dark:border-slate-700"
+              :class="codeLogTab === 'consume' ? 'bg-brand-50 text-brand-700 dark:bg-brand-900/20 dark:text-brand-300' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800'"
+              @click="switchCodeLogTab('consume')"
+            >消费记录</button>
+          </div>
+          <button class="btn-secondary !px-2.5 !py-1.5" title="测试生成卡密 (与真实发货一致, 不真实发货)" @click="openDeliverTestDoc">
+            <Icon name="sparkles" /> 卡密发货测试
+          </button>
+          <button class="btn-secondary !px-2.5 !py-1.5" title="外部消费 API 调用流程说明" @click="consumeDocOpen = true">
+            <Icon name="info" /> 消费流程
+          </button>
           <div class="relative">
             <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"><Icon name="search" /></span>
             <input v-model="codeLogKeyword" class="input pl-9 !w-64" placeholder="卡密 / 订单号 / 买家 / 商品 / 卡券" @keyup.enter="resetCodeLogsAndReload" />
@@ -137,6 +155,8 @@
         <Icon name="refresh" class="animate-spin mr-2" /> 加载中...
       </div>
       <template v-else>
+        <!-- 生成记录 -->
+        <template v-if="codeLogTab === 'gen'">
         <div class="table-wrap max-h-96 overflow-y-auto">
           <table class="table">
             <thead>
@@ -158,6 +178,7 @@
                 <td class="text-slate-500 whitespace-nowrap">{{ formatTime(l.created_at) }}</td>
                 <td>
                   <span class="font-mono font-semibold tracking-wider text-slate-800 dark:text-white">{{ l.code }}</span>
+                  <span v-if="l.source === 'test'" class="badge ml-1 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">测试</span>
                 </td>
                 <td>
                   <span class="badge" :class="l.status === 'used' ? 'bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-300' : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'">
@@ -182,19 +203,174 @@
           </table>
         </div>
         <EmptyState v-if="!codeLogs.length" message="暂无卡密生成记录；卡密型卡券发货时自动生成并留档" icon="key" />
-        <div v-if="codeLogTotal > codeLogPageSize" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-slate-700">
-          <p class="text-slate-500">共 {{ codeLogTotal }} 条，第 {{ codeLogPage }} / {{ codeLogTotalPages }} 页</p>
+        </template>
+        <!-- 消费记录 -->
+        <template v-else>
+        <div class="table-wrap max-h-96 overflow-y-auto">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>消费时间</th>
+                <th>卡密</th>
+                <th>结果</th>
+                <th>说明</th>
+                <th>卡券</th>
+                <th>订单号</th>
+                <th>买家</th>
+                <th>消费 Key</th>
+                <th>IP</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="l in consumeLogs" :key="l.id">
+                <td class="text-slate-500 whitespace-nowrap">{{ formatTime(l.created_at) }}</td>
+                <td>
+                  <span class="font-mono font-semibold tracking-wider text-slate-800 dark:text-white">{{ l.code }}</span>
+                  <span v-if="l.source === 'test'" class="badge ml-1 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">测试</span>
+                </td>
+                <td>
+                  <span class="badge" :class="l.result === 'success' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400'">
+                    {{ l.result === 'success' ? '验证成功' : '验证失败' }}
+                  </span>
+                </td>
+                <td class="text-slate-500 max-w-[220px]"><p class="truncate" :title="l.message">{{ l.message || '—' }}</p></td>
+                <td class="text-slate-500">{{ l.card_name || '—' }}</td>
+                <td class="font-mono text-slate-500 max-w-[160px]"><p class="truncate" :title="l.order_id">{{ l.order_id || '—' }}</p></td>
+                <td class="font-mono text-slate-500">{{ l.buyer_id || '—' }}</td>
+                <td class="text-slate-500 max-w-[140px]"><p class="truncate" :title="l.api_key_name">{{ l.api_key_name || '—' }}</p></td>
+                <td class="font-mono text-slate-500">{{ l.ip || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <EmptyState v-if="!consumeLogs.length" message="暂无卡密消费记录；业务方携 API Key 调用核销接口后自动留痕（成功/失败均记录），点右上角「消费流程」查看调用方式" icon="key" />
+        </template>
+        <div v-if="codeLogActiveTotal > codeLogPageSize" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-slate-700">
+          <p class="text-slate-500">共 {{ codeLogActiveTotal }} 条，第 {{ codeLogActivePage }} / {{ codeLogActiveTotalPages }} 页</p>
           <div class="flex items-center gap-1">
-            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="codeLogPage <= 1" @click="goCodeLogPage(codeLogPage - 1)">
+            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="codeLogActivePage <= 1" @click="goCodeLogPage(codeLogActivePage - 1)">
               <Icon name="chevronRight" class="rotate-180" />
             </button>
-            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="codeLogPage >= codeLogTotalPages" @click="goCodeLogPage(codeLogPage + 1)">
+            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="codeLogActivePage >= codeLogActiveTotalPages" @click="goCodeLogPage(codeLogActivePage + 1)">
               <Icon name="chevronRight" />
             </button>
           </div>
         </div>
       </template>
     </div>
+
+    <!-- 卡密发货测试/流程说明弹窗 (含交互式测试器) -->
+    <ModalBase v-model="deliverTestDocOpen" title="卡密发货测试 · 测试生成流程" size="lg">
+      <div class="space-y-4">
+        <div>
+          <label class="label">测试流程（与真实发货完全一致, 但不会真实发货）</label>
+          <ol class="list-decimal list-inside space-y-1.5 text-slate-600 dark:text-slate-300">
+            <li>选择一张卡密型（生成型）卡券 → 调用下方测试接口</li>
+            <li>接口走与真实发货完全相同的生成链路：按卡券配置的长度/英文/数字/大小写随机生成 → 文案模板 {code} 渲染 → 启用变量替换（模拟上下文 = 发货规则绑定商品的真实数据）</li>
+            <li>返回模拟生成的卡密与发货文案，可直接预览买家将收到的加群验证码样式；卡密同时落库「生成记录」并带<span class="font-medium text-amber-600 dark:text-amber-400">「测试」标签</span>（订单号 TEST- 前缀，状态=未核销）</li>
+            <li>测试卡密可用「消费 API」<span class="font-mono">/api/verify-codes/verify</span> 真实核销验证 — 与正常消费完全同一链路，消费记录同样带「测试」标签，成功/失败均有详细日志（原因/消费方 Key/IP/时间）</li>
+            <li>不会真实发货的部分：不发送买家消息 / 不写发货记录 / 不改订单状态 / 不加规则发货计数；测试卡密与真实卡密同库唯一，核销后同样失效，可放心反复测试</li>
+          </ol>
+        </div>
+        <div>
+          <label class="label">请求方式与参数（登录可用）</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">POST /api/cards/deliver-test
+Content-Type: application/json
+
+{ "card_id": 1, "count": 1 }        ← 卡券ID + 生成份数 (1-10, 默认 1)</pre>
+        </div>
+        <div>
+          <label class="label">响应示例</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">200 { "success": true, "data": {
+  "card_id": 1, "card_name": "会员季度卡", "count": 1,
+  "order_id": "TEST-1769999999999", "persisted_count": 1,
+  "items": [ { "code": "aB3x9K2m", "text": "你的验证码为: aB3x9K2m, 请复制后加群验证!", "preview": "[卡密] aB3x9K2m", "persisted": true } ],
+  "config": { "length": 8, "letters": true, "digits": true, "case": "mixed", "template": "..." },
+  "note": "测试生成: ... 已入库 (带「测试」标签), 可用消费 API 真实核销验证" } }</pre>
+          <p class="mt-1.5 text-slate-500 dark:text-slate-400">拿到 <span class="font-mono">items[].code</span> 后即可按右侧「消费流程」用 API Key 调核销接口做全链路验证；在「生成记录/消费记录」中按订单号 <span class="font-mono">TEST-...</span> 或「测试」标签即可筛出本批测试数据。</p>
+        </div>
+        <div>
+          <label class="label">curl 调用示例</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">curl -X POST 'https://你的域名/api/cards/deliver-test' \
+  -H 'Authorization: Bearer &lt;登录令牌&gt;' \
+  -H 'Content-Type: application/json' \
+  -d '{"card_id":1,"count":1}'</pre>
+        </div>
+        <div class="border-t border-slate-100 dark:border-slate-700 pt-4">
+          <label class="label">在线测试（选卡密型卡券，立即生成预览）</label>
+          <div class="flex items-center gap-2 flex-wrap">
+            <select v-model="deliverTestCardId" class="input !w-auto min-w-[200px]">
+              <option :value="0" disabled>选择卡密型卡券</option>
+              <option v-for="c in codeCards" :key="c.id" :value="c.id">{{ c.name }}</option>
+            </select>
+            <input v-model.number="deliverTestCount" type="number" min="1" max="10" class="input !w-20" title="生成份数 (1-10)" />
+            <button class="btn-primary !px-3 !py-1.5" :disabled="deliverTestRunning || !deliverTestCardId" @click="runDeliverTest">
+              <Icon name="sparkles" :class="deliverTestRunning ? 'animate-spin' : ''" /> {{ deliverTestRunning ? '生成中...' : '生成测试卡密' }}
+            </button>
+          </div>
+          <p v-if="codeCards.length === 0" class="mt-2 text-slate-400">还没有卡密型卡券，先新增一个「卡密」类型卡券</p>
+          <div v-if="deliverTestResult" class="mt-3 space-y-2">
+            <div class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3">
+              <p class="font-medium text-slate-700 dark:text-slate-200">卡券「{{ deliverTestResult.card_name }}」× {{ deliverTestResult.count }} 份</p>
+              <p class="mt-0.5 text-slate-500 dark:text-slate-400">批次订单号: <span class="font-mono">{{ deliverTestResult.order_id }}</span>（已入库 {{ deliverTestResult.persisted_count }} 份，可在「生成记录」中搜索）</p>
+              <p class="mt-0.5 text-slate-400">{{ deliverTestResult.note }}</p>
+            </div>
+            <div v-for="(it, i) in deliverTestResult.items" :key="i" class="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="font-mono font-semibold tracking-wider text-slate-800 dark:text-white">{{ it.code }}</span>
+                <button class="btn-ghost !px-2 !py-1" title="复制卡密" @click="copyCodeLog(it.code)"><Icon name="copy" /></button>
+                <span class="badge bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-300">第 {{ i + 1 }} 份</span>
+                <span v-if="it.persisted" class="badge bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">测试·已入库</span>
+                <span v-else class="badge bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400">入库失败</span>
+              </div>
+              <p class="mt-1.5 text-slate-500 dark:text-slate-400 whitespace-pre-wrap">发货文案: {{ it.text }}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </ModalBase>
+
+    <!-- 消费流程/API 文档弹窗 -->
+    <ModalBase v-model="consumeDocOpen" title="卡密消费 API · 外部调用流程" size="lg">
+      <div class="space-y-4">
+        <div>
+          <label class="label">消费流程（自动发货生成的卡密如何被外部系统核销）</label>
+          <ol class="list-decimal list-inside space-y-1.5 text-slate-600 dark:text-slate-300">
+            <li>买家拍下付款 → 自动发货命中卡密型卡券 → 系统生成唯一卡密发给买家，同时在「生成记录」留档（状态=未核销）</li>
+            <li>买家把卡密提供给你方的业务系统（发卡平台/充值站/验证系统等）</li>
+            <li>业务方在「API Key管理」生成专用 Key（<span class="font-mono">xyk_</span> 前缀），携 Key 调用下方核销接口</li>
+            <li>接口原子核销（未核销 → 已核销，并发重复请求只成功一次），返回卡密对应的订单/商品/买家回执</li>
+            <li>无论成功/失败，本次请求都会在「消费记录」留痕（消费方 Key/IP/结果/说明），可直接核对</li>
+          </ol>
+        </div>
+        <div>
+          <label class="label">请求方式与参数</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">POST /api/verify-codes/verify
+Authorization: Bearer &lt;API Key&gt;      ← 「API Key管理」生成的业务方 Key (xyk_ 前缀)
+Content-Type: application/json
+
+{ "code": "A3b9xK" }                  ← 买家收到的卡密 (兼容字段名: code / card / key)</pre>
+        </div>
+        <div>
+          <label class="label">响应示例（统一 envelope，业务结果一律 HTTP 200）</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">验证成功 → 200 { "success": true, "msg": "验证成功", "data": {
+  "code": "A3b9xK", "card_name": "会员季度卡", "order_id": "5127...",
+  "item_id": "1090...", "buyer_id": "2088...", "status": "used",
+  "used_at": "2026-11-02 12:00:00", "verified_by": "发卡平台A" } }
+
+验证失败 → 200 { "success": false, "msg": "验证失败: 卡密不存在/已被使用 (使用时间 ...)/格式错误", "data": { ...原卡密信息 } }
+鉴权/停用/过期/限速 → 401/403/429 { "success": false, "msg": "原因", "data": {} }</pre>
+        </div>
+        <div>
+          <label class="label">curl 调用示例</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">curl -X POST 'https://你的域名/api/verify-codes/verify' \
+  -H 'Authorization: Bearer xyk_xxxxxxxx' \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"A3b9xK"}'</pre>
+        </div>
+        <p class="text-slate-500 dark:text-slate-400">验证成功后卡密立即失效（生成记录中状态变为已核销）；每个 Key 独立限速（默认 30 次/60 秒，超限 429）+ 可配置有效期（到期后 403）。Key 在「管理员 → API Key管理」页生成与维护。</p>
+      </div>
+    </ModalBase>
 
     <!-- Create/Edit modal -->
     <ModalBase v-model="modalOpen" :title="editing ? '编辑卡券' : '新增卡券'" size="lg">
@@ -472,10 +648,13 @@
 </template>
 
 <script setup lang="ts">
-import { getCards, createCard, updateCard, deleteCard } from '~/api/cards'
+import { getCards, createCard, updateCard, deleteCard, deliverTestCard } from '~/api/cards'
 import type { Card } from '~/api/cards'
+import type { DeliverTestResult } from '~/api/cards'
 import { getCardCodeLogs } from '~/api/card-codes'
 import type { CardCodeLogRow } from '~/api/card-codes'
+import { getCardConsumeLogs } from '~/api/card-consumes'
+import type { CardConsumeLogRow } from '~/api/card-consumes'
 
 definePageMeta({ layout: 'default' })
 
@@ -805,17 +984,75 @@ const codeLogPageSize = ref(20)
 const codeLogKeyword = ref('')
 const codeLogsLoading = ref(false)
 const codeLogTotalPages = computed(() => Math.max(1, Math.ceil(codeLogTotal.value / codeLogPageSize.value)))
+// 生成/消费双 Tab + 消费记录状态 (共用搜索词/分页尺寸/加载态)
+const codeLogTab = ref<'gen' | 'consume'>('gen')
+const consumeLogs = ref<CardConsumeLogRow[]>([])
+const consumeLogTotal = ref(0)
+const consumeLogPage = ref(1)
+const consumeLogTotalPages = computed(() => Math.max(1, Math.ceil(consumeLogTotal.value / codeLogPageSize.value)))
+const consumeDocOpen = ref(false)
+// 卡密发货测试弹窗 + 在线测试器状态
+const deliverTestDocOpen = ref(false)
+const deliverTestCardId = ref(0)
+const deliverTestCount = ref(1)
+const deliverTestRunning = ref(false)
+const deliverTestResult = ref<DeliverTestResult | null>(null)
+const codeCards = computed(() => cards.value.filter((c) => c.type === 'code'))
+
+function openDeliverTestDoc() {
+  deliverTestDocOpen.value = true
+  if (!deliverTestCardId.value && codeCards.value.length) deliverTestCardId.value = codeCards.value[0].id
+}
+
+async function runDeliverTest() {
+  if (!deliverTestCardId.value) {
+    toast.error('请先选择卡密型卡券')
+    return
+  }
+  deliverTestRunning.value = true
+  try {
+    deliverTestResult.value = await deliverTestCard({
+      card_id: deliverTestCardId.value,
+      count: Math.min(10, Math.max(1, Number(deliverTestCount.value) || 1)),
+    })
+  } catch (e: any) {
+    toast.error(e.message || '发货测试失败')
+  } finally {
+    deliverTestRunning.value = false
+  }
+}
+const codeLogActiveTotal = computed(() => (codeLogTab.value === 'gen' ? codeLogTotal.value : consumeLogTotal.value))
+const codeLogActivePage = computed(() => (codeLogTab.value === 'gen' ? codeLogPage.value : consumeLogPage.value))
+const codeLogActiveTotalPages = computed(() => (codeLogTab.value === 'gen' ? codeLogTotalPages.value : consumeLogTotalPages.value))
+
+function switchCodeLogTab(tab: 'gen' | 'consume') {
+  if (codeLogTab.value === tab) return
+  codeLogTab.value = tab
+  codeLogPage.value = 1
+  consumeLogPage.value = 1
+  reloadCodeLogs()
+}
 
 async function reloadCodeLogs() {
   codeLogsLoading.value = true
   try {
-    const res = await getCardCodeLogs({
-      page: codeLogPage.value,
-      pageSize: codeLogPageSize.value,
-      keyword: codeLogKeyword.value.trim() || undefined,
-    })
-    codeLogs.value = res.data
-    codeLogTotal.value = res.total
+    if (codeLogTab.value === 'gen') {
+      const res = await getCardCodeLogs({
+        page: codeLogPage.value,
+        pageSize: codeLogPageSize.value,
+        keyword: codeLogKeyword.value.trim() || undefined,
+      })
+      codeLogs.value = res.data
+      codeLogTotal.value = res.total
+    } else {
+      const res = await getCardConsumeLogs({
+        page: consumeLogPage.value,
+        pageSize: codeLogPageSize.value,
+        keyword: codeLogKeyword.value.trim() || undefined,
+      })
+      consumeLogs.value = res.data
+      consumeLogTotal.value = res.total
+    }
   } catch (e: any) {
     toast.error(e.message || '卡密记录加载失败')
   } finally {
@@ -825,12 +1062,14 @@ async function reloadCodeLogs() {
 
 function resetCodeLogsAndReload() {
   codeLogPage.value = 1
+  consumeLogPage.value = 1
   reloadCodeLogs()
 }
 
 function goCodeLogPage(p: number) {
-  if (p < 1 || p > codeLogTotalPages.value) return
-  codeLogPage.value = p
+  if (p < 1 || p > codeLogActiveTotalPages.value) return
+  if (codeLogTab.value === 'gen') codeLogPage.value = p
+  else consumeLogPage.value = p
   reloadCodeLogs()
 }
 

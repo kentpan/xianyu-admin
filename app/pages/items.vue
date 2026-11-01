@@ -11,6 +11,9 @@
         <button class="btn-secondary" @click="openPublishTemplate">
           <Icon name="edit" /> 发布模板
         </button>
+        <button class="btn-secondary" title="外部获取商品列表 API 调用说明" @click="apiDocOpen = true">
+          <Icon name="info" /> 外部调用
+        </button>
         <button
           class="btn-danger"
           :disabled="selected.length === 0"
@@ -222,6 +225,56 @@
         </button>
       </template>
     </ModalBase>
+
+    <!-- 外部调用 API 文档弹窗 -->
+    <ModalBase v-model="apiDocOpen" title="外部获取商品列表 API · 调用说明" size="lg">
+      <div class="space-y-4">
+        <div>
+          <label class="label">接口说明</label>
+          <p class="text-slate-600 dark:text-slate-300">供外部系统（发卡平台/下单系统/比价工具等）拉取本系统已同步的闲鱼在售商品列表，<span class="font-medium">按闲鱼账号分组</span>返回。每个账号默认返回最新 10 条商品，可通过 <span class="font-mono">limit</span> 参数调整返回条数。</p>
+        </div>
+        <div>
+          <label class="label">鉴权方式</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">Authorization: Bearer &lt;API Key&gt;      ← 「管理员 → API Key管理」生成的业务方 Key (xyk_ 前缀)</pre>
+          <p class="mt-1.5 text-slate-500 dark:text-slate-400">Key 需处于启用状态且未过期；每个 Key 独立限速（默认 30 次/60 秒，超限返回 429）。每次调用（成功/失败）均留痕到调用日志，可在「API Key管理」查看。</p>
+        </div>
+        <div>
+          <label class="label">请求方式与参数</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">GET /api/open/items
+
+Query 参数 (均可选):
+  limit    每个闲鱼账号返回的商品条数, 默认 10, 可传 1-200 (按更新时间取最新 N 条)
+  keyword  商品标题 / 商品ID 模糊过滤</pre>
+        </div>
+        <div>
+          <label class="label">响应示例（统一 envelope）</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">200 { "success": true, "data": {
+  "total": 25,              ← 全部在售商品总数 (不受 limit 影响)
+  "returned": 20,           ← 本次实际返回条数
+  "account_count": 2,       ← 闲鱼账号数
+  "limit": 10, "keyword": "", "called_by": "发卡平台A",
+  "groups": [ {
+    "cookie_id": "xy_2214...", "username": "店铺A", "remark": "主号",
+    "item_count": 15,       ← 该账号全部商品数
+    "returned_count": 10,   ← 本次实际返回条数 (受 limit 限制)
+    "items": [ { "item_id": "1090...", "item_title": "...", "item_price": "9.9",
+      "item_description": "...", "item_category": "...", "item_detail": "...",
+      "is_multi_spec": false, "multi_quantity_delivery": false,
+      "updated_at": "..." } ]
+  } ] } }</pre>
+        </div>
+        <div>
+          <label class="label">curl 调用示例</label>
+          <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">curl 'https://你的域名/api/open/items?limit=20&amp;keyword=话费' \
+  -H 'Authorization: Bearer xyk_xxxxxxxx'</pre>
+        </div>
+        <div class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3">
+          <p class="font-medium text-slate-700 dark:text-slate-200 mb-1">错误响应</p>
+          <p class="text-slate-500 dark:text-slate-400">401 = Key 缺失/无效；403 = Key 已停用/已过期；429 = 触发限速（响应头/消息含重试等待秒数）。均返回 <span class="font-mono">{ "success": false, "msg": "原因" }</span>。</p>
+        </div>
+        <p class="text-slate-500 dark:text-slate-400">仅返回启用状态闲鱼账号的在售商品；停用账号不会出现在分组中。商品数据来自「同步闲鱼商品」拉取结果，同步后即可被外部获取。</p>
+      </div>
+    </ModalBase>
   </div>
 </template>
 
@@ -254,6 +307,8 @@ const polishingIds = ref<Set<number>>(new Set())
 // 发布模板
 const pubModalOpen = ref(false)
 const pubSaving = ref(false)
+// 外部调用 API 文档
+const apiDocOpen = ref(false)
 const pubResult = ref<PublishTemplateResult | null>(null)
 const pubForm = reactive({
   title: '',

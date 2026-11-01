@@ -172,6 +172,28 @@ CREATE TABLE card_code_logs (
     item_id VARCHAR(64) DEFAULT '',
     order_id VARCHAR(64) DEFAULT '',
     buyer_id VARCHAR(64) DEFAULT '',
+    status VARCHAR(16) DEFAULT 'unused',
+    used_at TIMESTAMP,
+    used_ip VARCHAR(64) DEFAULT '',
+    used_by_key_id INTEGER DEFAULT 0,
+    source VARCHAR(16) DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+CREATE TABLE card_consume_logs (
+    id __AUTO__,
+    code_id INTEGER DEFAULT 0,
+    code VARCHAR(64) DEFAULT '',
+    card_name VARCHAR(128) DEFAULT '',
+    order_id VARCHAR(64) DEFAULT '',
+    item_id VARCHAR(64) DEFAULT '',
+    buyer_id VARCHAR(64) DEFAULT '',
+    api_key_id INTEGER DEFAULT 0,
+    api_key_name VARCHAR(128) DEFAULT '',
+    ip VARCHAR(64) DEFAULT '',
+    result VARCHAR(16) DEFAULT 'success',
+    message VARCHAR(240) DEFAULT '',
+    source VARCHAR(16) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -652,6 +674,12 @@ CREATE INDEX idx_apilog_key ON api_key_logs(api_key_id, id);
 CREATE INDEX idx_autolog_cookie ON auto_reply_logs(cookie_id, id);
 
 CREATE INDEX idx_cardcode_created ON card_code_logs(created_at);
+
+CREATE INDEX idx_cardcode_status ON card_code_logs(status, created_at);
+
+CREATE INDEX idx_cardconsume_created ON card_consume_logs(created_at);
+
+CREATE INDEX idx_cardconsume_code ON card_consume_logs(code);
 
 CREATE INDEX idx_dock_card ON dock_records(card_id);
 

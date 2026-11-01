@@ -5,8 +5,8 @@ export const DATA_TABLE_WHITELIST: string[] = [
   'message_notifications', 'system_settings', 'users', 'system_logs',
   'risk_control_logs', 'ai_reply_settings', 'ai_conversations', 'item_ai_settings',
   'ai_configs',
-  // API Key 管理 + 卡密生成记录 (兼核销账本)
-  'api_keys', 'api_key_logs', 'card_code_logs',
+  // API Key 管理 + 卡密生成记录 (兼核销账本) + 卡密消费记录
+  'api_keys', 'api_key_logs', 'card_code_logs', 'card_consume_logs',
   // 返佣分销系统
   'dock_records', 'dock_code_bindings', 'agent_orders', 'fund_flows',
   'settlement_records',
@@ -40,6 +40,7 @@ export const TABLE_PK: Record<string, string> = {
   api_keys: 'id',
   api_key_logs: 'id',
   card_code_logs: 'id',
+  card_consume_logs: 'id',
   // 返佣分销系统
   dock_records: 'id',
   dock_code_bindings: 'id',

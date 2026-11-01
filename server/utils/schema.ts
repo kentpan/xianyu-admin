@@ -829,6 +829,7 @@ const MIGRATIONS: string[] = [
     used_at TIMESTAMP,
     used_ip VARCHAR(64) DEFAULT '',
     used_by_key_id INTEGER DEFAULT 0,
+    source VARCHAR(16) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_cardcode_created ON card_code_logs(created_at)`,
@@ -838,8 +839,32 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE card_code_logs ADD COLUMN used_at TIMESTAMP`,
   `ALTER TABLE card_code_logs ADD COLUMN used_ip VARCHAR(64) DEFAULT ''`,
   `ALTER TABLE card_code_logs ADD COLUMN used_by_key_id INTEGER DEFAULT 0`,
+  // 发货来源标记: ''=真实发货, 'test'=卡密发货测试生成 (测试卡密同样可被消费 API 核销, 记录带测试标签)
+  `ALTER TABLE card_code_logs ADD COLUMN source VARCHAR(16) DEFAULT ''`,
   // 卡密唯一约束防重发 (空表/无重复时生效; 老数据若有重复由 try/catch 跳过)
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_cardcode_unique ON card_code_logs(code)`,
+  // 卡密消费记录: 每次外部核销请求 (成功/失败) 留痕 — 消费方 Key/IP/结果/说明
+  // (生成留痕在 card_code_logs, 消费留痕在这里, 两表经 code/code_id 关联)
+  `CREATE TABLE IF NOT EXISTS card_consume_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_id INTEGER DEFAULT 0,
+    code VARCHAR(64) DEFAULT '',
+    card_name VARCHAR(128) DEFAULT '',
+    order_id VARCHAR(64) DEFAULT '',
+    item_id VARCHAR(64) DEFAULT '',
+    buyer_id VARCHAR(64) DEFAULT '',
+    api_key_id INTEGER DEFAULT 0,
+    api_key_name VARCHAR(128) DEFAULT '',
+    ip VARCHAR(64) DEFAULT '',
+    result VARCHAR(16) DEFAULT 'success',
+    message VARCHAR(240) DEFAULT '',
+    source VARCHAR(16) DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_cardconsume_created ON card_consume_logs(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_cardconsume_code ON card_consume_logs(code)`,
+  // 老库补齐来源列 (核销测试卡密时, 消费记录同样带 'test' 标签)
+  `ALTER TABLE card_consume_logs ADD COLUMN source VARCHAR(16) DEFAULT ''`,
   // 提货验证码独立表已废弃, 卡密统一由 card_code_logs 承载 (发放+核销)
   `DROP TABLE IF EXISTS verify_codes`,
   // 发货规则废弃列清理: 是否发消息/是否发卡密改由卡券配置决定, 规则只保留发货方式

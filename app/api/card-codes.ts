@@ -14,6 +14,8 @@ export interface CardCodeLogRow {
   used_at: string | null
   used_ip: string
   used_by_key_id: number
+  /** 来源: ''=真实发货 / 'test'=卡密发货测试生成 */
+  source: '' | 'test' | string
   created_at: string
 }
 

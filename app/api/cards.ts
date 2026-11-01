@@ -80,3 +80,30 @@ export function toggleCardEnabled(id: number, enabled: boolean) {
 export function deleteCard(id: number) {
   return useApi().del(`/api/cards/${id}`)
 }
+
+export interface DeliverTestItem {
+  code: string
+  /** 渲染后的发货文案 (与真实发货发出的内容一致) */
+  text: string
+  preview: string
+  /** 是否已入库 (source='test'): 入库后可用消费 API 真实核销 */
+  persisted: boolean
+}
+
+export interface DeliverTestResult {
+  card_id: number
+  card_name: string
+  count: number
+  /** 本次测试批次的订单号 (TEST- 前缀, 便于在生成/消费记录中定位) */
+  order_id: string
+  /** 实际成功入库的份数 */
+  persisted_count: number
+  items: DeliverTestItem[]
+  config: { length: number; letters: boolean; digits: boolean; case: string; template: string }
+  note: string
+}
+
+/** 卡密发货测试: 与真实发货同一生成链路并入库 (带测试标签), 可用消费 API 真实核销; 不真实发货 */
+export function deliverTestCard(body: { card_id: number; count?: number }) {
+  return useApi().post<DeliverTestResult>('/api/cards/deliver-test', body)
+}
