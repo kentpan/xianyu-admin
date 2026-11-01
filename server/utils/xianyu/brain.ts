@@ -46,16 +46,6 @@ interface BrainOptions {
 const orderLocks = new Map<string, Promise<unknown>>()
 const orderCooldown = new Map<string, number>()
 const ORDER_COOLDOWN_MS = 10 * 60 * 1000
-/** 发货认领租期: 兜底实例中途被杀后残留认领的自动过期 (正常失败路径会主动释放) */
-const ORDER_CLAIM_LEASE_MS = 10 * 60 * 1000
-
-/**
- * 付款触发事件去重 (滑动 30s 窗口): 同一笔付款常被 sync 双通道重推 (聊天体消息 + 卡片更新
- * 消息, 内容同为「[我已付款，等待你发货]」), 两次事件都会进发货链 — 事件层直接丢弃重复推送,
- * 与 DB 认领闸门 (跨实例) / 内存锁 (同进程) 三层防重, 杜绝同一订单重复发货。
- */
-const recentPaymentTriggers = new Map<string, number>()
-const PAYMENT_TRIGGER_DEDUP_MS = 30 * 1000
 
 /** 卖家手动回复后暂停该会话自动回复 (落库 chat_pauses, 跨引擎/跨实例全局可见; minutes=账号 pause_duration, 0 = 不暂停)。 */
 export async function pauseChatAutoReply(
@@ -391,22 +381,6 @@ export async function handleChatEvent(
 
   // 付款触发卡片 (先于暂停与回复链 — butler 自动发货独立于 pause_manager, 人工接入不阻断发货)
   if (isPaymentTrigger(msg.content)) {
-    // 付款卡片重复推送去重 (滑动 30s): 聊天体 + 卡片更新双通道重推只处理首次,
-    // 决策日志落 duplicate_event 可追溯 (重复推送不会触发第二次发货)
-    const payKey = `${cookieId}:${msg.chatId}:${msg.itemId || extractOrderId(msg.raw) || ''}:${msg.content.slice(0, 40)}`
-    const lastPayAt = recentPaymentTriggers.get(payKey) || 0
-    if (Date.now() - lastPayAt < PAYMENT_TRIGGER_DEDUP_MS) {
-      recentPaymentTriggers.set(payKey, Date.now())
-      logWarn(`[${cookieId}] 付款卡片重复推送 (30s 窗口内), 忽略本次触发防重复发货`)
-      await addLog(db, cookieId, msg, opts, {
-        process_status: 'skipped',
-        decision_reason: 'duplicate_event',
-        reply_strategy: 'none',
-        reply_text: '付款卡片重复推送, 已忽略 (防重复发货, 首次推送已处理)',
-      })
-      return []
-    }
-    recentPaymentTriggers.set(payKey, Date.now())
     let orderId = extractOrderId(msg.raw)
     if (!orderId) {
       // 自愈兜底 (对齐 deliverOnTradeComplete 的回退策略): 付款卡片变体可能不含订单号
@@ -445,14 +419,15 @@ export async function handleChatEvent(
         orderId = remote.orderId
         logWarn(`[${cookieId}] 付款卡片未含订单号, 远程拉单命中 ${orderId} (${remote.source}) 触发发货`)
       } else {
-        // 三重兜底落空 ≠ 发货失败: 订单同步/买家提醒发货/交易成功兑底仍在后面,
-        // 此处如实落「等待订单信息」延迟语义 (delivery_deferred), 后续事件到达即自动发货
-        logWarn(`[${cookieId}] 付款触发订单号三重兜底均落空 (${remote.source}), 等待后续事件重试`)
+        logWarn(`[${cookieId}] 付款触发订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
+        // 决策日志可见: 用户已付款, 仅订单号暂未定位 (付款卡片丢失订单号); 附卡片原文摘要 + 远程拉单原因供排查
+        // (v2.1.14) 不再落 delivery_failed (红色「发货失败」误导排查), 改落 payment_received (琥珀色「用户已付款」)
         await addLog(db, cookieId, msg, opts, {
           process_status: 'skipped',
-          decision_reason: 'delivery_deferred',
+          decision_reason: 'payment_received',
           reply_strategy: 'none',
-          reply_text: `付款卡片未提取到订单号, 暂无法定位订单, 等待订单同步/买家提醒发货后自动补发 (${remote.source})`.slice(0, 380),
+          reply_text: '用户已付款, 启动自动发货!',
+          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
         })
         return []
       }
@@ -549,24 +524,6 @@ export async function handleChatEvent(
 
   // 平台系统通知文本: 记录后直接跳过 (与 butler 一致, 不进回复链)
   if (isSystemNotice(msg.content)) {
-    // 买家拍下待付款: 决策日志留痕 (系统通知) + 推送通知 (payment 事件通道) —
-    // 买家下单第一时间可见, 不再只有发货/付款后才感知有单
-    if (msg.content.includes('拍下') && msg.content.includes('待付款')) {
-      dispatchNotify(
-        {
-          type: 'payment',
-          cookieId,
-          title: '买家已拍下 · 待付款',
-          fields: {
-            买家: msg.senderNick || msg.senderUserId || '未知',
-            商品ID: msg.itemId || '未知',
-            状态: '已拍下未付款, 等待买家付款',
-          },
-          link: '/orders',
-        },
-        `placed:${msg.chatId || msg.itemId || msg.content}`,
-      )
-    }
     await addLog(db, cookieId, msg, opts, {
       process_status: 'skipped',
       decision_reason: 'system_notice',
@@ -734,25 +691,6 @@ export async function handleSystemEvent(
     }
   }
 
-  // 买家拍下待付款 (系统卡片变体「等待买家付款」): 推送通知让卖家第一时间感知有新订单
-  // (与聊天体「[我已拍下，待付款]」路径同语义; 按订单号/会话去重, 两路只发首条)
-  if (msg.redReminder === '等待买家付款') {
-    dispatchNotify(
-      {
-        type: 'payment',
-        cookieId,
-        title: '买家已拍下 · 待付款',
-        fields: {
-          订单号: orderId || '未知',
-          商品ID: msg.itemId || '未知',
-          状态: '已拍下未付款, 等待买家付款',
-        },
-        link: '/orders',
-      },
-      `placed:${msg.chatId || orderId}`,
-    )
-  }
-
   // 交易成功兑底 (系统卡片路径, 无聊天体的纯 redReminder): 交易成功 = 买家已付款且交易终结,
   // 若订单未经本系统发货 (付款卡片丢失/解析失败), 此处为最后补发窗口 — 与付款触发同等优先
   if (msg.redReminder === '交易成功') {
@@ -804,27 +742,10 @@ export async function handleSystemEvent(
 
   if (msg.redReminder !== '等待卖家发货') return []
   if (!orderId) {
-    // 自愈兜底: 系统卡片变体可能不含订单号 — 极简交易卡片只携带会话 ID (protocol 已提取),
-    // 其余变体带 商品/买家 维度。按 会话 → 商品+买家 → 商品 三级回退最近一笔 10 分钟内
-    // 有动作的可发货订单 (订单列表同步/拍下建单已落库, 时间窗锁定刚付款的那单, 防误发)
+    // 自愈兜底: 系统卡片变体可能不含订单号 — 用 商品/买家 维度回退最近一笔 10 分钟内有
+    // 动作的可发货订单 (订单列表同步/拍下建单已落库, 时间窗锁定刚付款的那单, 防误发)
     let fallbackRow: { order_id: string; buyer_id?: string; chat_id?: string } | null = null
-    if (msg.chatId) {
-      fallbackRow = await db
-        .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
-          `SELECT order_id, buyer_id, chat_id FROM orders
-           WHERE cookie_id = ? AND system_shipped = 0
-             AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
-             AND chat_id = ?
-             AND updated_at >= datetime('now', '-10 minutes')
-           ORDER BY updated_at DESC LIMIT 1`,
-          [cookieId, msg.chatId],
-        )
-        .catch(() => null)
-      if (fallbackRow) {
-        logWarn(`[${cookieId}] 系统卡片未含订单号, 回退会话 ${msg.chatId} 最近可发货订单 ${fallbackRow.order_id} 触发发货`)
-      }
-    }
-    if (!fallbackRow && msg.itemId && msg.buyerId) {
+    if (msg.itemId && msg.buyerId) {
       fallbackRow = await db
         .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
           `SELECT order_id, buyer_id, chat_id FROM orders
@@ -857,21 +778,20 @@ export async function handleSystemEvent(
         fallbackRow = { order_id: remote.orderId }
         logWarn(`[${cookieId}] 系统卡片未含订单号, 远程拉单命中 ${remote.orderId} (${remote.source}) 触发发货`)
       } else {
-        // 三重兜底落空 ≠ 发货失败: 极简卡片常比付款卡片早到几秒, 本地库此时往往尚未落库;
-        // 谎报「发货失败」会误导排查 (实际发货由随后的付款卡片完成)。
-        // 如实落「等待订单信息」延迟语义, 付款卡片/订单同步/交易成功兑底到达后自动发货。
-        logWarn(`[${cookieId}] 系统卡片订单号三重兜底均落空 (${remote.source}), 等待付款卡片/订单同步重试`)
+        logWarn(`[${cookieId}] 付款事件订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
+        // (v2.1.14) 同上: 用户已付款语义, 不再落 delivery_failed
         await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
           process_status: 'skipped',
-          decision_reason: 'delivery_deferred',
+          decision_reason: 'payment_received',
           reply_strategy: 'none',
-          reply_text: `等待卖家发货卡片未携带订单号, 暂无法定位订单, 等待付款卡片/订单同步后自动发货 (${remote.source})`.slice(0, 380),
+          reply_text: '用户已付款, 启动自动发货!',
+          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
         })
         return []
       }
     }
     orderId = String(fallbackRow.order_id)
-    logWarn(`[${cookieId}] 系统卡片未含订单号, 回退会话/商品维度最近可发货订单 ${orderId} 触发发货`)
+    logWarn(`[${cookieId}] 系统卡片未含订单号, 回退商品/买家维度最近可发货订单 ${orderId} 触发发货`)
   }
 
   // 会话/买家信息兜底: 纯系统卡片可能缺 chatId/buyerId, 从订单行回填 (缺失则无法发送, 跳过)
@@ -1566,37 +1486,9 @@ async function autoDeliver(
     return []
   }
 
-  // DB 级原子发货认领 (v2.1.12): 防重双保险的最后一道闸。
-  // 背景: CF Pages 每个请求一个隔离实例, 内存锁 (orderLocks) 跨实例无效 —— 同一订单
-  // 两个触发事件 (付款卡片重报/提醒发货) 相隔几秒各落在不同实例, 都通过 system_shipped
-  // 检查 (此时首个决策还卡在卡券 delay_seconds 的 sleep 里没落库) → 重复发货两份。
-  // 认领是原子 UPDATE: 抢不到 = 已发货或另一实例决策进行中, 跨实例/跨引擎全局有效。
-  // 认领租期 10 分钟仅兜底实例中途被杀的残留认领; 正常失败路径在下方主动释放, 不阻塞重试。
-  const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ')
-  const claimCutoff = new Date(Date.now() - ORDER_CLAIM_LEASE_MS).toISOString().slice(0, 19).replace('T', ' ')
-  const claim = await db
-    .run(
-      `UPDATE orders SET delivery_claim_at = ?
-       WHERE order_id = ? AND IFNULL(system_shipped, 0) = 0
-         AND (delivery_claim_at IS NULL OR delivery_claim_at < ?)`,
-      [nowStr, orderId, claimCutoff],
-    )
-    .catch(() => ({ changes: 0 })) // DB 异常时绝不放行: 放行 = 并发触发全部发货 (重复发货事故根源);
-  // 后续事件 ([记得及时发货]/付款卡片重报) 到达时会重试, 丢一次触发不丢货
-  if (!Number(claim.changes)) {
-    logWarn(`[${cookieId}] 订单 ${orderId} 未抢到发货认领 (已发货或另一决策进行中), 跳过本次重复触发`)
-    await addLog(db, cookieId, logMsg, opts, {
-      process_status: 'skipped',
-      decision_reason: 'delivery_in_progress',
-      reply_strategy: 'none',
-      reply_text: `订单 ${orderId} 正在发货或刚发过 (并发触发被防重认领拦截)`,
-    })
-    return []
-  }
-
   const run = (async () => {
     try {
-      const result = await (async () => {
+      return await (async () => {
     const buyerId = ctx.buyerId || order?.buyer_id || ''
     const chatId = ctx.chatId || order?.chat_id || ''
 
@@ -1943,18 +1835,7 @@ async function autoDeliver(
     )
     return deliveryLogId ? actions.map((a) => ({ ...a, log_id: deliveryLogId })) : actions
       })()
-      // 失败路径释放发货认领 (无规则/卡券发完/发货失败): 不阻塞后续事件重试;
-      // 成功时 system_shipped=1 已永久拦截, 认领保留与否均无影响
-      const shippedAfter = await db
-        .get<{ system_shipped: number }>('SELECT system_shipped FROM orders WHERE order_id = ?', [orderId])
-        .catch(() => null)
-      if (Number(shippedAfter?.system_shipped ?? 0) !== 1) {
-        await db.run('UPDATE orders SET delivery_claim_at = NULL WHERE order_id = ?', [orderId]).catch(() => {})
-      }
-      return result
     } catch (e: any) {
-      // 异常路径同样释放认领, 保证代理重报/买家提醒可安全重试
-      await db.run('UPDATE orders SET delivery_claim_at = NULL WHERE order_id = ?', [orderId]).catch(() => {})
       // (v2.1.6) 发货全链路异常兜底: mtop 网关/任务/直连全挂、DB 异常等场景不再炸决策
       // (曾致: 占位被删 → 代理「决策超时失效」无限重报 → 不发货+无日志死循环)。
       // 落 delivery_failed 决策日志 + 通知, 决策正常终结, 代理重报后由防重链安全重试。

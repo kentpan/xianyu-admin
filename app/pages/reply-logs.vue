@@ -73,8 +73,8 @@
                 </td>
                 <td class="max-w-[140px] truncate text-slate-500 dark:text-slate-400">{{ log.matched_keyword || '-' }}</td>
                 <td class="max-w-[260px]">
-                  <p class="whitespace-pre-wrap break-words" :class="log.error_message && log.process_status !== 'success' ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'">
-                    {{ log.error_message || log.reply_text || '-' }}
+                  <p class="whitespace-pre-wrap break-words" :class="contentMeta(log)">
+                    {{ contentText(log) }}
                   </p>
                 </td>
                 <td>
@@ -157,10 +157,8 @@ function strategyMeta(log: ReplyLog) {
       case 'already_shipped': return { label: '已发货跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'system_notice': return { label: '系统通知', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'skip_reply_filter': return { label: '过滤规则', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-      case 'delivery_deferred': return { label: '等待订单信息', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
-      case 'delivery_in_progress': return { label: '并发触发拦截', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-      case 'duplicate_event': return { label: '重复推送忽略', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'delivery_failed': return { label: '发货失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
+      case 'payment_received': return { label: '用户已付款', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
       default: return { label: '跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
     }
   }
@@ -172,6 +170,17 @@ function strategyMeta(log: ReplyLog) {
     case 'api': return { label: 'API', cls: 'bg-sky-50 text-sky-600 dark:bg-sky-900/30 dark:text-sky-400' }
     default: return { label: '未回复', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
   }
+}
+
+// (v2.1.14) 回复内容列: payment_received (用户已付款待发货) 用琥珀色正向语义, 其余维持原判定
+function contentText(log: ReplyLog): string {
+  if (log.decision_reason === 'payment_received') return log.reply_text || '-'
+  return log.error_message || log.reply_text || '-'
+}
+
+function contentMeta(log: ReplyLog): string {
+  if (log.decision_reason === 'payment_received') return 'text-amber-600 dark:text-amber-400'
+  return log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'
 }
 
 function sendMeta(sendStatus: string) {

@@ -258,12 +258,7 @@ async function onSystem(cookieId: string, msg: ParsedSystemMessage): Promise<voi
 async function executeActions(actions: EngineAction[]): Promise<void> {
   for (const action of actions) {
     const client = runtime.clients.get(action.account)
-    if (!client) {
-      // 账号客户端不在 (引擎重启中/未启用): 不再静默丢弃 — 静默会让决策日志永远停在
-      // 「未发送 (pending)」, 排查时看起来像发丢了; 如实回写失败原因, 后续触发事件可重试
-      await markActionResult(action, false, '内置引擎未连接该账号, 动作未执行 (账号重新上线后的触发会自动重试)')
-      continue
-    }
+    if (!client) continue
     try {
       if (action.type === 'send_text') {
         await client.sendText(action.chat_id, action.to_user_id, action.text, action.delay_ms)
@@ -603,11 +598,14 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
         }
       }
     } catch {
-      // 单账号列表拉取失败不阻断后续账号
+      // 单账号列表拉取失败不阻断详情刷新
     }
     await new Promise((r) => setTimeout(r, 500))
   }
 
+  // 详情精修能力已全链路移除 (按用户需求): 定时同步只做纯列表拉取入库, 不再逐单调
+  // order.detail 精修 (批量逐单实查动辄数百次请求, 是超时/风控元凶)。单个订单需要
+  // 详情精修时在订单页点单条「详情精修」按钮走 /api/orders/:id/refresh。
   const summary = `订单定时同步完成: 待发货列表已按账号拉取入库 (纯列表同步, 无逐单精修)`
   console.log(`[xianyu-engine] ${summary}`)
   await db

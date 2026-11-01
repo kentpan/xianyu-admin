@@ -1,62 +1,57 @@
 /**
- * Navigation config — single source of truth for the sidebar menu.
- * Pages render purely from this data; no hard-coded nav anywhere else.
+ * Navigation — sidebar menu source.
+ *
+ * (v2.1.14) 单源迁至 shared/navigation.ts (前后端共用, #shared 别名):
+ *   - 服务端 RBAC 把菜单表按用户权限过滤后经 useState('rbac_menus') 注水 (SSR);
+ *   - 本 composable 优先消费服务端菜单 (名称/路径/图标/排序全部以菜单表为准),
+ *     服务端菜单为空时 (种子失败/未升级) 回退静态 NAV_ITEMS;
+ *   - is_admin 用户可见 admin 分组与 admin_only 菜单, 权限过滤已在服务端完成。
  */
 import type { Component } from 'vue'
+import { NAV_ITEMS, type NavItem } from '#shared/navigation'
 
-export interface NavItem {
+export { NAV_ITEMS }
+export type { NavItem }
+
+/** 服务端下发的菜单行 (GET /api/auth/menus 返回结构)。 */
+export interface ServerMenuRow {
+  id: number
+  parent_id: number
+  name: string
   path: string
-  label: string
-  icon: string // icon name from the icon map (lucide-like keys)
-  group: 'main' | 'admin' | 'bottom'
-  adminOnly?: boolean
-  badge?: string
+  icon: string
+  group_name: string
+  sort_order: number
+  admin_only: number
+  enabled: number
 }
-
-export const NAV_ITEMS: NavItem[] = [
-  { path: '/dashboard', label: '工作台', icon: 'dashboard', group: 'main' },
-  { path: '/accounts', label: '账号管理', icon: 'accounts', group: 'main' },
-  { path: '/listener', label: '监听服务', icon: 'server', group: 'main' },
-  { path: '/items', label: '商品管理', icon: 'items', group: 'main' },
-  { path: '/orders', label: '订单管理', icon: 'orders', group: 'main' },
-  { path: '/messages', label: '消息管理', icon: 'message', group: 'main' },
-  { path: '/manual-ship', label: '补发货', icon: 'ship', group: 'main' },
-  { path: '/keywords', label: '自动回复', icon: 'keywords', group: 'main' },
-  { path: '/item-replies', label: '指定商品回复', icon: 'itemReply', group: 'main' },
-  { path: '/cards', label: '卡券管理', icon: 'cards', group: 'main' },
-  { path: '/delivery', label: '自动发货', icon: 'delivery', group: 'main' },
-  { path: '/reply-logs', label: '回复决策日志', icon: 'activity', group: 'main' },
-  { path: '/filters', label: '消息过滤', icon: 'filter', group: 'main' },
-  { path: '/notification-channels', label: '通知渠道', icon: 'channels', group: 'main' },
-  { path: '/message-notifications', label: '消息通知', icon: 'msgNotify', group: 'main' },
-  // 返佣分销系统
-  { path: '/distribution/supply', label: '货源广场', icon: 'store', group: 'main' },
-  { path: '/distribution/docked', label: '我的对接', icon: 'link', group: 'main' },
-  { path: '/distribution/agent-orders', label: '代理订单', icon: 'handshake', group: 'main' },
-  { path: '/distribution/fund-flows', label: '资金流水', icon: 'coins', group: 'main' },
-  { path: '/settings', label: '系统设置', icon: 'settings', group: 'main' },
-
-  { path: '/admin/ai-configs', label: 'AI配置', icon: 'sparkles', group: 'admin', adminOnly: true },
-  { path: '/admin/api-keys', label: 'API Key管理', icon: 'key', group: 'admin', adminOnly: true },
-  { path: '/admin/users', label: '用户管理', icon: 'users', group: 'admin', adminOnly: true },
-  { path: '/admin/logs', label: '系统日志', icon: 'logs', group: 'admin', adminOnly: true },
-  { path: '/admin/risk-logs', label: '风控日志', icon: 'riskLogs', group: 'admin', adminOnly: true },
-  { path: '/admin/audit', label: '操作审计', icon: 'shield', group: 'admin', adminOnly: true },
-  { path: '/admin/settlement-records', label: '提现审核', icon: 'wallet', group: 'admin', adminOnly: true },
-  { path: '/admin/data', label: '数据管理', icon: 'data', group: 'admin', adminOnly: true },
-
-  { path: '/disclaimer', label: '免责声明', icon: 'disclaimer', group: 'bottom' },
-  { path: '/wallet', label: '我的钱包', icon: 'wallet', group: 'bottom' },
-  { path: '/profile', label: '个人中心', icon: 'user', group: 'bottom' },
-  { path: '/about', label: '关于', icon: 'about', group: 'bottom' },
-]
 
 export function useNav() {
   const route = useRoute()
-  const mainItems = NAV_ITEMS.filter((i) => i.group === 'main')
-  const adminItems = NAV_ITEMS.filter((i) => i.group === 'admin')
-  const bottomItems = NAV_ITEMS.filter((i) => i.group === 'bottom')
+  const { user } = useAuth()
+
+  // 服务端注水的菜单 (SSR 中间件已按登录态+权限拉取, payload 水合到客户端)
+  const serverMenus = useState<ServerMenuRow[]>('rbac_menus', () => [])
+
+  const items = computed<NavItem[]>(() => {
+    const rows = serverMenus.value
+    if (rows.length) {
+      return rows.map((m) => ({
+        path: m.path,
+        label: m.name,
+        icon: m.icon || 'dashboard',
+        group: (m.group_name as NavItem['group']) || 'main',
+        adminOnly: Number(m.admin_only) === 1,
+      }))
+    }
+    // 回退: 静态配置 (非管理员滤掉 admin 分组)
+    return NAV_ITEMS.filter((i) => !i.adminOnly || user.value?.is_admin)
+  })
+
+  const mainItems = computed(() => items.value.filter((i) => i.group === 'main'))
+  const adminItems = computed(() => items.value.filter((i) => i.group === 'admin'))
+  const bottomItems = computed(() => items.value.filter((i) => i.group === 'bottom'))
   const isActive = (path: string) =>
     route.path === path || route.path.startsWith(path + '/')
-  return { mainItems, adminItems, bottomItems, isActive, all: NAV_ITEMS }
+  return { mainItems, adminItems, bottomItems, isActive, all: items }
 }

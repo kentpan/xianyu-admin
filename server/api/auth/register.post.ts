@@ -18,6 +18,17 @@ export default defineEventHandler(
       'INSERT INTO users (username, email, password_hash, is_active, is_admin) VALUES (?, ?, ?, 1, 0)',
       [username, email, hashPassword(password)],
     )
+    // (v2.1.14) RBAC: 新用户默认挂「普通用户」角色 — 无角色的用户在菜单级权限校验下
+    // 只能停留在工作台, 注册链路必须补默认授权 (与 seedRbac 存量用户兜底同语义)
+    try {
+      const defRole = await db.get<{ id: number }>(`SELECT id FROM roles WHERE name = '普通用户'`)
+      if (defRole) {
+        await db.run('INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)', [
+          Number(result.lastInsertId),
+          defRole.id,
+        ])
+      }
+    } catch { /* 角色表未就绪时不阻塞注册 */ }
     const token = signToken({ userId: Number(result.lastInsertId), username, isAdmin: false })
     setCookie(event, 'admin_token', token, { httpOnly: true, sameSite: 'lax', path: '/', maxAge: 60 * 60 * 24 * 7 })
     return ok({ token, user: { user_id: Number(result.lastInsertId), username, is_admin: false, email } }, '注册成功')

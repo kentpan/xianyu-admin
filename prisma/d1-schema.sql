@@ -526,7 +526,7 @@ CREATE TABLE orders (
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP);
+  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP);
 
 -- 删除订单屏蔽表 (v2.1.9): 用户删除的订单号登记于此, 订单同步命中即跳过 (删除不被同步拉回)
 CREATE TABLE IF NOT EXISTS deleted_orders (
@@ -675,3 +675,48 @@ CREATE INDEX idx_vcode_order ON verify_codes(order_id);
 
 CREATE INDEX idx_vcode_status ON verify_codes(status, created_at);
 
+
+-- RBAC (v2.1.14): 菜单 / 角色 / 角色菜单 / 用户角色
+
+CREATE TABLE IF NOT EXISTS menus (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER DEFAULT 0,
+  name VARCHAR(64) NOT NULL,
+  path VARCHAR(128) NOT NULL UNIQUE,
+  icon VARCHAR(64) DEFAULT '',
+  group_name VARCHAR(16) DEFAULT 'main',
+  sort_order INTEGER DEFAULT 0,
+  admin_only INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS roles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name VARCHAR(64) NOT NULL UNIQUE,
+  description VARCHAR(255) DEFAULT '',
+  is_system INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS role_menus (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role_id INTEGER NOT NULL,
+  menu_id INTEGER NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(role_id, menu_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  role_id INTEGER NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, role_id)
+);
+
+CREATE INDEX idx_rolemenu_role ON role_menus(role_id, menu_id);
+
+CREATE INDEX idx_userrole_user ON user_roles(user_id, role_id);

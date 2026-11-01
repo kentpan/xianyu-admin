@@ -24,6 +24,42 @@ const SCHEMA: string[] = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+  // RBAC (v2.1.14): 菜单表 (树状, 种子来自 shared/navigation.ts) + 角色/角色菜单/用户角色
+  `CREATE TABLE IF NOT EXISTS menus (
+    id __AUTO__,
+    parent_id INTEGER DEFAULT 0,
+    name VARCHAR(64) NOT NULL,
+    path VARCHAR(128) NOT NULL UNIQUE,
+    icon VARCHAR(64) DEFAULT '',
+    group_name VARCHAR(16) DEFAULT 'main',
+    sort_order INTEGER DEFAULT 0,
+    admin_only INTEGER DEFAULT 0,
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS roles (
+    id __AUTO__,
+    name VARCHAR(64) NOT NULL UNIQUE,
+    description VARCHAR(255) DEFAULT '',
+    is_system INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS role_menus (
+    id __AUTO__,
+    role_id INTEGER NOT NULL,
+    menu_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(role_id, menu_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS user_roles (
+    id __AUTO__,
+    user_id INTEGER NOT NULL,
+    role_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, role_id)
+  )`,
   `CREATE TABLE IF NOT EXISTS cookies (
     id VARCHAR(64) PRIMARY KEY,
     value TEXT NOT NULL,
@@ -110,7 +146,7 @@ const SCHEMA: string[] = [
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    delivery_claim_at TIMESTAMP,
+    // 状态时间 (v2.1.15): 付款/发货/完成/取消 — 卖家列表接口能提取到才写入, 空则 NULL 不伪造
     paid_at TIMESTAMP,
     shipped_at TIMESTAMP,
     finished_at TIMESTAMP,
@@ -672,13 +708,13 @@ const MIGRATIONS: string[] = [
   // 监听引擎: 规则作用域 (账号级隔离) + 订单状态机扩展列
   `ALTER TABLE delivery_rules ADD COLUMN cookie_id VARCHAR(64)`,
   `ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0`,
-  `ALTER TABLE orders ADD COLUMN delivery_claim_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN version INTEGER DEFAULT 1`,
   `ALTER TABLE orders ADD COLUMN buy_num INTEGER DEFAULT 1`,
   `ALTER TABLE orders ADD COLUMN auction_price VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN confirm_fee VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN refund_fee VARCHAR(32) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN post_fee VARCHAR(32) DEFAULT ''`,
+  // 订单状态时间 (v2.1.15): 付款/发货/完成/取消 (卖家列表接口能提取到才写入)
   `ALTER TABLE orders ADD COLUMN paid_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP`,
   `ALTER TABLE orders ADD COLUMN finished_at TIMESTAMP`,
@@ -934,11 +970,31 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
   // 冷启动短路: 指纹一致 = 全部结构/迁移/种子已就位, 1 次查询即返回。
   // 首次启动/升级时 system_settings 尚无此行或表不存在 → 全量初始化后写入指纹。
   // (表不存在时 get 报错 → caught → 指纹视作缺失 → 走全量建表)
+  // (v2.1.14) 指纹命中后仍自检 RBAC 菜单表: 历史启动若在种子落库前被杀/失败,
+  // 指纹已写入会导致种子永远补不上 — 菜单表为空时原地补种 (幂等, 只多 1 次查询)。
   try {
     const marker = await db.get<{ value: string }>(
       "SELECT value FROM system_settings WHERE key_name = 'schema_fingerprint'",
     )
-    if (marker?.value === schemaFingerprint()) return
+    if (marker?.value === schemaFingerprint()) {
+      let menuCount = 0
+      try {
+        const cnt = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM menus')
+        menuCount = Number(cnt?.c || 0)
+      } catch {
+        // menus 表不存在 → 指纹不可信, 走全量初始化
+        menuCount = -1
+      }
+      if (menuCount > 0) return
+      try {
+        const { seedRbac } = await import('./rbac')
+        await seedRbac(db)
+        console.log('[xianyu-admin] RBAC seed re-applied on warm boot (menus empty)')
+      } catch (e: any) {
+        console.error('[xianyu-admin] RBAC seed failed on warm boot:', e?.message || e)
+      }
+      return
+    }
   } catch {
     /* 表未建: 走全量初始化 */
   }
@@ -1016,6 +1072,16 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
         [v.var_key, v.label, v.category, v.description, v.sort],
       )
       .catch(() => {})
+  }
+
+  // RBAC 种子 (v2.1.14, 幂等): 菜单种子 (shared/navigation 单源) + 内置角色 + 存量用户兜底挂普通用户
+  try {
+    const { seedRbac } = await import('./rbac')
+    await seedRbac(db)
+    const rbacCnt = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM menus').catch(() => null)
+    console.log('[xianyu-admin] RBAC seeded (menus:', Number(rbacCnt?.c || 0) + ')')
+  } catch (e: any) {
+    console.error('[xianyu-admin] RBAC seed failed:', e?.message || e)
   }
 
   // 写入结构指纹 (幂等, 跨驱动先查后写): 之后每个冷启动实例 1 次查询即短路返回

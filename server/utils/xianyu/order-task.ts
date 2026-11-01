@@ -130,92 +130,36 @@ export interface FetchOrdersTaskOptions {
 }
 
 /**
- * 任务通道聚合批量传输层 (v2.1.12): 收集窗口内 (默认 250ms) 的并发 mtop 请求合并进
- * 同一个 http_fetch 任务 (代理原生支持单任务多请求, 逐个 400ms 限速转发), 一次任务
- * 领取/回报完成整批 — 消灭逐请求任务轮询延迟 (此前每页一个任务, 每个都要等代理
- * 3s 轮询周期, 5 页串行 ≈ 15~45s, 一键同步 20s 预算必然超时拉不到单)。
- * 代理零解析不变: 请求后台签名, 原始响应回传后由 mtopCall 无损解析。
- * token 过期场景: 同批全部返回 FAIL_SYS_TOKEN_EXPIRED → 各自重签后再次并发入队 →
- * 自然合并为第二批任务, 全程仅 2 次任务往返。
+ * 任务通道透传传输层: 把一次 mtop HTTP 请求 (后台已构造并签名) 打包为 http_fetch
+ * 任务, 代理原样转发并回报原始响应文本 — 代理零解析, 响应回到本模块后经 mtopCall
+ * 的无损解析层解析 (订单号精度主权在后台, 与直连/网关模式完全同源同语义)。
  */
-function batchingTaskTransport(
+function taskChannelTransport(
   db: Awaited<ReturnType<typeof getDb>>,
-  deadlineMs: number,
+  timeoutMs: number,
 ): MtopTransport {
-  type TaskResp = { status: number; text: string; setCookie: string[] }
-  type Waiter = { req: { url: string; method: string; headers: Record<string, string>; body: string }; resolve: (r: TaskResp) => void; reject: (e: Error) => void }
-  let queue: Waiter[] = []
-  let flushTimer: ReturnType<typeof setTimeout> | null = null
-  let dispatching = false
-
-  const flush = async (): Promise<void> => {
-    if (dispatching || !queue.length) return
-    dispatching = true
-    if (flushTimer) {
-      clearTimeout(flushTimer)
-      flushTimer = null
-    }
-    const batch = queue.splice(0, 5)
-    try {
-      const remain = deadlineMs - Date.now()
-      if (remain < 3_000) {
-        batch.forEach((b) => b.reject(new Error('任务通道整体时间预算耗尽')))
-        return
-      }
-      const r = await dispatchProxyTask(
-        db,
-        'http_fetch',
-        { requests: batch.map((b) => ({ url: b.req.url, method: b.req.method, headers: b.req.headers, body: b.req.body })) },
-        Math.min(20_000, Math.max(3_000, remain)),
-      )
-      if (!r.ok) {
-        const msg = String(r.errors[0] || '代理透传任务执行失败')
-        batch.forEach((b) => b.reject(new Error(msg)))
-        return
-      }
-      const responses = Array.isArray(r.data?.responses) ? r.data.responses : []
-      if (responses.length < batch.length) {
-        // 部分响应 = 批内某个请求失败 (代理遇错短路): 全批作废重试, 不做顺序猜测
-        batch.forEach((b) => b.reject(new Error('代理透传任务部分请求未完成')))
-        return
-      }
-      batch.forEach((b, i) => {
-        const resp = responses[i]
-        b.resolve({
-          status: Number(resp.status || 0),
-          text: String(resp.text || ''),
-          setCookie: Array.isArray(resp.set_cookie) ? resp.set_cookie.map(String) : [],
-        })
-      })
-    } catch (e: any) {
-      batch.forEach((b) => b.reject(new Error(String(e?.message || e).slice(0, 200))))
-    } finally {
-      dispatching = false
-      if (queue.length) void flush() // 队列还有积压 (token 重试等) → 立即下一批
+  return async (url, init) => {
+    const r = await dispatchProxyTask(
+      db,
+      'http_fetch',
+      { requests: [{ url, method: init.method, headers: init.headers, body: init.body || '' }] },
+      timeoutMs,
+    )
+    if (!r.ok) throw new Error(r.errors[0] || '代理透传任务执行失败')
+    const resp = r.data?.responses?.[0]
+    if (!resp) throw new Error('代理透传任务未返回响应')
+    return {
+      status: Number(resp.status || 0),
+      text: String(resp.text || ''),
+      setCookie: Array.isArray(resp.set_cookie) ? resp.set_cookie.map(String) : [],
     }
   }
-
-  return (url, init) =>
-    new Promise<TaskResp>((resolve, reject) => {
-      queue.push({ req: { url, method: init.method, headers: init.headers, body: init.body || '' }, resolve, reject })
-      if (queue.length >= 5) {
-        void flush()
-      } else if (!flushTimer && !dispatching) {
-        flushTimer = setTimeout(() => {
-          flushTimer = null
-          void flush()
-        }, 250)
-      }
-    })
 }
 
 /**
- * 经任务通道拉取卖家订单列表 (v2.1.12 两阶段聚合):
- *   第 1 页单发一探 (拿 totalCount/nextPage + 完成 token 轮换) → 剩余页并发入队,
- *   由聚合传输层合并进同一个 http_fetch 任务 (代理逐个 400ms 限速转发, 风控节奏不变)。
- * 任务往返从逐页 N 次降为最多 2 次, 一键同步 20s 预算内稳稳完成。
- * Cookie 以数据库为唯一真源; 请求由后台 mtopCall 构造并签名, 代理零解析; 响应由
- * 后台无损解析并标准化。超时/失败不抛异常 — errors 如实携带原因, items 可能为空。
+ * 经任务通道拉取卖家订单列表 (逐页透传): Cookie 以数据库为唯一真源, 请求由后台
+ * mtopCall 构造并签名 (含 _m_h5_tk 轮换/token 过期重试), 代理只做原样转发, 响应
+ * 由后台无损解析并标准化。超时/失败不抛异常 — errors 如实携带原因, items 可能为空。
  */
 export async function fetchOrdersViaProxy(
   db: Awaited<ReturnType<typeof getDb>>,
@@ -231,51 +175,33 @@ export async function fetchOrdersViaProxy(
 
   const budgetMs = Math.min(Math.max(opts.timeoutMs || 20_000, 3_000), TASK_TIMEOUT_CAP_MS)
   const deadline = Date.now() + budgetMs
-  const maxPages = Math.min(Math.max(opts.pages || 1, 1), 5)
+  const pages = Math.min(Math.max(opts.pages || 1, 1), 5)
   const queryCode = opts.queryCode === 'NOT_SHIP' ? 'NOT_SHIP' : 'ALL'
-  const transport = batchingTaskTransport(db, deadline)
-
-  const runPage = (page: number) =>
-    fetchSellerOrders(cookieStr, page, queryCode, { transport })
-
-  /* ---- 第 1 页: 单发一探 (token 轮换/失败原因都在这页暴露) ---- */
-  const first = await runPage(1).catch((e: any) => ({
-    items: [] as SellerOrderItem[],
-    nextPage: false,
-    totalCount: 0,
-    retMsg: String(e?.message || e).slice(0, 200),
-    finalCookieStr: cookieStr,
-  }))
-  if (first.finalCookieStr && first.finalCookieStr !== cookieStr) cookieStr = first.finalCookieStr
-  if (first.retMsg) {
-    errors.push(String(first.retMsg).slice(0, 200))
-    return { items, errors, viaProxy: true }
-  }
-  items.push(...first.items)
-
-  /* ---- 剩余页: 按 totalCount 精确并发 (无 totalCount 时最多再拉 1 页探底), 聚合成一次任务 ---- */
-  if (first.nextPage && maxPages > 1) {
-    const totalCount = Math.max(Number(first.totalCount || 0), first.items.length)
-    const knownPages = totalCount > 0 ? Math.ceil(totalCount / 30) : 0
-    const wantPages = knownPages > 0 ? Math.min(maxPages, knownPages) : Math.min(maxPages, 2)
-    const rest = await Promise.all(
-      Array.from({ length: wantPages - 1 }, (_, i) => i + 2).map((page) =>
-        runPage(page).catch((e: any) => ({
-          items: [] as SellerOrderItem[],
-          nextPage: false,
-          totalCount: 0,
-          retMsg: String(e?.message || e).slice(0, 200),
-          finalCookieStr: cookieStr,
-        })),
-      ),
-    )
-    for (const pg of rest) {
-      if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
-      if (pg.retMsg) errors.push(String(pg.retMsg).slice(0, 200))
-      items.push(...pg.items)
+  let page = 1
+  while (page <= pages) {
+    const remain = deadline - Date.now()
+    if (remain < 3_000) {
+      errors.push('任务通道整体时间预算耗尽 (代理未及时领取/回报), 已拉取部分页')
+      break
     }
+    const pg = await fetchSellerOrders(cookieStr, page, queryCode, {
+      transport: taskChannelTransport(db, remain),
+    }).catch((e: any) => ({
+      items: [] as SellerOrderItem[],
+      nextPage: false,
+      totalCount: 0,
+      retMsg: String(e?.message || e).slice(0, 200),
+      finalCookieStr: cookieStr,
+    }))
+    if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
+    if (pg.retMsg) {
+      errors.push(String(pg.retMsg).slice(0, 200))
+      break
+    }
+    items.push(...pg.items)
+    if (!pg.nextPage || !pg.items.length) break
+    page++
   }
-
   // _m_h5_tk 轮换回写 (与直连/网关模式同语义), 保证下次请求用最新签名凭证
   if (cookieStr !== String(acct?.value || '')) {
     await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, id]).catch(() => {})
