@@ -17,7 +17,7 @@ import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
 import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
-import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders, cookieIdentityMismatch } from './mtop'
+import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders, cookieIdentityMismatch, classifyMtopFailure } from './mtop'
 import { upsertSoldOrders } from './order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
 import { isGatewayMode } from './gateway'
@@ -257,12 +257,12 @@ async function pickOrderIdDirect(
 ): Promise<{ orderId: string; source: string }> {
   const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
   const cookieStr = String(acct?.value || '')
-  if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }
+  if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失 — 需要重新扫码登录' }
   const pg = await fetchSellerOrders(cookieStr, 1, 'NOT_SHIP')
   if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
     await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, cookieId]).catch(() => {})
   }
-  if (pg.retMsg) return { orderId: '', source: `远程拉单失败: ${pg.retMsg.slice(0, 80)}` }
+  if (pg.retMsg) return { orderId: '', source: `远程拉单失败 — ${classifyMtopFailure(pg.retMsg)}` }
   if (!pg.items.length) return { orderId: '', source: '远程待发货列表为空' }
   await upsertSoldOrders(db, cookieId, pg.items).catch(() => {})
   const pending = pg.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
@@ -310,7 +310,8 @@ async function pickOrderIdFromRemote(
         }
       }
       const pr = await fetchOrdersViaProxy(db, cookieId, { queryCode: 'NOT_SHIP', pages: 1, timeoutMs: 12_000 })
-      if (pr.errors.length && !pr.items.length) return { orderId: '', source: `代理拉单失败: ${pr.errors.join('; ').slice(0, 120)}` }
+      if (pr.errors.length && !pr.items.length)
+        return { orderId: '', source: `代理拉单失败 — ${pr.errors.map((x) => classifyMtopFailure(x)).join('; ').slice(0, 150)}` }
       await upsertSoldOrders(db, cookieId, pr.items).catch(() => {})
       const pending = pr.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
       const hit =
@@ -327,7 +328,7 @@ async function pickOrderIdFromRemote(
     }
     return await pickOrderIdDirect(db, cookieId, itemId, buyerId)
   } catch (e: any) {
-    return { orderId: '', source: `远程拉单异常: ${String(e?.message || e).slice(0, 80)}` }
+    return { orderId: '', source: `远程拉单异常 — ${classifyMtopFailure(String(e?.message || e))}` }
   }
 }
 
@@ -420,14 +421,14 @@ export async function handleChatEvent(
         logWarn(`[${cookieId}] 付款卡片未含订单号, 远程拉单命中 ${orderId} (${remote.source}) 触发发货`)
       } else {
         logWarn(`[${cookieId}] 付款触发订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
-        // 决策日志可见: 用户已付款, 仅订单号暂未定位 (付款卡片丢失订单号); 附卡片原文摘要 + 远程拉单原因供排查
+        // 决策日志一眼清: reply_text 直接写明未发货的明确原因 (cookie 失效/需扫码/拉单失败/代理侧), 卡片原文摘要落 error_message 供排查
         // (v2.1.14) 不再落 delivery_failed (红色「发货失败」误导排查), 改落 payment_received (琥珀色「用户已付款」)
         await addLog(db, cookieId, msg, opts, {
           process_status: 'skipped',
           decision_reason: 'payment_received',
           reply_strategy: 'none',
-          reply_text: '用户已付款, 启动自动发货!',
-          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
+          reply_text: `用户已付款, 自动发货未启动 — 原因: ${remote.source.slice(0, 200)}`,
+          error_message: `订单号未定位: 付款卡片未含订单号且本地库无可发货订单, 远程拉单落空 (${remote.source}) | 卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
         })
         return []
       }
@@ -779,13 +780,13 @@ export async function handleSystemEvent(
         logWarn(`[${cookieId}] 系统卡片未含订单号, 远程拉单命中 ${remote.orderId} (${remote.source}) 触发发货`)
       } else {
         logWarn(`[${cookieId}] 付款事件订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
-        // (v2.1.14) 同上: 用户已付款语义, 不再落 delivery_failed
+        // (v2.1.14) 同上: 用户已付款语义, 不再落 delivery_failed; reply_text 直接写明未发货原因
         await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
           process_status: 'skipped',
           decision_reason: 'payment_received',
           reply_strategy: 'none',
-          reply_text: '用户已付款, 启动自动发货!',
-          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)} | ${remote.source}`,
+          reply_text: `用户已付款, 自动发货未启动 — 原因: ${remote.source.slice(0, 200)}`,
+          error_message: `订单号未定位: 系统卡片未含订单号且本地库无可发货订单, 远程拉单落空 (${remote.source}) | 卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
         })
         return []
       }
@@ -1715,10 +1716,9 @@ async function autoDeliver(
         .catch(() => {})
       logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货: ${confirm.success ? '成功 (发货凭证已提交平台)' : `失败 (${confirm.message.slice(0, 120)})`}`)
       if (!confirm.success) {
-        // (v2.1.16) 平台发货未达成 → 不标记已发货/不落发货记录, 发货内容也不降级为聊天消息。
-        // 不再落红色「发货失败」日志/弹失败通知: 典型场景是发货先于付款事件到达 (买家拍下未付款),
-        // 平台如实报 ORDER_STATUS_ERROR 属瞬时误报 — 后续 [记得及时发货]/付款卡片重报 会经防重链
-        // 自动重试并正常发货 (失败时未设冷却、未标记已发货, 重试链路原样保留), 仅保留 console 记录可排查
+        // 决策日志必留痕: 发货接口失败的明确原因 (cookie 失效需扫码/风控/代理网关不可达/订单状态瞬时误报),
+        // message 已由 mtop 层归类为「一眼清」结论; 未标记已发货、未设冷却, 后续付款卡片/提醒发货触发自动重试
+        await failLog(`订单 ${orderId} 自动发货失败 — 无需邮寄发货接口未达成: ${confirm.message.slice(0, 300)} (未标记已发货, 后续触发将自动重试)`)
         return []
       }
       viaVoucher = voucherTexts.length > 0
@@ -1831,7 +1831,8 @@ async function autoDeliver(
       // (曾致: 占位被删 → 代理「决策超时失效」无限重报 → 不发货+无日志死循环)。
       // 落 delivery_failed 决策日志 + 通知, 决策正常终结, 代理重报后由防重链安全重试。
       logWarn(`[${cookieId}] 订单 ${orderId} 自动发货异常: ${String(e?.message || e).slice(0, 200)}`)
-      await failLog(`自动发货异常: ${String(e?.message || e).slice(0, 350)}`)
+      // 异常原因归类 (cookie 失效/需扫码/风控/代理网关不可达/平台报错), 决策日志一眼清
+      await failLog(`自动发货异常 — ${classifyMtopFailure(String(e?.message || e)) || '未知异常'}`)
       dispatchNotify(
         {
           type: 'delivered',

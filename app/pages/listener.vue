@@ -226,7 +226,7 @@
           <div class="rounded-lg border border-slate-200 dark:border-slate-700 divide-y divide-slate-200 dark:divide-slate-700">
             <div class="p-3 space-y-1">
               <p class="font-medium text-slate-700 dark:text-slate-200">模式一 · 任务模式（默认，无需公网 IP）</p>
-              <p class="text-slate-500 dark:text-slate-400">.env 只配 <code>XY_ADMIN_URL</code> + <code>XY_ENGINE_TOKEN</code>（不填 XY_PROXY_PORT）：代理主动外呼本后台 —— 拉账号配置 → 建闲鱼消息长连接 → 上报事件/领任务；订单拉取走任务通道（后台构造签名请求，代理 3s 轮询领取 http_fetch 原样转发后回报原始响应，解析全部在后台完成）。无需公网入站端口，能出网即可。</p>
+              <p class="text-slate-500 dark:text-slate-400">.env 只配 <code>XY_ADMIN_URL</code> + <code>XY_ENGINE_TOKEN</code>（不填 XY_PROXY_PORT）：代理主动外呼本后台 —— 拉账号配置 → 建闲鱼消息长连接 → 上报事件/领任务；消息会话等数据只发往 .env 里配置的后台，<b>多主服务器用 <code>|</code> 分隔最多 3 个（拆分后自动去头尾空格）并行推送</b>，同账号多后台只建一条闲鱼连接（靠前后台优先），决策动作/任务按各自后台独立领取与回报；订单拉取走任务通道（后台构造签名请求，代理 3s 轮询领取 http_fetch 原样转发后回报原始响应，解析全在后台完成）。无需公网入站端口，能出网即可。</p>
             </div>
             <div class="p-3 space-y-1">
               <p class="font-medium text-slate-700 dark:text-slate-200">模式二 · 任务模式 + 透传网关（推荐，需公网固定 IP）</p>

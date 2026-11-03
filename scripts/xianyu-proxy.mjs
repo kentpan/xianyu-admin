@@ -27,14 +27,16 @@
  *      到 h5api 被墙 500 超时), 需服务器公网固定 IP + 防火墙放行端口, 引擎行登记该地址。
  *
  * 环境变量:
- *   XY_ADMIN_URL     后台地址 (必填, 如 https://xianyu-admin.pages.dev)
+ *   XY_ADMIN_URL     后台地址 (必填, 如 https://xianyu-admin.pages.dev;
+ *                    支持多主服务器: `|` 分隔最多 3 个, 拆分后 trim 去头尾空格,
+ *                    消息/会话等事件并行推送到全部活跃后台; 同账号只建一条闲鱼连接)
  *   XY_ENGINE_TOKEN  引擎接入令牌 (必填, 后台「监听服务」页该代理行的接入令牌;
  *                    透传网关鉴权复用同一令牌, Bearer XY_ENGINE_TOKEN)
  *   XY_PROXY_PORT    本地健康检查端口 (选填, 默认关闭; 绑定全部网卡, 开启后同端口提供
  *                    GET /health 运行状态 + POST /gateway mtop 透传网关, Bearer 鉴权)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.14; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.1.20; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -100,22 +102,37 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.1.14 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.14'
+// XY_PKG_VERSION 读取, 缺省 2.1.20 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.1.20'
 
-const ADMIN_URL = String(process.env.XY_ADMIN_URL || '').replace(/\/+$/, '')
+// (v2.1.20) 多主服务器支持: XY_ADMIN_URL 支持 `|` 分隔最多 3 个后台地址 (拆分后 trim 去空格,
+// 去重, 取前 3 个)。消息/会话等事件数据并行推送到全部「活跃」后台 — 数据只发往本 .env
+// 配置的服务器, 谁配了本代理谁收数据; 多后台同账号只建一条闲鱼长连接 (靠前后台优先),
+// 决策动作/任务按各自后台独立领取与回报 (log_id/task_id 各后台独立编号, 绝不串号)。
+let ADMIN_URLS = [
+  ...new Set(
+    String(process.env.XY_ADMIN_URL || '')
+      .split('|')
+      .map((s) => s.trim().replace(/\/+$/, ''))
+      .filter(Boolean),
+  ),
+]
+if (ADMIN_URLS.length > 3) {
+  log(`XY_ADMIN_URL 配置了 ${ADMIN_URLS.length} 个后台地址, 超出上限只取前 3 个: ${ADMIN_URLS.slice(0, 3).join(' | ')}`)
+  ADMIN_URLS = ADMIN_URLS.slice(0, 3)
+}
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
 const DEFAULT_POLL_SECONDS = Math.max(10, Math.round(Number(process.env.XY_POLL_SECONDS || 30)) || 30)
 
-if (!ADMIN_URL || !ENGINE_TOKEN) {
+if (!ADMIN_URLS.length || !ENGINE_TOKEN) {
   console.error('[xianyu-proxy] 缺少配置: XY_ADMIN_URL / XY_ENGINE_TOKEN 为必填项, 进程退出')
   console.error('  三种配置方式任选其一:')
   console.error('  ① 真实环境变量: XY_ADMIN_URL=... XY_ENGINE_TOKEN=... node xianyu-proxy.mjs')
   console.error('  ② .env 文件: 工作目录或脚本同目录放 .env(每行 KEY=VALUE), 启动时自动加载' + (dotenvInfo ? '' : '(当前两处均未找到 .env)'))
   console.error('  ③ 面板变量页: Wispbyte 等面板「Environment」页写入的就是 .env 文件, 本脚本会自动读取; Startup/启动页的变量才是真环境变量, 两处是分开的')
   console.error('  示例 .env:')
-  console.error('    XY_ADMIN_URL=https://你的后台域名')
+  console.error('    XY_ADMIN_URL=https://你的后台域名 (多主服务器用 | 分隔最多 3 个, 如 https://a|https://b)')
   console.error('    XY_ENGINE_TOKEN=后台「监听服务」页该代理行的接入令牌')
   process.exit(1)
 }
@@ -124,9 +141,9 @@ if (dotenvInfo && dotenvInfo.injected.length) {
   log(`.env 配置文件已加载: ${dotenvInfo.path} (注入: ${dotenvInfo.injected.join(', ')}; 已存在的环境变量优先不被覆盖)`)
 }
 
-const CONFIG_URL = `${ADMIN_URL}/api/engine/config`
-const EVENTS_URL = `${ADMIN_URL}/api/engine/events`
-const TASKS_URL = `${ADMIN_URL}/api/engine/tasks`
+const CONFIG_URLS = ADMIN_URLS.map((b) => `${b}/api/engine/config`)
+const EVENTS_URLS = ADMIN_URLS.map((b) => `${b}/api/engine/events`)
+const TASKS_URLS = ADMIN_URLS.map((b) => `${b}/api/engine/tasks`)
 
 /** 任务轮询间隔秒 (选填, 默认 3): http_fetch 等下发任务的领取频率, 越短后台等得越短 */
 const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
@@ -134,7 +151,7 @@ const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_T
 // 启动即打印生效配置全貌: 后台地址是排查「全部超时」的第一现场 —— 配错了/指向了旧
 // 后台, 这一行日志直接可见, 不用再猜。
 log(
-  `启动配置: 后台=${ADMIN_URL} | 接入令牌=${ENGINE_TOKEN.slice(0, 6)}…(长度 ${ENGINE_TOKEN.length}) | 脚本版本=v${SCRIPT_VERSION} | ` +
+  `启动配置: 后台=${ADMIN_URLS.join(' | ')}${ADMIN_URLS.length > 1 ? ` (多后台并行推送 ${ADMIN_URLS.length} 个)` : ''} | 接入令牌=${ENGINE_TOKEN.slice(0, 6)}…(长度 ${ENGINE_TOKEN.length}) | 脚本版本=v${SCRIPT_VERSION} | ` +
     `配置轮询=${DEFAULT_POLL_SECONDS}s | 任务轮询=${DEFAULT_TASK_POLL_SECONDS}s | 透传网关=${PROXY_PORT ? `开启 (端口 ${PROXY_PORT})` : '关闭'} | ` +
     `配置来源=${dotenvInfo ? dotenvInfo.path : '进程环境变量'}`,
 )
@@ -565,12 +582,7 @@ async function fetchTokenDetailed(cookieStr, deviceId) {
     const ret = Array.isArray(json?.ret) ? json.ret : []
     const merged = { ...cookies }
     try {
-      const setCookies = res.headers.getSetCookie?.() || []
-      for (const sc of setCookies) {
-        const [pair] = sc.split(';')
-        const eq = pair.indexOf('=')
-        if (eq > 0) merged[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim()
-      }
+      applySetCookies(merged, res.headers.getSetCookie?.() || [])
     } catch {}
     const token = json?.data?.accessToken || ''
     const punishUrl = typeof json?.data?.url === 'string' ? json.data.url : ''
@@ -596,6 +608,10 @@ const TOKEN_REFRESH_MS = 3600 * 1000
 // cookie 保活 (复刻参考项目 cookie_refresh_loop): 3 分钟周期, 消息活动后 5 分钟冷却
 const COOKIE_KEEPALIVE_MS = 180 * 1000
 const COOKIE_MSG_COOLDOWN_MS = 300 * 1000
+// web 会话保活 (与后台 ws-client.ts 同源): 30 分钟访问主站一次, 滑动续期 web 登录会话 —
+// token API 不能续期 web 会话, 不做这个每 ~24h 必被服务端踢下线要求重新扫码
+const WEB_KEEPALIVE_MS = 30 * 60 * 1000
+const WEB_HOME_URL = 'https://www.goofish.com/'
 const SEND_WINDOW_MS = 60_000
 const SEND_MAX_PER_WINDOW = 12
 
@@ -606,6 +622,33 @@ function jitter(ms, ratio = 0.15) {
 function backoffDelay(failures) {
   const base = Math.min(300_000, 5_000 * Math.pow(2, Math.min(failures, 6)))
   return jitter(base, 0.2)
+}
+
+/** Set-Cookie 合并 (过期删除感知): Max-Age=0 / Expires 已过 → 删除, 否则覆盖 (与后台 ws-client.ts 同源)。 */
+function applySetCookies(record, setCookieList) {
+  for (const sc of setCookieList || []) {
+    const segments = String(sc || '').split(';')
+    const pair = segments[0] || ''
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    const name = pair.slice(0, eq).trim()
+    const value = pair.slice(eq + 1).trim()
+    if (!name) continue
+    let expired = false
+    for (const attr of segments.slice(1)) {
+      const a = attr.trim()
+      const al = a.toLowerCase()
+      if (al.startsWith('max-age=')) {
+        const n = Number(a.slice(8))
+        if (Number.isFinite(n) && n <= 0) expired = true
+      } else if (al.startsWith('expires=')) {
+        const ts = Date.parse(a.slice(8))
+        if (Number.isFinite(ts) && ts <= Date.now()) expired = true
+      }
+    }
+    if (expired) delete record[name]
+    else record[name] = value
+  }
 }
 
 function sleep(ms) {
@@ -642,6 +685,7 @@ class XianyuAccountClient {
     this.tokenTimer = null
     this.heartbeatTimer = null
     this.cookieKeepaliveTimer = null
+    this.webKeepaliveTimer = null
     this.cookieRefreshing = false
     this.riskCooldownUntil = 0
     this.riskLadderIndex = 0
@@ -684,6 +728,42 @@ class XianyuAccountClient {
     this.cookieKeepaliveTimer = setInterval(() => {
       if (!this.stopped) void this.maybeCookieKeepalive()
     }, jitter(COOKIE_KEEPALIVE_MS, 0.1))
+    // web 会话保活: 每 30 分钟访问主站一次 (滑动续期 web 登录会话, 与后台 ws-client.ts 同源)
+    this.webKeepaliveTimer = setInterval(() => {
+      if (!this.stopped) void this.webSessionKeepalive()
+    }, jitter(WEB_KEEPALIVE_MS, 0.1))
+  }
+
+  async webSessionKeepalive() {
+    if (this.stopped || this.cookieRefreshing) return
+    if (Date.now() < this.riskCooldownUntil) return
+    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
+    this.cookieRefreshing = true
+    try {
+      const res = await fetch(WEB_HOME_URL, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          'User-Agent': resolveChromeUA().ua,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          Cookie: this.cookieStr,
+        },
+        signal: AbortSignal.timeout(20_000),
+      })
+      // 只续期不回写 (v2.1.18 事故根治): 滑动续期在服务端收到请求时已完成。主站网页
+      // 上下文的 Set-Cookie 与 mtop/token 链路不同上下文, 合并进本地 cookie 会污染
+      // token 签名身份, 经 onCookieRotated 回写后台后更会污染后台发货链 (远程拉单/
+      // 发货接口) 的签名 cookie 并引发每 30min 一次的无意义热替换 — 一律不合并。
+      const location = res.headers.get('location') || ''
+      if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {
+        log(`账号 ${this.cookieId} web 会话保活: 主站重定向登录页 (会话可能已失效, 以 token 链路判定为准)`)
+      }
+    } catch {
+      // 主站不可达/网络异常: 静默, 下一周期重试
+    } finally {
+      this.cookieRefreshing = false
+    }
   }
 
   async maybeCookieKeepalive() {
@@ -699,11 +779,11 @@ class XianyuAccountClient {
 
   async stop() {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer, this.webKeepaliveTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
-    this.tokenTimer = this.heartbeatTimer = this.cookieKeepaliveTimer = null
+    this.tokenTimer = this.heartbeatTimer = this.cookieKeepaliveTimer = this.webKeepaliveTimer = null
     this.generation++
     this.setState('disabled', '已停止')
     try {
@@ -862,10 +942,14 @@ class XianyuAccountClient {
     try {
       const { token, mergedCookies, ret, punishUrl } = await fetchTokenDetailed(this.cookieStr, this.deviceId)
       const verdict = classifyTokenError(ret)
-      const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
-      if (mergedStr !== this.cookieStr) {
-        this.cookieStr = mergedStr
-        this.sink.onCookieRotated(this.cookieId, mergedStr)
+      // 登录失效 (auth) 响应的 Set-Cookie 不回写 (与后台 ws-client.ts 同策略: 失效响应
+      // 的往往是清理指令/空值, 合并只会毒化仍有效的会话)
+      if (verdict !== 'auth') {
+        const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
+        if (mergedStr !== this.cookieStr) {
+          this.cookieStr = mergedStr
+          this.sink.onCookieRotated(this.cookieId, mergedStr)
+        }
       }
       if (verdict === 'ok' && token) {
         this.token = token
@@ -971,6 +1055,11 @@ let heartbeatSeconds = 15
 let stopped = false
 let configFailStreak = 0
 let pollOkCount = 0
+// (v2.1.20) 多后台运行态: 活跃后台下标集合 (配置轮询驱动, 首轮前视为全部活跃);
+// 事件连续失败自动暂停推该后台 (防一个死后台把队列堵住拖累其它后台), 配置轮询成功即恢复
+let activeAdmins = new Set(ADMIN_URLS.map((_, i) => i))
+const adminEventFailStreak = new Map()
+const dupWarnAt = new Map()
 
 // 上报队列: 状态变化/事件即时入队, 合并窗口批量 POST (后台限速 120/min)
 const reportQueue = []
@@ -1099,37 +1188,103 @@ async function flushReports() {
     return
   }
   lastFlushAt = now
-  const events = reportQueue.splice(0, 100)
-  // 事件批次画像: 条数 / 类型分布 / 首尾 event_id, 失败日志一眼可定位是哪批什么事件
+  const batch = reportQueue.splice(0, 100)
+  // (v2.1.20) 多后台路由拆分: action_result 只回执给决策所属后台 (log_id 是各后台独立
+  // 编号, 广播会串号误标记); 其余事件 (消息会话/风控/状态) 广播给全部活跃后台 —
+  // 数据只发往 .env XY_ADMIN_URL 配置的服务器, 单个后台挂了不拖累其它后台
+  const broadcast = []
+  const perAdmin = new Map()
+  for (const entry of batch) {
+    const admin = Number(entry?._admin ?? -1)
+    if (Number.isInteger(admin) && admin >= 0 && admin < ADMIN_URLS.length) {
+      if (!perAdmin.has(admin)) perAdmin.set(admin, [])
+      perAdmin.get(admin).push(entry)
+    } else {
+      broadcast.push(entry)
+    }
+  }
+  const strip = (list) => list.map(({ _admin, ...rest }) => rest)
+  const targets = (activeAdmins.size ? [...activeAdmins] : ADMIN_URLS.map((_, i) => i)).filter(
+    (i) => broadcast.length > 0 || perAdmin.has(i),
+  )
+  if (!targets.length) {
+    reportQueue.unshift(...batch)
+    scheduleFlush(500)
+    return
+  }
+  // 事件批次画像: 条数 / 类型分布, 失败日志一眼可定位是哪批什么事件
   const typeCount = {}
-  for (const ev of events) typeCount[String(ev?.type || '?')] = (typeCount[String(ev?.type || '?')] || 0) + 1
-  const eventSummary = `${events.length}条 [${Object.entries(typeCount).map(([t, n]) => `${t}×${n}`).join(' ')}]`
+  for (const ev of broadcast) typeCount[String(ev?.type || '?')] = (typeCount[String(ev?.type || '?')] || 0) + 1
+  const eventSummary = `${batch.length}条 [${Object.entries(typeCount).map(([t, n]) => `${t}×${n}`).join(' ')}]`
   const status = {
     accounts: [...accountStates.entries()].map(([id, s]) => ({ id, state: s.state, detail: s.detail || '' })),
   }
-  try {
-    // 30s 超时 + 失败换新连接重试一次 (与配置轮询同款链路加固, 高丢包链路实测半数请求超时);
-    // 快速 ACK 模式下后台秒回, 决策 (AI 可达 20~30s) 由 pullActions 异步回收; 重报因
-    // event_id 去重安全 (服务端原样重放不重算)。旧版后台无拉取协议时同步返回动作, 同样兼容
-    const resp = await apiCallWithRetry(EVENTS_URL, { status, events }, 30_000)
-    const actions = Array.isArray(resp?.actions) ? resp.actions : []
-    await executeActions(actions)
-    const pullIds = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
-    if (pullIds.length) await pullActions(pullIds, events)
-  } catch (e) {
-    if (e?.fatal) {
-      log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
-      process.exit(1)
+  // 并行推送全部活跃后台 (各后台独立去重, 重报安全)
+  const results = await Promise.allSettled(
+    targets.map((i) =>
+      apiCallWithRetry(EVENTS_URLS[i], { status, events: [...strip(broadcast), ...strip(perAdmin.get(i) || [])] }, 30_000),
+    ),
+  )
+  const failedIdx = []
+  let rateLimitedSecs = 0
+  for (let k = 0; k < targets.length; k++) {
+    const i = targets[k]
+    const r = results[k]
+    if (r.status === 'rejected') {
+      failedIdx.push(i)
+      const e = r.reason
+      if (e?.fatal) {
+        handleFatalAdmin(i, e)
+      } else {
+        const streak = (adminEventFailStreak.get(i) || 0) + 1
+        adminEventFailStreak.set(i, streak)
+        if (streak >= 5) {
+          activeAdmins.delete(i)
+          log(`后台#${i + 1} (${adminHost(i)}) 事件上报连续失败 ${streak} 次, 暂停推送该后台 (其余后台不受影响, 配置轮询成功后自动恢复)`)
+        } else {
+          log(`上报失败: 后台#${i + 1} (${adminHost(i)}) POST events 批次 ${eventSummary} — ${e?.message}`)
+        }
+        if (e?.rateLimited) rateLimitedSecs = Math.max(rateLimitedSecs, Number(e.rateLimited) || 5)
+      }
+      continue
     }
-    reportQueue.unshift(...events)
-    if (e?.rateLimited) {
-      log(`上报失败: POST events (${eventSummary}, 队列回队后 ${reportQueue.length} 条) — ${e.message}`)
-      await sleep(Math.min(e.rateLimited * 1000, 30_000))
-    } else {
-      log(`上报失败: POST events 批次 ${eventSummary} (队列回队后 ${reportQueue.length} 条) — ${e?.message} — 已回队等待重试`)
-      await sleep(3000)
+    adminEventFailStreak.set(i, 0)
+    try {
+      const resp = r.value
+      const actions = Array.isArray(resp?.actions) ? resp.actions : []
+      if (actions.length) await executeActions(actions, i)
+      const pullIds = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
+      if (pullIds.length) await pullActions(pullIds, [...broadcast, ...(perAdmin.get(i) || [])], i)
+    } catch (e) {
+      if (e?.fatal) handleFatalAdmin(i, e)
+      else log(`后台#${i + 1} (${adminHost(i)}) 动作执行/决策拉取异常: ${e?.message}`)
     }
+  }
+  if (failedIdx.length) {
+    // 回队: 广播事件整体回队 (成功后台按 event_id 去重安全); action_result 只回给失败的后台
+    for (const ev of broadcast) reportQueue.unshift(ev)
+    for (const i of failedIdx) reportQueue.unshift(...(perAdmin.get(i) || []))
+    if (rateLimitedSecs) await sleep(Math.min(rateLimitedSecs * 1000, 30_000))
+    else await sleep(3000)
     scheduleFlush(500)
+  }
+}
+
+/** 多后台致命错误 (鉴权失效): 单后台保持旧契约退出; 多后台只停推该后台, 不拖死其它后台。 */
+function handleFatalAdmin(adminIdx, e) {
+  if (ADMIN_URLS.length === 1) {
+    log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
+    process.exit(1)
+  }
+  activeAdmins.delete(adminIdx)
+  log(`后台#${adminIdx + 1} (${adminHost(adminIdx)}) 致命错误: ${e.message} — 已停推该后台 (其余后台不受影响, 修正令牌后重启生效)`)
+}
+
+function adminHost(adminIdx) {
+  try {
+    return new URL(ADMIN_URLS[adminIdx]).hostname
+  } catch {
+    return String(ADMIN_URLS[adminIdx] || '?').slice(0, 60)
   }
 }
 
@@ -1138,29 +1293,29 @@ async function flushReports() {
  * 动作随拉取响应返回后照常人化执行 (executedActions 按 log_id 去重, 重放绝不重发)。
  * 占位超时被后台判失效 (expired) 或达拉取上限仍未完成 → 事件重新上报自愈。
  */
-async function pullActions(ids, originEvents) {
+async function pullActions(ids, originEvents, adminIdx = 0) {
   let remaining = ids.slice()
   for (let attempt = 0; attempt < 72 && remaining.length && !stopped; attempt++) {
     await sleep(attempt === 0 ? 1200 : 2500)
     let resp
     try {
-      resp = await apiCallWithRetry(EVENTS_URL, { pull: remaining }, 30_000)
+      resp = await apiCallWithRetry(EVENTS_URLS[adminIdx], { pull: remaining }, 30_000)
     } catch (e) {
       if (e?.fatal) throw e
       continue // 网络抖动继续拉, 拉取上限兜底
     }
     const actions = Array.isArray(resp?.actions) ? resp.actions : []
-    if (actions.length) await executeActions(actions)
+    if (actions.length) await executeActions(actions, adminIdx)
     const expired = Array.isArray(resp?.expired) ? resp.expired.map(String) : []
     if (expired.length) {
-      log(`决策超时失效 ${expired.length} 个事件, 重新上报`)
+      log(`决策超时失效 ${expired.length} 个事件 (后台#${adminIdx + 1}), 重新上报`)
       reportQueue.unshift(...originEvents)
       scheduleFlush(500)
     }
     remaining = Array.isArray(resp?.pending) ? resp.pending.map(String) : []
   }
   if (remaining.length) {
-    log(`${remaining.length} 个事件决策未完成, 重新上报`)
+    log(`${remaining.length} 个事件决策未完成 (后台#${adminIdx + 1}), 重新上报`)
     reportQueue.unshift(...originEvents)
     scheduleFlush(500)
   }
@@ -1182,25 +1337,26 @@ function pruneExecutedActions() {
   }
 }
 
-async function executeActions(actions) {
+async function executeActions(actions, adminIdx = 0) {
   const logCounter = new Map()
   for (const action of actions) {
     const client = clients.get(String(action.account || ''))
     if (!client) {
-      log(`动作丢弃: 账号 ${action.account} 不由本代理托管`)
+      log(`动作丢弃 (后台#${adminIdx + 1}): 账号 ${action.account} 不由本代理托管`)
       continue
     }
     const logId = Number(action.log_id || 0)
     let actionKey = ''
     if (logId > 0) {
+      // actionKey 带后台下标: log_id 是各后台独立编号, 不带前缀会跨后台误判「已执行过」
       const seq = logCounter.get(logId) || 0
       logCounter.set(logId, seq + 1)
-      actionKey = `${logId}#${seq}`
+      actionKey = `a${adminIdx}:${logId}#${seq}`
       const done = executedActions.get(actionKey)
       if (done) {
-        // 同一动作的重放 (上轮响应丢失后的重试): 不重发, 仅补报执行结果
-        if (done.ok) log(`动作已执行过, 跳过重发 (log ${logId})`)
-        enqueueReport({ type: 'action_result', account: String(action.account || ''), log_id: logId, ok: done.ok, error: done.error || '' })
+        // 同一动作的重放 (上轮响应丢失后的重试): 不重发, 仅补报执行结果 (只回决策所属后台)
+        if (done.ok) log(`动作已执行过, 跳过重发 (后台#${adminIdx + 1} log ${logId})`)
+        enqueueReport({ type: 'action_result', _admin: adminIdx, account: String(action.account || ''), log_id: logId, ok: done.ok, error: done.error || '' })
         continue
       }
     }
@@ -1210,7 +1366,7 @@ async function executeActions(actions) {
       const delay = Math.max(0, Math.round(Number(action.delay_ms || 0)))
       if (action.type === 'send_text') {
         await client.sendText(String(action.chat_id), String(action.to_user_id), String(action.text || ''), delay)
-        log(`已发送文本 → 账号 ${action.account} 会话 ${action.chat_id}`)
+        log(`已发送文本 (后台#${adminIdx + 1}) → 账号 ${action.account} 会话 ${action.chat_id}`)
       } else if (action.type === 'send_image') {
         await client.sendImage(
           String(action.chat_id),
@@ -1220,7 +1376,7 @@ async function executeActions(actions) {
           Number(action.height || 600),
           delay,
         )
-        log(`已发送图片 → 账号 ${action.account} 会话 ${action.chat_id}`)
+        log(`已发送图片 (后台#${adminIdx + 1}) → 账号 ${action.account} 会话 ${action.chat_id}`)
       }
     } catch (e) {
       ok = false
@@ -1230,7 +1386,7 @@ async function executeActions(actions) {
     if (logId > 0) {
       executedActions.set(actionKey, { ok, error: err, at: Date.now() })
       pruneExecutedActions()
-      enqueueReport({ type: 'action_result', account: String(action.account || ''), log_id: logId, ok, error: err })
+      enqueueReport({ type: 'action_result', _admin: adminIdx, account: String(action.account || ''), log_id: logId, ok, error: err })
     }
   }
 }
@@ -1313,60 +1469,19 @@ async function apiCallWithRetry(url, body, timeoutMs = 30_000) {
   }
 }
 
-async function fetchConfigWithRetry() {
-  return apiCallWithRetry(CONFIG_URL)
-}
-
 async function pollConfigOnce() {
-  try {
-    const cfg = await fetchConfigWithRetry()
-    configFailStreak = 0
-    const wasActive = engineActive
-    engineActive = !!cfg.active
-    if (cfg.intervals?.poll_seconds) {
-      pollSeconds = Math.max(10, Math.round(Number(cfg.intervals.poll_seconds) || DEFAULT_POLL_SECONDS))
-    }
-    if (cfg.intervals?.heartbeat_seconds) {
-      heartbeatSeconds = Math.min(60, Math.max(5, Math.round(Number(cfg.intervals.heartbeat_seconds) || 15)))
-    }
-
-    if (!engineActive) {
-      if (wasActive || clients.size) {
-        log('当前引擎非使用中 (备用状态), 全部账号下线 (多引擎互斥)')
-        for (const id of [...clients.keys()]) await stopClient(id)
-      }
-      return
-    }
-
-    // 账号对齐: cookie 以后台下发的为准 (用户重新扫码生效), 本地滚动合并值
-    // 仅作连接期使用; 后台值有变化时热替换 (下轮重连生效)
-    const wanted = new Map(
-      (Array.isArray(cfg.accounts) ? cfg.accounts : []).map((a) => [a.id && String(a.id), accountEntryFromConfig(a)]),
-    )
-
-    for (const [id] of [...clients]) {
-      if (!wanted.has(id)) await stopClient(id)
-    }
-    for (const [, account] of wanted) {
-      const client = clients.get(account.id)
-      if (client) {
-        const effective = latestCookies.get(account.id) || ''
-        if (account.cookies && account.cookies !== effective) {
-          client.setCookieStr(account.cookies)
-          latestCookies.set(account.id, account.cookies)
-          log(`账号 ${account.id} Cookie 已按后台更新热替换`)
-        }
-        continue
-      }
-      createClient(account)
-    }
-
-    if (!wasActive && engineActive) log(`引擎已激活: 托管 ${wanted.size} 个账号`)
-    pollOkCount += 1
-    if (pollOkCount % 10 === 1) {
-      log(`配置轮询正常: active=${engineActive}, 下发账号 ${wanted.size}, 本地连接 ${clients.size}` + (pollOkCount === 1 ? '' : ` (连续成功 ${pollOkCount}; 成功默认静默, 每 10 次打印一次)`))
-    }
-  } catch (e) {
+  // (v2.1.20) 多后台配置轮询: 并行拉全部后台, 成功者参与账号合并;
+  // 全部失败才走旧失败路径 (连续失败自检)。单后台行为与旧版完全一致。
+  const results = await Promise.allSettled(ADMIN_URLS.map((_, i) => apiCallWithRetry(CONFIG_URLS[i])))
+  const okConfigs = [] // [adminIdx, cfg] 按 XY_ADMIN_URL 配置顺序 (同账号靠前后台优先)
+  const failures = []
+  for (let i = 0; i < ADMIN_URLS.length; i++) {
+    const r = results[i]
+    if (r.status === 'fulfilled') okConfigs.push([i, r.value])
+    else failures.push([i, r.reason])
+  }
+  if (!okConfigs.length) {
+    const e = failures[0][1]
     if (e?.fatal) {
       log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
       process.exit(1)
@@ -1379,6 +1494,81 @@ async function pollConfigOnce() {
     // 连续失败自动网络自检(第 2 次触发, 此后每 10 次复查): 定位 DNS/TCP/SNI 过滤/整机断路
     configFailStreak += 1
     if (configFailStreak === 2 || configFailStreak % 10 === 0) await diagnoseNetwork()
+    return
+  }
+  configFailStreak = 0
+  const wasActive = engineActive
+  // 活跃后台集合: 配置成功且 active=true 的后台 (事件只推活跃后台; 本轮拉取失败的后台
+  // 保留上一轮的活跃判定, 鉴权致命错误才即时摘除)
+  const newActive = new Set()
+  let intervalsApplied = false
+  for (const [i, cfg] of okConfigs) {
+    if (!cfg?.active) continue
+    newActive.add(i)
+    // 轮询/心跳间隔: 取第一个下发 intervals 的活跃后台 (靠前后台优先, 不互相覆盖)
+    if (!intervalsApplied && (cfg.intervals?.poll_seconds || cfg.intervals?.heartbeat_seconds)) {
+      if (cfg.intervals?.poll_seconds) {
+        pollSeconds = Math.max(10, Math.round(Number(cfg.intervals.poll_seconds) || DEFAULT_POLL_SECONDS))
+      }
+      if (cfg.intervals?.heartbeat_seconds) {
+        heartbeatSeconds = Math.min(60, Math.max(5, Math.round(Number(cfg.intervals.heartbeat_seconds) || 15)))
+      }
+      intervalsApplied = true
+    }
+  }
+  activeAdmins = newActive
+  engineActive = newActive.size > 0
+
+  if (!engineActive) {
+    if (wasActive || clients.size) {
+      log('全部后台引擎均非使用中 (备用状态), 全部账号下线 (多引擎互斥)')
+      for (const id of [...clients.keys()]) await stopClient(id)
+    }
+    return
+  }
+
+  // 账号对齐 (多后台合并): 只取活跃后台下发的账号; 同账号被多个后台同时下发时只建
+  // 一条闲鱼长连接 (靠前后台优先) — 双后台同账号并行决策会给买家发两份消息, 连接层
+  // 必须唯一; 事件仍并行推送全部活跃后台 (各后台按自己库里的账号归属自行取舍)。
+  const wanted = new Map()
+  for (const [i, cfg] of okConfigs) {
+    if (!cfg?.active) continue
+    for (const a of Array.isArray(cfg.accounts) ? cfg.accounts : []) {
+      const id = a?.id && String(a.id)
+      if (!id) continue
+      if (wanted.has(id)) {
+        const last = dupWarnAt.get(id) || 0
+        if (Date.now() - last > 10 * 60_000) {
+          dupWarnAt.set(id, Date.now())
+          log(`账号 ${id} 被多个后台同时下发 (后台#${i + 1} 重复), 仅保留靠前后台的连接定义; 事件仍并行推送全部活跃后台`)
+        }
+        continue
+      }
+      wanted.set(id, accountEntryFromConfig(a))
+    }
+  }
+
+  for (const [id] of [...clients]) {
+    if (!wanted.has(id)) await stopClient(id)
+  }
+  for (const [, account] of wanted) {
+    const client = clients.get(account.id)
+    if (client) {
+      const effective = latestCookies.get(account.id) || ''
+      if (account.cookies && account.cookies !== effective) {
+        client.setCookieStr(account.cookies)
+        latestCookies.set(account.id, account.cookies)
+        log(`账号 ${account.id} Cookie 已按后台更新热替换`)
+      }
+      continue
+    }
+    createClient(account)
+  }
+
+  if (!wasActive && engineActive) log(`引擎已激活: 托管 ${wanted.size} 个账号 (活跃后台 ${[...newActive].map((i) => `#${i + 1}`).join(' ')})`)
+  pollOkCount += 1
+  if (pollOkCount % 10 === 1) {
+    log(`配置轮询正常: active=${engineActive}, 活跃后台 ${newActive.size}/${ADMIN_URLS.length}, 下发账号 ${wanted.size}, 本地连接 ${clients.size}` + (pollOkCount === 1 ? '' : ` (连续成功 ${pollOkCount}; 成功默认静默, 每 10 次打印一次)`))
   }
 }
 
@@ -1414,33 +1604,44 @@ async function diagnoseNetwork() {
   if (diagRunning) return
   diagRunning = true
   try {
-    const u = new URL(ADMIN_URL)
+    // (v2.1.20) 逐后台自检 (多后台各查各的链路, 断哪个一眼可见)
+    for (let i = 0; i < ADMIN_URLS.length; i++) await diagnoseAdminNetwork(i)
+  } finally {
+    diagRunning = false
+  }
+}
+
+async function diagnoseAdminNetwork(adminIdx) {
+  const adminUrl = ADMIN_URLS[adminIdx]
+  const tag = ADMIN_URLS.length > 1 ? `后台#${adminIdx + 1} (${adminHost(adminIdx)}) ` : ''
+  try {
+    const u = new URL(adminUrl)
     const host = u.hostname
     const port = Number(u.port) || 443
-    log('网络自检: 拉取连续失败, 自动定位断点 (DNS → TCP → Cloudflare 对照 → 后台域名)...')
+    log(`${tag}网络自检: 拉取连续失败, 自动定位断点 (DNS → TCP → Cloudflare 对照 → 后台域名)...`)
     const [ips, tcpMs, cfOk, targetOk] = await Promise.all([
       dns.promises.lookup(host, { all: true }).catch(() => []),
       tcpConnectMs(host, port),
       fetchTraceOk('https://www.cloudflare.com/cdn-cgi/trace'),
-      fetchTraceOk(`${ADMIN_URL}/cdn-cgi/trace`),
+      fetchTraceOk(`${adminUrl}/cdn-cgi/trace`),
     ])
     const ipText = (Array.isArray(ips) && ips.length ? ips : []).map((r) => `${r.address}(v${r.family})`).join(' ') || '解析失败'
-    log(`网络自检结果: DNS=${ipText}; TCP443=${tcpMs ? tcpMs + 'ms' : '不通'}; Cloudflare对照站=${cfOk ? '通' : '不通'}; 后台域名=${targetOk ? '通' : '不通'}`)
+    log(`${tag}网络自检结果: DNS=${ipText}; TCP443=${tcpMs ? tcpMs + 'ms' : '不通'}; Cloudflare对照站=${cfOk ? '通' : '不通'}; 后台域名=${targetOk ? '通' : '不通'}`)
     if (!Array.isArray(ips) || !ips.length) {
-      log('自检结论: DNS 解析失败 — 检查容器/系统 DNS 配置 (可换 1.1.1.1 / 8.8.8.8)')
+      log(`${tag}自检结论: DNS 解析失败 — 检查容器/系统 DNS 配置 (可换 1.1.1.1 / 8.8.8.8)`)
     } else if (!tcpMs) {
-      log('自检结论: ' + (cfOk
+      log(`${tag}自检结论: ` + (cfOk
         ? `能连 Cloudflare 其它站点, 但到 ${host}:${port} 的 TCP 不通 — 该机房/上游拦截了目标网段, 换出口机器或联系机房`
         : 'TCP 全不通 — 这台机器到 Cloudflare 整体断路, 此机器无法运行代理; 换出口 (家用电脑/住宅 IP 更优, 闲鱼风控面也更友好)'))
     } else if (!targetOk) {
-      log('自检结论: ' + (cfOk
+      log(`${tag}自检结论: ` + (cfOk
         ? `TCP 通且 Cloudflare 其它站点可达, 唯独 ${host} 被丢包 — 该网络对此域名(SNI)过滤; 最有效解法: 给 Pages 项目绑定自定义域名(Custom domains), XY_ADMIN_URL 换成自定义域名`
         : `到 ${host} 与 Cloudflare 对照站均丢包 — 该机房到 CF 骨干路由异常, 换出口机器`))
     } else {
-      log('自检结论: DNS/TCP/TLS 全部可达 — 此前失败应为瞬时抖动; 若仍持续失败, 检查后台服务状态与日志')
+      log(`${tag}自检结论: DNS/TCP/TLS 全部可达 — 此前失败应为瞬时抖动; 若仍持续失败, 检查后台服务状态与日志`)
     }
-  } finally {
-    diagRunning = false
+  } catch (e) {
+    log(`${tag}网络自检异常: ${String(e?.message || e).slice(0, 120)}`)
   }
 }
 
@@ -1518,14 +1719,14 @@ async function executeSendMessageTask(payload) {
 }
 
 /** 领取并执行一轮任务 (无任务静默返回; 单任务异常不影响后续任务与轮询循环)。 */
-async function pollTasksOnce() {
+async function pollTasksOnce(adminIdx = 0) {
   if (!engineActive) return
   let resp
   try {
-    resp = await apiCallWithRetry(TASKS_URL, undefined, 15_000)
+    resp = await apiCallWithRetry(TASKS_URLS[adminIdx], undefined, 15_000)
   } catch (e) {
     if (e?.fatal) throw e
-    log(`任务领取失败: GET engine/tasks — ${e?.message} — 下轮重试 (已领取任务不受影响, 任务过期由后台守护)`)
+    log(`任务领取失败 (后台#${adminIdx + 1}): GET engine/tasks — ${e?.message} — 下轮重试 (已领取任务不受影响, 任务过期由后台守护)`)
     return
   }
   const tasks = Array.isArray(resp?.tasks) ? resp.tasks : []
@@ -1550,7 +1751,7 @@ async function pollTasksOnce() {
     let lastErr = ''
     for (let attempt = 1; attempt <= 3 && !reported && !stopped; attempt++) {
       try {
-        await apiCall(EVENTS_URL, {
+        await apiCall(EVENTS_URLS[adminIdx], {
           events: [{ type: 'task_result', task_id: taskId, ok: !!result.ok, data: result.data || {} }],
         }, 15_000)
         reported = true
@@ -1571,12 +1772,16 @@ async function pollTasksOnce() {
 
 async function tasksLoop() {
   while (!stopped) {
-    try {
-      await pollTasksOnce()
-    } catch (e) {
-      if (e?.fatal) {
-        log(`致命错误: ${e.message} — 代理退出 (修正配置后重启)`)
-        process.exit(1)
+    // (v2.1.20) 逐后台领取任务 (task_id/log_id 各后台独立编号, 哪家下发回哪家)
+    for (let i = 0; i < ADMIN_URLS.length; i++) {
+      if (stopped) break
+      if (!activeAdmins.has(i)) continue
+      try {
+        await pollTasksOnce(i)
+      } catch (e) {
+        if (e?.fatal) {
+          handleFatalAdmin(i, e)
+        }
       }
     }
     await sleep(jitter(DEFAULT_TASK_POLL_SECONDS * 1000, 0.1))
@@ -1695,7 +1900,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   })
 }
 
-log(`独立代理已启动 → 后台 ${ADMIN_URL}${PROXY_PORT > 0 ? ` (透传网关已开启 :${PROXY_PORT}/gateway)` : ''}`)
+log(`独立代理已启动 → 后台 ${ADMIN_URLS.join(' | ')}${ADMIN_URLS.length > 1 ? ` (多后台并行推送 ${ADMIN_URLS.length} 个)` : ''}${PROXY_PORT > 0 ? ` (透传网关已开启 :${PROXY_PORT}/gateway)` : ''}`)
 log(`配置轮询 ${DEFAULT_POLL_SECONDS}s (以后台下发的 intervals 为准), 事件上报合并窗口 250ms, 任务轮询 ${DEFAULT_TASK_POLL_SECONDS}s`)
 configLoop().catch((e) => {
   log(`主循环异常退出: ${e?.message}`)

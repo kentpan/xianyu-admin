@@ -1,4 +1,5 @@
-/** POST /api/accounts/:id/verify-cookie — lightweight cookie validity check.
+/**
+ * POST /api/accounts/:id/verify-cookie — lightweight cookie validity check.
  *
  * Strategy:
  *   1. GET `https://www.goofish.com/` with `redirect: 'manual'` so we can
@@ -11,11 +12,17 @@
  *        - Else (ambiguous) → fall back to "valid" only if `unb` cookie
  *          is present in the stored cookie string.
  *
+ * 同步续期: 主站响应的 Set-Cookie 合并回写账号 Cookie (DB + 引擎热替换, 过期删除
+ * 感知) — 手动验证本身也是一次网页级会话活动 (滑动续期 web 登录会话), 顺带把最新
+ * 会话状态落盘。
+ *
  * Updates `cookies.cookie_status_text` and `last_check_at`. Returns
  * `{ valid: boolean, checkedAt, reason }`.
  */
 const VERIFY_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
+
+import { mergeSetCookiesIntoAccount } from '../../../utils/xianyu/verify-state'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -44,6 +51,8 @@ export default defineEventHandler(
     let valid = false
     let reason = 'unknown'
 
+    let respSetCookies: string[] = []
+
     try {
       const res = await fetch('https://www.goofish.com/', {
         method: 'GET',
@@ -56,6 +65,7 @@ export default defineEventHandler(
         },
       })
 
+      respSetCookies = (res.headers as any).getSetCookie?.() || []
       const status = res.status
       const location = res.headers.get('location') || ''
 
@@ -90,6 +100,12 @@ export default defineEventHandler(
     } catch (e: any) {
       valid = false
       reason = `校验请求失败: ${e?.message || String(e)}`
+    }
+
+    // 主站下发的 Set-Cookie 合并回写 (含滑块验证后的 x5sec 赋回/过期删除指令),
+    // 引擎在线时同步热替换 — 与 web 会话保活同一语义的人工触发版
+    if (respSetCookies.length) {
+      await mergeSetCookiesIntoAccount(id, respSetCookies).catch(() => {})
     }
 
     const checkedAt = new Date().toISOString()

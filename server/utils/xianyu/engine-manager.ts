@@ -130,9 +130,9 @@ async function pollOnce(): Promise<void> {
     const builtinActive = active?.slug === 'builtin'
 
     if (!builtinActive) {
-      // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存): 失联/未在服务时内置引擎
-      // 自动接管, 代理恢复后自动交回 — 消灭「远程引擎失联 → 监听/商品同步/风控全链路
-      // 静默停摆却无人知晓」(v2.1.15 线上实证: 代理进程死后 standby, 商品同步/风控日志全停)。
+      // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存): 登记地址实测在服务 → 内置引擎
+      // 保持待命 (绝不与代理双连同一账号); 实测不可达/未在服务才自动接管, 代理恢复后自动交回
+      // — 消灭「远程引擎失联 → 监听/商品同步/风控全链路静默停摆却无人知晓」。
       const probe = await probeActiveRemote(db)
       if (probe.serving) {
         if (!runtime.standby) {
@@ -146,7 +146,10 @@ async function pollOnce(): Promise<void> {
               "UPDATE engines SET last_status = 'standby', updated_at = CURRENT_TIMESTAMP WHERE slug = 'builtin'",
             )
             .catch(() => {})
-          const msg = '远程代理已恢复在服务, 内置引擎交回服务权 (转待命)'
+          const msg =
+            probe.staleMin > 0
+              ? `远程代理登记地址实测在服务 (心跳已 ${probe.staleMin} 分钟未回报本后台, 以登记地址实测为准), 内置引擎交回服务权 (转待命, 绝不双连)`
+              : '远程代理已恢复在服务, 内置引擎交回服务权 (转待命)'
           console.log(`[xianyu-engine] ${msg}`)
           await db
             .run("INSERT INTO system_logs (level, module, message) VALUES ('INFO', 'engine', ?)", [msg])
@@ -350,7 +353,9 @@ async function markActionResult(action: EngineAction, sent: boolean, error: stri
  * 返回 serving=false 时 reason 说明原因。未登记地址/探测异常保守视为在服务
  * (不误杀 — 原待命语义), 此时后台任务链路照常由网关/直连承担。
  */
-async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise<{ serving: boolean; reason: string }> {
+async function probeActiveRemote(
+  db: Awaited<ReturnType<typeof getDb>>,
+): Promise<{ serving: boolean; reason: string; staleMin: number }> {
   try {
     const row = await db.get<{ host: string; port: number; last_seen_at: string | null }>(
       `SELECT host, port, last_seen_at FROM engines
@@ -358,28 +363,31 @@ async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise
          AND host IS NOT NULL AND host != '' AND port IS NOT NULL AND port > 0
        LIMIT 1`,
     )
-    if (!row) return { serving: true, reason: '' }
-    // 心跳新鲜度先行: 远程代理真实在服务本后台时, 配置轮询 (≤30s/次) 会持续刷新 last_seen_at。
-    // 进程活着但心跳陈旧 = 代理连的是别的后台 / 上报中断 — 此时本后台监听实际已死,
-    // 不能被 /health 的 engine_active 陈旧真值骗过 (v2.1.16 实测: last_seen 停在 6h 前)。
+    if (!row) return { serving: true, reason: '', staleMin: 0 }
+    // 登记地址 /health 实测是「代理是否在服务」的唯一权威判据:
+    // 探测通过 (进程存活且 engine_active=true) → 代理在服务, 内置引擎必须保持待命。
+    // 心跳 (last_seen_at) 只能证明「某实例在向本后台回报」, 证明不了登记地址上进程的死活:
+    // 凭心跳陈旧强行接管, 会与登记地址上真实在服务的代理形成同一账号双 WS 连接 —
+    // 重复消费消息 + 双出口高频打 token 接口, 直接触发风控。因此心跳陈旧降级为提示
+    // (随接管/交回日志留痕), 绝不作为接管依据; 仅登记地址实测不可达/未在服务时才接管。
+    const r = await probeRemoteEngine(String(row.host), Number(row.port))
+    let staleMin = 0
     if (row.last_seen_at) {
       const raw = String(row.last_seen_at)
       const seenMs = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z')
-      if (Number.isFinite(seenMs)) {
-        const staleMin = Math.round((Date.now() - seenMs) / 60_000)
-        if (Date.now() - seenMs > REMOTE_STALE_MS) {
-          return { serving: false, reason: `心跳陈旧 (${staleMin} 分钟无上报, 代理可能在服务其他后台或上报中断)` }
-        }
+      if (Number.isFinite(seenMs) && Date.now() - seenMs > REMOTE_STALE_MS) {
+        staleMin = Math.round((Date.now() - seenMs) / 60_000)
       }
     }
-    const r = await probeRemoteEngine(String(row.host), Number(row.port))
-    if (!r.ok) return { serving: false, reason: `登记地址健康探测失败 (${r.error || '不可达'})` }
-    if (!r.engine_active) {
-      return { serving: false, reason: '代理进程存活但未在服务 (engine_active=false, 常见为接入令牌不匹配或代理未激活)' }
+    if (r.ok && r.engine_active) return { serving: true, reason: '', staleMin }
+    if (!r.ok) return { serving: false, reason: `登记地址健康探测失败 (${r.error || '不可达'})`, staleMin }
+    return {
+      serving: false,
+      reason: '代理进程存活但未在服务 (engine_active=false, 常见为接入令牌不匹配或代理未激活)',
+      staleMin,
     }
-    return { serving: true, reason: '' }
   } catch {
-    return { serving: true, reason: '' }
+    return { serving: true, reason: '', staleMin: 0 }
   }
 }
 
@@ -452,6 +460,7 @@ let itemSyncLastRunAt = 0
 
 async function itemSyncTick(): Promise<void> {
   if (runtime.itemSyncRunning) return
+  if (runtime.standby) return // 待命 (代理在服务): 内置引擎一切直连闲鱼的维护动作全部静默, 严禁双出口打接口
   const db = await getDb().catch(() => null)
   if (!db) return
   try {
@@ -568,6 +577,7 @@ let polishLastRunAt = 0
 
 async function polishTick(): Promise<void> {
   if (runtime.polishRunning) return
+  if (runtime.standby) return // 待命 (代理在服务): 内置引擎一切直连闲鱼的维护动作全部静默, 严禁双出口打接口
   const db = await getDb().catch(() => null)
   if (!db) return
   try {
@@ -657,6 +667,7 @@ const ORDER_SYNC_MIN_INTERVAL_S = 1800
 
 async function orderSyncTick(): Promise<void> {
   if (runtime.orderSyncRunning) return
+  if (runtime.standby) return // 待命 (代理在服务): 内置引擎一切直连闲鱼的维护动作全部静默, 严禁双出口打接口
   const db = await getDb().catch(() => null)
   if (!db) return
   try {

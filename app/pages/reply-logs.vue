@@ -172,14 +172,18 @@ function strategyMeta(log: ReplyLog) {
   }
 }
 
-// (v2.1.14) 回复内容列: payment_received (用户已付款待发货) 用琥珀色正向语义, 其余维持原判定
+// (v2.1.14) 回复内容列: payment_received (用户已付款) 用琥珀色正向语义;
+// 自动发货未启动 (含明确失败原因) 用红色警示, 一眼区分「正常待发货」与「发货被卡」
 function contentText(log: ReplyLog): string {
   if (log.decision_reason === 'payment_received') return log.reply_text || '-'
   return log.error_message || log.reply_text || '-'
 }
 
 function contentMeta(log: ReplyLog): string {
-  if (log.decision_reason === 'payment_received') return 'text-amber-600 dark:text-amber-400'
+  if (log.decision_reason === 'payment_received')
+    return (log.reply_text || '').includes('自动发货未启动')
+      ? 'text-rose-500'
+      : 'text-amber-600 dark:text-amber-400'
   return log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'
 }
 

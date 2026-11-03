@@ -269,15 +269,20 @@
             <li>接口走与真实发货完全相同的生成链路：按卡券配置的长度/英文/数字/大小写随机生成 → 文案模板 {code} 渲染 → 启用变量替换（模拟上下文 = 发货规则绑定商品的真实数据）</li>
             <li>返回模拟生成的卡密与发货文案，可直接预览买家将收到的加群验证码样式；卡密同时落库「生成记录」并带<span class="font-medium text-amber-600 dark:text-amber-400">「测试」标签</span>（订单号 TEST- 前缀，状态=未核销）</li>
             <li>测试卡密可用「消费 API」<span class="font-mono">/api/verify-codes/verify</span> 真实核销验证 — 与正常消费完全同一链路，消费记录同样带「测试」标签，成功/失败均有详细日志（原因/消费方 Key/IP/时间）</li>
+            <li>外部系统/模拟器可直接携 API Key（<span class="font-mono">Bearer xyk_</span>）调用本接口，无需登录；card_id 可省略（自动选第一张卡密型卡券），每次调用均留痕到「API Key管理」调用日志</li>
             <li>不会真实发货的部分：不发送买家消息 / 不写发货记录 / 不改订单状态 / 不加规则发货计数；测试卡密与真实卡密同库唯一，核销后同样失效，可放心反复测试</li>
           </ol>
         </div>
         <div>
-          <label class="label">请求方式与参数（登录可用）</label>
+          <label class="label">请求方式与参数（登录令牌 或 Bearer apikey 均可）</label>
           <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">POST /api/cards/deliver-test
 Content-Type: application/json
 
-{ "card_id": 1, "count": 1 }        ← 卡券ID + 生成份数 (1-10, 默认 1)</pre>
+{ "card_id": 1, "count": 1 }        ← card_id 可选 (缺省自动选第一张卡密型卡券); count 1-10 默认 1
+
+鉴权 (二选一, 自动识别):
+  Authorization: Bearer &lt;登录令牌&gt;    ← 后台登录态 / 在线测试器
+  Authorization: Bearer xyk_xxxxxxxx  ← 「API Key管理」生成的 Key, 供外部系统/模拟器调用 (受限速+留痕)</pre>
         </div>
         <div>
           <label class="label">响应示例</label>
@@ -290,11 +295,11 @@ Content-Type: application/json
           <p class="mt-1.5 text-slate-500 dark:text-slate-400">拿到 <span class="font-mono">items[].code</span> 后即可按右侧「消费流程」用 API Key 调核销接口做全链路验证；在「生成记录/消费记录」中按订单号 <span class="font-mono">TEST-...</span> 或「测试」标签即可筛出本批测试数据。</p>
         </div>
         <div>
-          <label class="label">curl 调用示例</label>
+          <label class="label">curl 调用示例（外部系统/模拟器用 apikey）</label>
           <pre class="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono overflow-x-auto whitespace-pre-wrap">curl -X POST 'https://你的域名/api/cards/deliver-test' \
-  -H 'Authorization: Bearer &lt;登录令牌&gt;' \
+  -H 'Authorization: Bearer xyk_xxxxxxxx' \
   -H 'Content-Type: application/json' \
-  -d '{"card_id":1,"count":1}'</pre>
+  -d '{"count":1}'</pre>
         </div>
         <div class="border-t border-slate-100 dark:border-slate-700 pt-4">
           <label class="label">在线测试（选卡密型卡券，立即生成预览）</label>

@@ -76,6 +76,46 @@ export function cookieIdentityMismatch(cookieId: string, cookieStr: string): str
   return ''
 }
 
+/**
+ * mtop 失败原因统一分类 (决策日志「一眼清」用):
+ * 把平台原始 ret / 网络异常字符串翻译成明确的人类结论 —
+ * cookie 失效需重新扫码 / 风控验证 / 代理网关不可达 / 平台业务报错。
+ *
+ * @returns 空串表示无可归类内容 (调用方保留原文); 非空即直接可展示的失败结论
+ */
+export function classifyMtopFailure(raw: string): string {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  // 登录态失效: mtop 会话/ token 类错误码 (token 过期 mtopCall 内部已自动重试, 仍冒出即会话死亡)
+  if (
+    /SESSION_EXPIRED|SESSION_CHANGED|FAIL_SYS_TOKEN\.\w+|TOKEN_EXOIRED|NOT_LOGIN|NEED_LOGIN|LOGIN_REQUIRED|未登录|登录态|登录已过期/i.test(
+      s,
+    )
+  ) {
+    return '登录态已失效 (Cookie 失效) — 需要重新扫码登录'
+  }
+  // Cookie 身份串号 (verify-state 合并毒化/顶号残留): 明示重扫
+  if (/Cookie 身份与账号不符/.test(s)) return 'Cookie 身份与账号不符 — Cookie 属于其他账号会话, 需要删除该账号后重新扫码登录'
+  // 风控/验证码
+  if (/RGV587|punish|x5sec|验证码|风控|SLAVER/i.test(s)) {
+    return '触发风控验证 — 请到「账号管理」完成验证或稍后重试'
+  }
+  // 订单状态类 (发货先于付款到达的典型瞬时误报, 会自动重试, 不误导排查)
+  if (/ORDER_STATUS_ERROR|订单状态不正确/i.test(s)) {
+    return '平台报订单状态不正确 — 多为发货先于付款事件到达 (买家尚未付款), 付款确认后自动重试'
+  }
+  // 代理/网关/网络层: 超时、连接失败、网关 5xx
+  if (
+    /timeout|timed?\s*out|abort|ECONN|EAI_AGAIN|ENOTFOUND|EPROTO|fetch failed|socket|network|500|502|503|504|Bad Gateway|Gateway|网关|不可达/i.test(
+      s,
+    )
+  ) {
+    return '代理/网关请求失败 (网络不可达或超时) — 请检查代理侧连通性'
+  }
+  // 平台业务报错 (频率限制等) 原文透出
+  return `平台接口报错: ${s.slice(0, 120)}`
+}
+
 /** 把 jar 序列化为 cookie 字符串。 */
 export function cookieHeader(jar: Map<string, string>): string {
   return Array.from(jar.entries())
@@ -559,7 +599,8 @@ export async function confirmOrderShipped(
   if (retStr.includes('ORDER_ALREADY_DELIVERY') || retStr.includes('已发货成功')) {
     return { success: true, message: '订单已是已发货状态 (无需邮寄发货达成)', finalCookieStr: r.cookieStr }
   }
-  return { success: false, message: retStr || '确认发货失败', finalCookieStr: r.cookieStr }
+  // 失败原因统一归类 (cookie 失效/需扫码/风控/代理侧/平台报错), 决策日志直接展示
+  return { success: false, message: classifyMtopFailure(retStr) || '确认发货失败', finalCookieStr: r.cookieStr }
 }
 
 /**
@@ -582,7 +623,7 @@ export async function freeshippingOrder(
   if (retStr.includes('SUCCESS')) {
     return { success: true, message: '免拼发货成功', finalCookieStr: r.cookieStr }
   }
-  return { success: false, message: retStr || '免拼发货失败', finalCookieStr: r.cookieStr }
+  return { success: false, message: classifyMtopFailure(retStr) || '免拼发货失败', finalCookieStr: r.cookieStr }
 }
 
 // ============ 订单查询 (语义对齐 butler order_fetcher_optimized._parse_api_response) ============

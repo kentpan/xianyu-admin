@@ -10,6 +10,7 @@
  *   5. 发送人化队列 — 随机间隔 0.8~2.5s, 滑动窗口限速 12 条/分钟, 每条消息必 ack
  */
 import { parseLosslessJson } from './lossless-json'
+import { resolveChromeUA } from './chrome-ua'
 import {
   WEBSOCKET_URL,
   TOKEN_API,
@@ -85,6 +86,16 @@ const RISK_LADDER_WINDOW_MS = 30 * 60 * 1000
 /** token 刷新周期 1h ± 5min 抖动。 */
 const TOKEN_REFRESH_MS = 3600 * 1000
 
+/**
+ * web 会话保活周期 30min ± 10% (携带会话 cookie 访问闲鱼主站 — 真实浏览器行为)。
+ * 根因: 闲鱼 web 登录会话是滑动过期 (约 24h 无网页级活动即服务端过期), mtop token
+ * API 的滚动不能续期 web 会话 — 只调 token API 的引擎每 ~24h 必被踢下线, 而用户
+ * 手动「验证 cookie」(GET www.goofish.com) 后即恢复, 即为本机制的实证。周期性主站
+ * 访问让滑动窗口永不断档, 从源头根除「隔天必须重新扫码」。
+ */
+const WEB_KEEPALIVE_MS = 30 * 60 * 1000
+const WEB_HOME_URL = 'https://www.goofish.com/'
+
 /** cookie 保活周期 3 分钟 (参考项目 cookie_refresh_interval=180s)。 */
 const COOKIE_KEEPALIVE_MS = 180 * 1000
 /** 收到聊天消息后 5 分钟内不滚动 cookie (参考项目 message_cookie_refresh_cooldown=300s)。 */
@@ -97,6 +108,37 @@ function jitter(ms: number, ratio = 0.15): number {
 function backoffDelay(failures: number): number {
   const base = Math.min(300_000, 5_000 * Math.pow(2, Math.min(failures, 6)))
   return jitter(base, 0.2)
+}
+
+/**
+ * Set-Cookie 合并 (过期删除感知): Max-Age=0 或 Expires 已过的删除指令 → 从会话中
+ * 移除该 cookie, 否则覆盖。此前实现无视删除语义把待删项存成空值永久保留, cookie
+ * 串只增不减 (跟踪 cookie 每次响应都在轮换), 陈旧项累积会干扰会话判定。
+ */
+export function applySetCookies(record: Record<string, string>, setCookieList: string[]): void {
+  for (const sc of setCookieList || []) {
+    const segments = String(sc || '').split(';')
+    const pair = segments[0] || ''
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    const name = pair.slice(0, eq).trim()
+    const value = pair.slice(eq + 1).trim()
+    if (!name) continue
+    let expired = false
+    for (const attr of segments.slice(1)) {
+      const a = attr.trim()
+      const al = a.toLowerCase()
+      if (al.startsWith('max-age=')) {
+        const n = Number(a.slice(8))
+        if (Number.isFinite(n) && n <= 0) expired = true
+      } else if (al.startsWith('expires=')) {
+        const ts = Date.parse(a.slice(8))
+        if (Number.isFinite(ts) && ts <= Date.now()) expired = true
+      }
+    }
+    if (expired) delete record[name]
+    else record[name] = value
+  }
 }
 
 /**
@@ -146,15 +188,10 @@ export async function fetchTokenDetailed(
     })
     const json: any = await res.json().catch(() => ({}))
     const ret: string[] = Array.isArray(json?.ret) ? json.ret : []
-    // 合并服务端下发的 set-cookie (token 接口会滚动 _m_h5_tk / x5secdata 等) — 无论成败都合并, 保持会话状态新鲜
+    // 合并服务端下发的 set-cookie (token 接口会滚动 _m_h5_tk / x5secdata 等, 过期删除指令同步生效) — 保持会话状态新鲜
     const merged: Record<string, string> = { ...cookies }
     try {
-      const setCookies: string[] = (res.headers as any).getSetCookie?.() || []
-      for (const sc of setCookies) {
-        const [pair] = sc.split(';')
-        const eq = pair.indexOf('=')
-        if (eq > 0) merged[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim()
-      }
+      applySetCookies(merged, (res.headers as any).getSetCookie?.() || [])
     } catch {}
     const token = json?.data?.accessToken || ''
     const punishUrl = typeof json?.data?.url === 'string' ? json.data.url : ''
@@ -192,6 +229,7 @@ export class XianyuAccountClient {
   private heartbeatTimer: NodeJS.Timeout | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
   private cookieKeepaliveTimer: NodeJS.Timeout | null = null
+  private webKeepaliveTimer: NodeJS.Timeout | null = null
   private cookieRefreshing = false
   private lastChatMessageAt = 0
   private riskCooldownUntil = 0
@@ -253,15 +291,20 @@ export class XianyuAccountClient {
     this.cookieKeepaliveTimer = setInterval(() => {
       if (!this.stopped) void this.maybeCookieKeepalive()
     }, jitter(COOKIE_KEEPALIVE_MS, 0.1))
+    // web 会话保活: 每 30 分钟访问主站一次 (滑动续期 web 登录会话 — token API 做不到这点,
+    // 不做这个每 ~24h 必被服务端踢下线要求重新扫码)
+    this.webKeepaliveTimer = setInterval(() => {
+      if (!this.stopped) void this.webSessionKeepalive()
+    }, jitter(WEB_KEEPALIVE_MS, 0.1))
   }
 
   async stop(): Promise<void> {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer, this.reconnectTimer, this.cookieKeepaliveTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.reconnectTimer, this.cookieKeepaliveTimer, this.webKeepaliveTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
-    this.tokenTimer = this.heartbeatTimer = this.reconnectTimer = this.cookieKeepaliveTimer = null
+    this.tokenTimer = this.heartbeatTimer = this.reconnectTimer = this.cookieKeepaliveTimer = this.webKeepaliveTimer = null
     this.generation++
     this.setState('disabled', '已停止')
     try {
@@ -467,6 +510,46 @@ export class XianyuAccountClient {
     }
   }
 
+  /**
+   * web 会话保活一次: 携带会话 cookie GET 闲鱼主站 (与用户手动「验证 cookie」同一动作,
+   * 服务端滑动续期 web 登录会话)。守卫与 cookie 保活同源: 防重入/人工验证持有期/风控
+   * 冷却/消息冷却; 失败静默 (网络异常不影响监听主链路); 不改状态机 (登录态判定仍由
+   * token 链路负责)。主站下发的 Set-Cookie 不回写 (v2.1.18 事故根治): 那是主站网页
+   * 上下文的反爬/追踪令牌, 与 mtop/发货链不同上下文, 合并只会污染签名身份并引发
+   * 代理侧无意义热替换; 会话 cookie 的新鲜度由 token 链路 (同上下文) 独家维护。
+   */
+  private async webSessionKeepalive(): Promise<void> {
+    if (this.stopped || this.cookieRefreshing) return
+    if (isManualVerifyHold(this.cookieId)) return
+    if (Date.now() < this.riskCooldownUntil) return
+    if (this.lastChatMessageAt && Date.now() - this.lastChatMessageAt < COOKIE_MSG_COOLDOWN_MS) return
+    this.cookieRefreshing = true
+    try {
+      const res = await fetch(WEB_HOME_URL, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          'User-Agent': resolveChromeUA().ua,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          Cookie: this.cookieStr,
+        },
+        signal: AbortSignal.timeout(20_000),
+      })
+      // 只续期不回写: 滑动续期在服务端收到请求时已完成; 主站网页上下文的 Set-Cookie
+      // 与 mtop/发货链不同上下文, 合并回写会污染签名身份 (v2.1.18 事故根治点)
+      // 重定向到 passport = 会话已失效 (仅留痕; 登录态判定与状态机仍由 token 链路负责)
+      const location = res.headers.get('location') || ''
+      if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {
+        logWarn(`[${this.cookieId}] web 会话保活: 主站重定向登录页 (会话可能已失效, 以 token 链路判定为准)`)
+      }
+    } catch {
+      // 主站不可达/网络异常: 静默, 下一周期重试
+    } finally {
+      this.cookieRefreshing = false
+    }
+  }
+
   private async refreshTokenSafely(): Promise<void> {
     // 人工验证持有期: 引擎静默, token 刷新完全交给弹窗内的人工重试
     if (isManualVerifyHold(this.cookieId)) return
@@ -475,11 +558,15 @@ export class XianyuAccountClient {
     try {
       const { token, mergedCookies, ret, punishUrl } = await fetchTokenDetailed(this.cookieStr, this.deviceId)
       const verdict = classifyTokenError(ret)
-      // 无论成败都把服务端滚动的 cookie 回写 (x5secdata 等状态字段保持新鲜)
-      const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
-      if (mergedStr !== this.cookieStr) {
-        this.cookieStr = mergedStr
-        this.events.onCookieRotated(this.cookieId, mergedStr)
+      // 服务端滚动的 cookie 回写 (x5secdata 等状态字段保持新鲜)。
+      // 唯一例外: 登录失效 (auth) 响应的 Set-Cookie 不回写 — 会话已判定失效, 此时下发
+      // 的往往是清理指令/空值, 合并只会毒化 cookie (瞬时误判时更会误伤仍有效的会话)。
+      if (verdict !== 'auth') {
+        const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
+        if (mergedStr !== this.cookieStr) {
+          this.cookieStr = mergedStr
+          this.events.onCookieRotated(this.cookieId, mergedStr)
+        }
       }
       if (verdict === 'ok' && token) {
         this.token = token
@@ -517,10 +604,13 @@ export class XianyuAccountClient {
   async manualTokenFetch(): Promise<ManualTokenOutcome> {
     const { token, mergedCookies, ret, punishUrl } = await fetchTokenDetailed(this.cookieStr, this.deviceId)
     const verdict = classifyTokenError(ret)
-    const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
-    if (mergedStr !== this.cookieStr) {
-      this.cookieStr = mergedStr
-      this.events.onCookieRotated(this.cookieId, mergedStr)
+    // auth (登录失效) 响应的 Set-Cookie 不回写, 与 refreshTokenSafely 同策略
+    if (verdict !== 'auth') {
+      const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
+      if (mergedStr !== this.cookieStr) {
+        this.cookieStr = mergedStr
+        this.events.onCookieRotated(this.cookieId, mergedStr)
+      }
     }
     if (verdict === 'ok' && token) {
       this.token = token
