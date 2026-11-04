@@ -78,7 +78,8 @@
                 </span>
               </td>
               <td>
-                <span v-if="e.is_active" class="badge bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400">
+                <span v-if="e.type === 'remote' && !e.enabled" class="badge bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">已停用</span>
+                <span v-else-if="e.is_active" class="badge bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400">
                   <Icon name="check" /> 使用中
                 </span>
                 <span v-else class="badge bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">备用</span>
@@ -87,6 +88,14 @@
                 <div class="inline-flex items-center gap-1.5 flex-wrap justify-end">
                   <button v-if="!e.is_active && !(e.type === 'builtin' && e.runtime_supported === false)" class="btn-secondary" :disabled="switching === e.id" @click="switchTo(e)">
                     {{ switching === e.id ? '切换中...' : '设为使用' }}
+                  </button>
+                  <button
+                    v-if="e.type === 'remote' && e.is_active && e.online && e.host && e.port"
+                    class="btn-secondary"
+                    :title="`打开代理 Web 管理面板 (新窗口): http://${e.host}:${e.port}/`"
+                    @click="openProxyPanel(e)"
+                  >
+                    <Icon name="external" /> 代理配置
                   </button>
                   <button v-if="e.type === 'remote'" class="btn-secondary" @click="openDeploy(e)">部署</button>
                   <button class="btn-secondary" @click="openEdit(e)">编辑</button>
@@ -226,7 +235,7 @@
           <div class="rounded-lg border border-slate-200 dark:border-slate-700 divide-y divide-slate-200 dark:divide-slate-700">
             <div class="p-3 space-y-1">
               <p class="font-medium text-slate-700 dark:text-slate-200">模式一 · 任务模式（默认，无需公网 IP）</p>
-              <p class="text-slate-500 dark:text-slate-400">.env 只配 <code>XY_ADMIN_URL</code> + <code>XY_ENGINE_TOKEN</code>（不填 XY_PROXY_PORT）：代理主动外呼本后台 —— 拉账号配置 → 建闲鱼消息长连接 → 上报事件/领任务；消息会话等数据只发往 .env 里配置的后台，<b>多主服务器用 <code>|</code> 分隔最多 3 个（拆分后自动去头尾空格）并行推送</b>，同账号多后台只建一条闲鱼连接（靠前后台优先），决策动作/任务按各自后台独立领取与回报；订单拉取走任务通道（后台构造签名请求，代理 3s 轮询领取 http_fetch 原样转发后回报原始响应，解析全在后台完成）。无需公网入站端口，能出网即可。</p>
+              <p class="text-slate-500 dark:text-slate-400">.env 只配 <code>XY_ADMIN_URL</code> + <code>XY_ENGINE_TOKEN</code>（不填 XY_PROXY_PORT）：代理主动外呼本后台 —— 拉账号配置 → 建闲鱼消息长连接 → 上报事件/领任务；订单拉取走任务通道（后台构造签名请求，代理 3s 轮询领取 http_fetch 原样转发后回报原始响应，解析全部在后台完成）。无需公网入站端口，能出网即可。</p>
             </div>
             <div class="p-3 space-y-1">
               <p class="font-medium text-slate-700 dark:text-slate-200">模式二 · 任务模式 + 透传网关（推荐，需公网固定 IP）</p>
@@ -376,7 +385,7 @@
       <div class="space-y-4">
         <div class="text-slate-600 dark:text-slate-300 space-y-2">
           <p>1. 将项目内 <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">scripts/xianyu-proxy.mjs</code> 单个文件上传到任意能出网的服务器（仅需 Node ≥ 20，零 npm 依赖；Node 20 可在同目录 npm i ws）。</p>
-          <p>2. 配置令牌与端口（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌），写在「与 xianyu-proxy.mjs 同目录的 .env」里（每行 KEY=VALUE，启动自动加载；面板部署则写在面板的环境变量页，写入的就是那个 .env）。两种代理模式任选：<b>模式一 · 任务模式</b>（默认，无需公网 IP）：只配 XY_ADMIN_URL + XY_ENGINE_TOKEN，代理主动外呼后台拉配置/监听消息/领任务（订单拉取走任务通道回报）。<b>模式二 · 任务模式 + 透传网关</b>（推荐，需公网固定 IP）：模式一基础上加配 XY_PROXY_PORT，代理同端口额外开启 POST /gateway 透传网关（鉴权复用 XY_ENGINE_TOKEN），并在本页该引擎行登记公网 IP + 端口、防火墙放行 —— 后台直连网关转发闲鱼 mtop 请求，解决 CF Pages 直连订单接口 500 超时。</p>
+          <p>2. 配置令牌与端口（鉴权统一为 Authorization: Bearer，令牌即本行代理的接入令牌），写在「与 xianyu-proxy.mjs 同目录的 .env」里（每行 KEY=VALUE，启动自动加载；面板部署则写在面板的环境变量页，写入的就是那个 .env）。<b>多后台并行推送（v2.2.0）</b>：XY_ADMIN_URL 用 | 分隔最多 3 个后台地址，消息/会话/风控/状态事件并行推送到全部活跃后台（某后台连续 5 次推送失败自动暂停、轮询成功自动恢复；同账号只建一条闲鱼连接，靠前后台优先）—— 消息数据只发往 .env 登记的服务器。两种代理模式任选：<b>模式一 · 任务模式</b>（默认，无需公网 IP）：只配 XY_ADMIN_URL + XY_ENGINE_TOKEN，代理主动外呼后台拉配置/监听消息/领任务（订单拉取走任务通道回报）。<b>模式二 · 任务模式 + 透传网关 + Web 面板</b>（推荐，需公网固定 IP）：加配 XY_PROXY_PORT（如 8880），代理同端口额外开启 POST /gateway 透传网关（鉴权复用 XY_ENGINE_TOKEN），并在本页该引擎行登记公网 IP + 端口、防火墙放行 —— 后台直连网关转发闲鱼 mtop 请求，解决 CF Pages 直连订单接口 500 超时；再配 XY_PROXY_ADMIN_SECRET 即同端口开启 Web 管理面板（配置编辑/日志/脚本上传覆盖/服务停止启动）。</p>
         </div>
         <div class="relative">
           <pre class="p-3 rounded-lg bg-slate-900 text-slate-100 overflow-x-auto leading-relaxed"><code>{{ deploySnippet }}</code></pre>
@@ -500,9 +509,11 @@ const deploySnippet = computed(() => {
   const e = deployEngine.value
   return [
     `# 与 xianyu-proxy.mjs 同目录 .env (面板部署写在面板环境变量页)`,
+    `# v2.2.0 多后台并行推送: 用 | 分隔最多 3 个后台, 消息/会话同时推送到全部活跃后台`,
     `XY_ADMIN_URL=${origin.value || 'https://你的后台域名'}`,
     `XY_ENGINE_TOKEN=${e?.token || '后台-监听服务页-复制该代理的接入令牌'}`,
-    `XY_PROXY_PORT=8800    # 选填: 本地健康检查端口; 开启后同端口附 POST /gateway 透传网关(推荐, 需公网固定IP)`,
+    `XY_PROXY_PORT=8880   # 选填: HTTP 服务端口; 开启后同端口附 POST /gateway 透传网关(推荐, 需公网固定IP)`,
+    `XY_PROXY_ADMIN_SECRET=   # 选填: Web 管理面板登录密钥 (配置后访问 http://代理IP:端口/ 打开面板)`,
     `XY_POLL_SECONDS=30    # 选填: 配置轮询间隔`,
   ].join('\n')
 })
@@ -588,6 +599,11 @@ async function removeEngine(e: EngineRow) {
   } catch (err: any) {
     toast.error(err?.message || '删除失败')
   }
+}
+
+/** 打开代理 Web 管理面板 (v2.2.2): 仅在「已配置地址 + 在线 + 使用中」时展示; 面板登录密钥为代理侧 XY_PROXY_ADMIN_SECRET */
+function openProxyPanel(e: EngineRow) {
+  window.open(`http://${e.host}:${e.port}/`, '_blank', 'noopener,noreferrer')
 }
 
 function openDeploy(e: EngineRow) {

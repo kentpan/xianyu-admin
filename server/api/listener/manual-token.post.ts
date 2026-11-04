@@ -8,6 +8,7 @@
  *   verdict=auth → 登录态失效, 需重新扫码
  * 引擎托管中的账号走在线客户端 (状态/连败计数一致); 引擎未托管时独立实调并合并滚动 Cookie。
  */
+import { persistCookieRotation } from '../../utils/xianyu/cookie-store'
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
@@ -53,7 +54,8 @@ export default defineEventHandler(
     const verdict = classifyTokenError(ret)
     const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
     if (mergedStr && mergedStr !== cookieStr) {
-      await db.run('UPDATE cookies SET value = ?, last_check_at = CURRENT_TIMESTAMP WHERE id = ?', [mergedStr, cookieId]).catch(() => {})
+      await persistCookieRotation(db, cookieId, cookieStr, mergedStr)
+      await db.run('UPDATE cookies SET last_check_at = CURRENT_TIMESTAMP WHERE id = ?', [cookieId]).catch(() => {})
       applyExternalCookieUpdate(cookieId, mergedStr)
     }
     if (verdict === 'ok' && token) {

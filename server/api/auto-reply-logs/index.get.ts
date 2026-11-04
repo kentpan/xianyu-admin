@@ -28,8 +28,14 @@ export default defineEventHandler(
       params.push(like, like, like, like)
     }
     if (strategy) {
-      conds.push('reply_strategy = ?')
-      params.push(strategy)
+      // (v2.1.19) 发货失败专项筛选: delivery_failed 是 decision_reason (reply_strategy 恒为 none),
+      // 沿用 reply_strategy = ? 永远查不到 — 按决策原因语义映射, 用户可一眼筛出全部发货失败记录
+      if (strategy === 'delivery_failed') {
+        conds.push("(process_status = 'skipped' AND decision_reason = 'delivery_failed')")
+      } else {
+        conds.push('reply_strategy = ?')
+        params.push(strategy)
+      }
     }
 
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''

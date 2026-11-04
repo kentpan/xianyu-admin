@@ -3,6 +3,7 @@
  * Body: { cookie_id }
  * 流程: 加载 cookie → 解析 unb 作为 userId → 分页拉取 → upsert item_info → 回写轮换后的 cookie。
  */
+import { persistCookieRotation } from '../../../utils/xianyu/cookie-store'
 export default defineEventHandler(
   withApi(async (event) => {
     const payload = requireUser(event)
@@ -46,9 +47,7 @@ export default defineEventHandler(
     }
 
     // 回写轮换后的 cookie (含新的 _m_h5_tk)
-    if (finalCookieStr && finalCookieStr !== row.value) {
-      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId])
-    }
+    await persistCookieRotation(db, cookieId, String(row.value), finalCookieStr)
 
     await auditLog(event, {
       action: 'sync',

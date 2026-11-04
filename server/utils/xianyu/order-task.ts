@@ -16,6 +16,7 @@
  */
 import type { MtopTransport, SellerOrderItem } from './mtop'
 import { fetchSellerOrders } from './mtop'
+import { persistCookieRotation } from './cookie-store'
 import { parseLosslessJson } from './lossless-json'
 import { getDb } from '../db'
 
@@ -203,9 +204,7 @@ export async function fetchOrdersViaProxy(
     page++
   }
   // _m_h5_tk 轮换回写 (与直连/网关模式同语义), 保证下次请求用最新签名凭证
-  if (cookieStr !== String(acct?.value || '')) {
-    await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, id]).catch(() => {})
-  }
+  await persistCookieRotation(db, id, String(acct?.value || ''), cookieStr)
   return { items, errors, viaProxy: true }
 }
 

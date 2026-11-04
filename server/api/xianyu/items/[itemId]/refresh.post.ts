@@ -2,6 +2,7 @@
  * POST /api/xianyu/items/:itemId/refresh — 擦亮一个宝贝 (提升排名)。
  * Body: { cookie_id }
  */
+import { persistCookieRotation } from '../../../../utils/xianyu/cookie-store'
 export default defineEventHandler(
   withApi(async (event) => {
     const payload = requireUser(event)
@@ -24,9 +25,7 @@ export default defineEventHandler(
     const result = await polishItem(row.value, itemId)
 
     // 回写轮换后的 cookie
-    if (result.finalCookieStr && result.finalCookieStr !== row.value) {
-      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [result.finalCookieStr, cookieId])
-    }
+    await persistCookieRotation(db, cookieId, String(row.value), result.finalCookieStr)
 
     await auditLog(event, {
       action: 'refresh',

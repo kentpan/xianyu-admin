@@ -23,6 +23,7 @@
           <select v-model="filterStrategy" class="input !w-auto min-w-[140px]" @change="load">
             <option value="">全部策略</option>
             <option value="delivery">自动发货</option>
+            <option value="delivery_failed">发货失败</option>
             <option value="keyword">关键词回复</option>
             <option value="ai">AI 回复</option>
             <option value="default">默认回复</option>
@@ -172,18 +173,18 @@ function strategyMeta(log: ReplyLog) {
   }
 }
 
-// (v2.1.14) 回复内容列: payment_received (用户已付款) 用琥珀色正向语义;
-// 自动发货未启动 (含明确失败原因) 用红色警示, 一眼区分「正常待发货」与「发货被卡」
+// (v2.1.14) 回复内容列: payment_received (用户已付款待发货) 用琥珀色正向语义, 其余维持原判定。
+// (v2.1.19) 付款留痕行把失败原因一并展示 (reply_text 已前置「订单号定位失败原因」;
+// error_message 携带卡片原文摘要/未含订单号说明, 与原因一起一眼清, 不再只看一句提示语)
 function contentText(log: ReplyLog): string {
-  if (log.decision_reason === 'payment_received') return log.reply_text || '-'
+  if (log.decision_reason === 'payment_received') {
+    return [log.reply_text, log.error_message].filter(Boolean).join('\n') || '-'
+  }
   return log.error_message || log.reply_text || '-'
 }
 
 function contentMeta(log: ReplyLog): string {
-  if (log.decision_reason === 'payment_received')
-    return (log.reply_text || '').includes('自动发货未启动')
-      ? 'text-rose-500'
-      : 'text-amber-600 dark:text-amber-400'
+  if (log.decision_reason === 'payment_received') return 'text-amber-600 dark:text-amber-400'
   return log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'
 }
 

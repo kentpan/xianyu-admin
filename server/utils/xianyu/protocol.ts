@@ -594,6 +594,12 @@ export function parseSyncItem(data: string, myId: string): ParsedMessage {
   const itemId = extractItemId(message)
   const card = parseTradeCard(message)
 
+  // 会话 ID 提取 (message['2'] = cid, "xxx@goofish" → "xxx"): 与卡片更新消息/聊天消息
+  // 同源同语义。纯系统卡片 (无 message['1']['10'] 聊天体) 也会携带该字段 — 缺失它时
+  // 「等待卖家发货」触发链无法按会话回退定位订单 (自动发货断链点, v2.1.18 修复)
+  const sysChatIdRaw = String(message['2'] ?? '')
+  const sysChatId = sysChatIdRaw.split('@')[0] || sysChatIdRaw
+
   const m1 = message['1']
   const m10 = m1 && typeof m1 === 'object' ? m1['10'] : null
   if (!m10 || typeof m10 !== 'object') {
@@ -604,7 +610,7 @@ export function parseSyncItem(data: string, myId: string): ParsedMessage {
         itemId,
         buyerId: '',
         orderId: extractOrderId(message),
-        chatId: '',
+        chatId: sysChatId,
         cardTitle: card.title,
         amount: card.amount,
         raw: message,

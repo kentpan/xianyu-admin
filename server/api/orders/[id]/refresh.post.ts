@@ -4,6 +4,7 @@
  * 状态/买家/金额/收货人变化全部落库; 平台风控或接口错误如实返回 502, 不伪造成功。
  */
 import { fetchOrderDetail } from '../../../utils/xianyu/mtop'
+import { persistCookieRotation } from '../../../utils/xianyu/cookie-store'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -24,9 +25,7 @@ export default defineEventHandler(
     const { detail, retMsg, finalCookieStr } = await fetchOrderDetail(acct.value, id)
 
     // 回写轮换后的 cookie (尤其是 _m_h5_tk)
-    if (finalCookieStr && finalCookieStr !== acct.value) {
-      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId])
-    }
+    await persistCookieRotation(db, cookieId, String(acct.value), finalCookieStr)
 
     if (!detail) throw new ApiError(502, `闲鱼接口未返回订单数据: ${retMsg || '未知错误'}`)
 

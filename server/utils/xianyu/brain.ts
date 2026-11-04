@@ -7,17 +7,26 @@
  * 回复优先级 (与 butler 完全一致):
  *   过滤规则跳过 → 付款触发(优先于一切回复) → 系统通知文本跳过 → 关键词回复(商品绑定 > 通用)
  *   → AI回复(意图识别+议价) → 指定商品回复 → 默认回复
- * 发货触发 (与 butler 完全一致):
- *   - 聊天卡片文本命中付款关键词 ([我已付款，等待你发货] 等) → 订单落库 pending_ship → 自动发货
- *   - 系统消息 redReminder = 等待卖家发货 → 订单落库 pending_ship → 自动发货
- *   发货执行: 商品归属校验(缺失时 mtop 拉详情补齐) → 规则唯一匹配 → 卡券原子扣减
- *   → 延时 → 虚拟发货确认(cookies.auto_confirm) → 发送内容
+ * 发货触发 (唯一): 系统卡片 redReminder = 等待卖家发货 → 订单落库 pending_ship → 自动发货。
+ *   聊天付款卡片 / 交易成功通知只做落库与状态回写, 不触发发货 — 同一笔付款会以多种形式到达,
+ *   多处触发会在 edge 多 isolate 下并发调用平台发货接口, 后到者必被判 ORDER_STATUS_ERROR。
+ *   发货执行: 跨实例认领(orders.delivery_claim_at) → 商品归属校验(缺失时 mtop 拉详情补齐)
+ *   → 规则唯一匹配 → 卡券原子扣减 → 延时 → 虚拟发货确认(瞬时拒绝有界重试) → 发送内容
  */
 import { getDb } from '../db'
 import { dispatchNotify } from '../notify'
 import { generateCardCode, renderCodeTemplate, persistCardCode } from '../card-code'
 import { fetchApiCardContent, applyCardVars, type ApiCardVars } from '../card-api'
-import { fetchItemDetail, confirmOrderShipped, freeshippingOrder, fetchSellerOrders, cookieIdentityMismatch, classifyMtopFailure } from './mtop'
+import {
+  fetchItemDetail,
+  confirmOrderShipped,
+  freeshippingOrder,
+  fetchSellerOrders,
+  fetchOrderDetail,
+  cookieIdentityMismatch,
+  mtopFailMessage,
+} from './mtop'
+import { persistCookieRotation } from './cookie-store'
 import { upsertSoldOrders } from './order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
 import { isGatewayMode } from './gateway'
@@ -257,12 +266,10 @@ async function pickOrderIdDirect(
 ): Promise<{ orderId: string; source: string }> {
   const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
   const cookieStr = String(acct?.value || '')
-  if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失 — 需要重新扫码登录' }
+  if (!cookieStr) return { orderId: '', source: '账号 cookie 缺失' }
   const pg = await fetchSellerOrders(cookieStr, 1, 'NOT_SHIP')
-  if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
-    await db.run('UPDATE cookies SET value = ? WHERE id = ?', [pg.finalCookieStr, cookieId]).catch(() => {})
-  }
-  if (pg.retMsg) return { orderId: '', source: `远程拉单失败 — ${classifyMtopFailure(pg.retMsg)}` }
+  await persistCookieRotation(db, cookieId, cookieStr, pg.finalCookieStr)
+  if (pg.retMsg) return { orderId: '', source: `远程拉单失败: ${pg.retMsg.slice(0, 200)}` }
   if (!pg.items.length) return { orderId: '', source: '远程待发货列表为空' }
   await upsertSoldOrders(db, cookieId, pg.items).catch(() => {})
   const pending = pg.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
@@ -310,8 +317,7 @@ async function pickOrderIdFromRemote(
         }
       }
       const pr = await fetchOrdersViaProxy(db, cookieId, { queryCode: 'NOT_SHIP', pages: 1, timeoutMs: 12_000 })
-      if (pr.errors.length && !pr.items.length)
-        return { orderId: '', source: `代理拉单失败 — ${pr.errors.map((x) => classifyMtopFailure(x)).join('; ').slice(0, 150)}` }
+      if (pr.errors.length && !pr.items.length) return { orderId: '', source: `代理拉单失败: ${pr.errors.join('; ').slice(0, 200)}` }
       await upsertSoldOrders(db, cookieId, pr.items).catch(() => {})
       const pending = pr.items.filter((o) => o.order_id && !ORDER_TERMINAL_STATUSES.has(o.order_status))
       const hit =
@@ -328,7 +334,8 @@ async function pickOrderIdFromRemote(
     }
     return await pickOrderIdDirect(db, cookieId, itemId, buyerId)
   } catch (e: any) {
-    return { orderId: '', source: `远程拉单异常 — ${classifyMtopFailure(String(e?.message || e))}` }
+    // (v2.1.19) 拉单异常原因一眼清: 超时/网络/平台错误翻译人话 (Cookie 失效/代理不在线等)
+    return { orderId: '', source: `远程拉单异常: ${mtopFailMessage(String(e?.message || e)).slice(0, 200)}` }
   }
 }
 
@@ -380,93 +387,66 @@ export async function handleChatEvent(
     return []
   }
 
-  // 付款触发卡片 (先于暂停与回复链 — butler 自动发货独立于 pause_manager, 人工接入不阻断发货)
+  // 付款触发卡片 (先于暂停与回复链)。v2.1.18 起「[系统卡片] 等待卖家发货」是自动发货的
+  // 唯一固定触发点 (平台每笔付款必下发的交易状态卡片, 比聊天付款卡片更可靠) — 本分支只做
+  // 订单状态流转 (卡片携带订单号时提前落 pending_ship) + 付款通知 + 决策日志留痕, 不再触发
+  // 发货动作, 消灭聊天卡片 × 系统卡片双触发点的重复发货问题。
   if (isPaymentTrigger(msg.content)) {
-    let orderId = extractOrderId(msg.raw)
-    if (!orderId) {
-      // 自愈兜底 (对齐 deliverOnTradeComplete 的回退策略): 付款卡片变体可能不含订单号
-      // (无卡片 JSON / URL 参数名变更), 回退该会话最近一笔可发货订单, 优先匹配商品
-      const byItem = msg.itemId
-        ? await db
-            .get<{ order_id: string }>(
-              `SELECT order_id FROM orders
-               WHERE cookie_id = ? AND chat_id = ? AND system_shipped = 0
-                 AND order_status NOT IN ('shipped', 'closed', 'completed') AND item_id = ?
-               ORDER BY updated_at DESC LIMIT 1`,
-              [cookieId, msg.chatId, msg.itemId],
-            )
-            .catch(() => null)
-        : null
-      const anyOrder =
-        byItem ||
-        (await db
-          .get<{ order_id: string }>(
-            `SELECT order_id FROM orders
-             WHERE cookie_id = ? AND chat_id = ? AND system_shipped = 0
-               AND order_status NOT IN ('shipped', 'closed', 'completed')
-             ORDER BY updated_at DESC LIMIT 1`,
-            [cookieId, msg.chatId],
-          )
-          .catch(() => null))
-      if (anyOrder?.order_id) {
-        orderId = String(anyOrder.order_id)
-        logWarn(`[${cookieId}] 付款卡片未含订单号, 回退会话最近可发货订单 ${orderId} 触发发货`)
-      }
-    }
-    if (!orderId) {
-      // 第三重兜底: 远程拉待发货列表按 商品/买家 匹配 (卡片无订单号 + 本地库未落库的最后防线)
-      const remote = await pickOrderIdFromRemote(db, cookieId, msg.itemId, msg.senderUserId)
-      if (remote.orderId) {
-        orderId = remote.orderId
-        logWarn(`[${cookieId}] 付款卡片未含订单号, 远程拉单命中 ${orderId} (${remote.source}) 触发发货`)
-      } else {
-        logWarn(`[${cookieId}] 付款触发订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
-        // 决策日志一眼清: reply_text 直接写明未发货的明确原因 (cookie 失效/需扫码/拉单失败/代理侧), 卡片原文摘要落 error_message 供排查
-        // (v2.1.14) 不再落 delivery_failed (红色「发货失败」误导排查), 改落 payment_received (琥珀色「用户已付款」)
-        await addLog(db, cookieId, msg, opts, {
-          process_status: 'skipped',
-          decision_reason: 'payment_received',
-          reply_strategy: 'none',
-          reply_text: `用户已付款, 自动发货未启动 — 原因: ${remote.source.slice(0, 200)}`,
-          error_message: `订单号未定位: 付款卡片未含订单号且本地库无可发货订单, 远程拉单落空 (${remote.source}) | 卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
-        })
-        return []
-      }
-    }
-    logWarn(`[${cookieId}] 付款触发: 订单 ${orderId} 商品 ${msg.itemId} → 自动发货`)
-    await upsertOrderPending(db, cookieId, {
-      orderId,
-      itemId: msg.itemId,
-      buyerId: msg.senderUserId,
-      chatId: msg.chatId,
-    })
-    dispatchNotify(
-      {
-        type: 'payment',
-        cookieId,
-        title: '付款成功 · 买家已付款',
-        fields: {
-          订单号: orderId,
-          商品ID: msg.itemId || '未知',
-          买家: msg.senderNick || msg.senderUserId || '未知',
-          处理: '已触发自动发货',
+    const orderId = extractOrderId(msg.raw)
+    if (orderId) {
+      await upsertOrderPending(db, cookieId, {
+        orderId,
+        itemId: msg.itemId,
+        buyerId: msg.senderUserId,
+        chatId: msg.chatId,
+      })
+      // 付款通知 (按订单号去重: 聊天付款卡片与系统交易卡片先后到达只发首条)
+      dispatchNotify(
+        {
+          type: 'payment',
+          cookieId,
+          title: '付款成功 · 买家已付款',
+          fields: {
+            订单号: orderId,
+            商品ID: msg.itemId || '未知',
+            买家: msg.senderNick || msg.senderUserId || '未知',
+            处理: '等待 [等待卖家发货] 系统卡片统一触发自动发货',
+          },
+          link: '/orders',
         },
-        link: '/orders',
-      },
-      orderId,
-    )
-    return autoDeliver(db, cookieId, {
-      orderId,
-      itemId: msg.itemId,
-      buyerId: msg.senderUserId,
-      chatId: msg.chatId,
-    }, opts)
+        orderId,
+      )
+    }
+    logWarn(`[${cookieId}] 付款卡片到达${orderId ? ` (订单 ${orderId}, 已落待发货)` : ' (未含订单号)'} — 自动发货由 [等待卖家发货] 系统卡片统一触发`)
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'payment_received',
+      reply_strategy: 'none',
+      reply_text: '用户已付款, 启动自动发货!',
+      error_message: orderId ? '' : '付款卡片未含订单号, 等待 [等待卖家发货] 系统卡片触发自动发货',
+    })
+    return []
   }
 
-  // 交易完成卡片兑底发货 (先于暂停/旧消息过滤 — 交易成功 = 资金已锁定, 若订单未经本系统发货,
-  // 此处是最后补发窗口; 覆盖付款卡片丢失/变体/解析失败导致的漏发)
+  // 交易完成卡片 (先于暂停/旧消息过滤): 交易成功 = 资金已锁定, 这里只回写订单终态;
+  // 发货仍由 [系统卡片] 等待卖家发货 唯一触发 (交易成功卡片不能作为第二个发货入口)。
   if (isTradeCompleteContent(msg.content)) {
-    return deliverOnTradeComplete(db, cookieId, msg, opts)
+    const doneOrderId = extractOrderId(msg.raw)
+    if (doneOrderId) {
+      await db
+        .run(
+          "UPDATE orders SET order_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+          [doneOrderId],
+        )
+        .catch(() => {})
+    }
+    await addLog(db, cookieId, msg, opts, {
+      process_status: 'skipped',
+      decision_reason: 'system_notice',
+      reply_strategy: 'none',
+      reply_text: `交易成功通知: 已回写订单 ${doneOrderId || '未知'} 终态; 发货由 [系统卡片] 等待卖家发货 触发`,
+    })
+    return []
   }
 
   // (v2.1.6) 仅本店铺买家会话才自动回复: 自己作为买家在他人店铺的会话 (会话商品不属于本账号)
@@ -692,34 +672,22 @@ export async function handleSystemEvent(
     }
   }
 
-  // 交易成功兑底 (系统卡片路径, 无聊天体的纯 redReminder): 交易成功 = 买家已付款且交易终结,
-  // 若订单未经本系统发货 (付款卡片丢失/解析失败), 此处为最后补发窗口 — 与付款触发同等优先
+  // 交易成功系统卡片: 交易已终结, 只回写订单终态并留痕。
+  // 此处不做补发 — 补发会让同一笔付款出现第二个发货入口, 多 isolate 并发时必然重复发货。
   if (msg.redReminder === '交易成功') {
-    if (!orderId) {
-      logWarn(`[${cookieId}] 交易成功卡片未提取到订单号, 无法兑底发货`)
-      return []
+    if (orderId) {
+      await db
+        .run("UPDATE orders SET order_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId])
+        .catch(() => {})
     }
-    const row = await db
-      .get<any>(
-        'SELECT order_id, item_id, buyer_id, chat_id, order_status, system_shipped FROM orders WHERE order_id = ?',
-        [orderId],
-      )
-      .catch(() => null)
-    if (!row || Number(row.system_shipped ?? 0) === 1 || ['shipped', 'closed'].includes(String(row.order_status || ''))) return []
-    const buyerId = msg.buyerId || row.buyer_id || ''
-    const chatId = msg.chatId || row.chat_id || ''
-    if (!chatId || !buyerId) {
-      logWarn(`[${cookieId}] 订单 ${orderId} 交易成功兑底缺少会话/买家信息 (chatId=${chatId ? '有' : '无'}, buyerId=${buyerId ? '有' : '无'}), 跳过补发`)
-      return []
-    }
-    logWarn(`[${cookieId}] 交易成功兑底: 订单 ${orderId} 未经本系统发货, 触发补发`)
-    return autoDeliver(
-      db,
-      cookieId,
-      { orderId, itemId: msg.itemId || row.item_id || '', buyerId, chatId },
-      opts,
-      { content: `[系统卡片] ${msg.redReminder}`, senderNick: '交易消息' },
-    )
+    logWarn(`[${cookieId}] 交易成功系统卡片: 订单 ${orderId || '未知'} 已回写终态, 不触发发货`)
+    await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
+      process_status: 'skipped',
+      decision_reason: 'system_notice',
+      reply_strategy: 'none',
+      reply_text: `交易成功系统卡片: 订单 ${orderId || '未知'} 已回写终态; 发货由 [系统卡片] 等待卖家发货 触发`,
+    })
+    return []
   }
 
   // 小刀卡片 (butler 同语义): 标记议价单 + 触发免拼发货, 再走正常发货链
@@ -728,9 +696,7 @@ export async function handleSystemEvent(
     const shipRow = await db.get<any>('SELECT value FROM cookies WHERE id = ?', [cookieId])
     if (shipRow?.value && msg.itemId && msg.buyerId) {
       const fr = await freeshippingOrder(String(shipRow.value), orderId, String(msg.itemId), String(msg.buyerId))
-      if (fr.finalCookieStr && fr.finalCookieStr !== shipRow.value) {
-        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [fr.finalCookieStr, cookieId]).catch(() => {})
-      }
+      await persistCookieRotation(db, cookieId, String(shipRow.value), fr.finalCookieStr)
       logWarn(`[${cookieId}] 订单 ${orderId} 免拼发货: ${fr.success ? '成功' : `失败 (${fr.message.slice(0, 120)})`}`)
       await db
         .run(
@@ -742,14 +708,21 @@ export async function handleSystemEvent(
   }
 
   if (msg.redReminder !== '等待卖家发货') return []
+
+  /* ---------------- 自动发货唯一固定触发点 (v2.1.18): [系统卡片] 等待卖家发货 ----------------
+   * 平台每笔付款必下发此交易状态卡片 (聊天付款卡片/交易完成卡片均为不可靠变体, 已在
+   * handleChatEvent 收敛为状态流转+留痕) — 订单号四重兜底:
+   *   ① 卡片订单号  ② 商品+买家 10min  ③ 商品 10min  ④ 会话 10min (v2.1.18 新增)
+   *   ⑤ 远程拉待发货列表按 商品/买家 匹配
+   * 时间窗兜底依赖「订单列表同步/拍下建单已落库」; 纯系统卡片变体可能商品/买家全空,
+   * ④按会话回退 (系统卡片与买家会话同 chatId, 会话内 10min 窗口的可发货订单即刚付款那单)。 */
   if (!orderId) {
-    // 自愈兜底: 系统卡片变体可能不含订单号 — 用 商品/买家 维度回退最近一笔 10 分钟内有
-    // 动作的可发货订单 (订单列表同步/拍下建单已落库, 时间窗锁定刚付款的那单, 防误发)
-    let fallbackRow: { order_id: string; buyer_id?: string; chat_id?: string } | null = null
+    let fallbackRow: { order_id: string } | null = null
     if (msg.itemId && msg.buyerId) {
+      // 兜底 ②: 商品+买家 维度 (10 分钟窗口锁刚付款那单, 防误发)
       fallbackRow = await db
-        .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
-          `SELECT order_id, buyer_id, chat_id FROM orders
+        .get<{ order_id: string }>(
+          `SELECT order_id FROM orders
            WHERE cookie_id = ? AND system_shipped = 0
              AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
              AND item_id = ? AND buyer_id = ?
@@ -758,11 +731,13 @@ export async function handleSystemEvent(
           [cookieId, msg.itemId, msg.buyerId],
         )
         .catch(() => null)
+      if (fallbackRow) logWarn(`[${cookieId}] 系统卡片未含订单号, 按商品/买家回退最近可发货订单 ${fallbackRow.order_id} 触发发货`)
     }
     if (!fallbackRow && msg.itemId) {
+      // 兜底 ③: 商品维度
       fallbackRow = await db
-        .get<{ order_id: string; buyer_id?: string; chat_id?: string }>(
-          `SELECT order_id, buyer_id, chat_id FROM orders
+        .get<{ order_id: string }>(
+          `SELECT order_id FROM orders
            WHERE cookie_id = ? AND system_shipped = 0
              AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
              AND item_id = ?
@@ -771,32 +746,60 @@ export async function handleSystemEvent(
           [cookieId, msg.itemId],
         )
         .catch(() => null)
+      if (fallbackRow) logWarn(`[${cookieId}] 系统卡片未含订单号/买家, 按商品回退最近可发货订单 ${fallbackRow.order_id} 触发发货`)
+    }
+    if (!fallbackRow && msg.chatId) {
+      // 兜底 ④: 会话维度 — 卡片变体可能商品/买家全空, 会话内 10min 窗口的可发货订单即刚付款那单
+      fallbackRow = await db
+        .get<{ order_id: string }>(
+          `SELECT order_id FROM orders
+           WHERE cookie_id = ? AND system_shipped = 0
+             AND order_status IN ('pending_payment', 'pending_ship', 'unknown')
+             AND chat_id = ?
+             AND updated_at >= datetime('now', '-10 minutes')
+           ORDER BY updated_at DESC LIMIT 1`,
+          [cookieId, msg.chatId],
+        )
+        .catch(() => null)
+      if (fallbackRow) logWarn(`[${cookieId}] 系统卡片未含订单号/商品/买家, 按会话 ${msg.chatId} 回退最近可发货订单 ${fallbackRow.order_id} 触发发货`)
     }
     if (!fallbackRow) {
-      // 第三重兜底: 远程拉待发货列表按 商品/买家 匹配 (与聊天付款卡片路径同款防线)
+      // 兜底 ⑤: 远程拉待发货列表按 商品/买家 匹配 (本地库未落库的最后防线)
       const remote = await pickOrderIdFromRemote(db, cookieId, msg.itemId, msg.buyerId)
       if (remote.orderId) {
         fallbackRow = { order_id: remote.orderId }
         logWarn(`[${cookieId}] 系统卡片未含订单号, 远程拉单命中 ${remote.orderId} (${remote.source}) 触发发货`)
       } else {
-        logWarn(`[${cookieId}] 付款事件订单号三重兜底均落空 (${remote.source}), 跳过自动发货`)
-        // (v2.1.14) 同上: 用户已付款语义, 不再落 delivery_failed; reply_text 直接写明未发货原因
+        logWarn(`[${cookieId}] 付款事件订单号五重兜底均落空 (${remote.source}), 跳过自动发货`)
+        // 用户已付款语义 (v2.1.14): 落琥珀色「用户已付款」留痕。
+        // (v2.1.19) 失败原因前置到回复内容列 (前端 payment_received 行展示 reply_text):
+        // 「已付款但未发货 + 为什么没发」一眼清 (拉单失败/Cookie 失效/代理不在线),
+        // 不再把原因埋在 error_message 里 (卡片原文摘要仍保留在 error_message 供深查)
         await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
           process_status: 'skipped',
           decision_reason: 'payment_received',
           reply_strategy: 'none',
-          reply_text: `用户已付款, 自动发货未启动 — 原因: ${remote.source.slice(0, 200)}`,
-          error_message: `订单号未定位: 系统卡片未含订单号且本地库无可发货订单, 远程拉单落空 (${remote.source}) | 卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
+          reply_text: `用户已付款, 自动发货未执行: 订单号定位失败 — ${remote.source.slice(0, 300)}`,
+          error_message: `卡片原文摘要: ${JSON.stringify(msg.raw).slice(0, 300)}`,
         })
         return []
       }
     }
     orderId = String(fallbackRow.order_id)
-    logWarn(`[${cookieId}] 系统卡片未含订单号, 回退商品/买家维度最近可发货订单 ${orderId} 触发发货`)
   }
 
-  // 会话/买家信息兜底: 纯系统卡片可能缺 chatId/buyerId, 从订单行回填 (缺失则无法发送, 跳过)
-  const orderRow = await db.get<any>('SELECT buyer_id, chat_id FROM orders WHERE order_id = ?', [orderId])
+  // 「等待卖家发货」= 买家已付款的平台铁证: 订单统一落/推为待发货 (幂等, 不回退已发货/
+  // 已完成状态)。兜底找到的订单可能仍是 pending_payment (拍下事件先落库、付款事件尚未同步),
+  // 不先推状态会被发货链 require_paid 拦截 (v2.1.18 修复发货断链点)。
+  await upsertOrderPending(db, cookieId, {
+    orderId,
+    itemId: msg.itemId,
+    buyerId: msg.buyerId,
+    chatId: msg.chatId,
+  })
+
+  // 会话/买家/商品信息兜底: 纯系统卡片可能缺 chatId/buyerId, 从订单行回填 (缺失则无法发送, 跳过)
+  const orderRow = await db.get<any>('SELECT item_id, buyer_id, chat_id FROM orders WHERE order_id = ?', [orderId])
   const buyerId = msg.buyerId || orderRow?.buyer_id || ''
   const chatId = msg.chatId || orderRow?.chat_id || ''
   // 付款通知 (按订单号去重: 聊天付款卡片与系统交易卡片先后到达只发首条)
@@ -807,7 +810,7 @@ export async function handleSystemEvent(
       title: '付款成功 · 买家已付款',
       fields: {
         订单号: orderId,
-        商品ID: msg.itemId || '未知',
+        商品ID: msg.itemId || orderRow?.item_id || '未知',
         买家: buyerId || '未知',
         处理: '已触发自动发货',
       },
@@ -816,19 +819,20 @@ export async function handleSystemEvent(
     orderId,
   )
   if (!chatId || !buyerId) {
-    logWarn(`[${cookieId}] 订单 ${orderId} 缺少会话/买家信息 (chatId=${chatId ? '有' : '无'}, buyerId=${buyerId ? '有' : '无'}), 等待付款卡片触发发货`)
-    await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-      process_status: 'skipped',
-      decision_reason: 'delivery_failed',
-      reply_strategy: 'none',
-      reply_text: `订单 ${orderId} 缺少会话/买家信息, 等待付款卡片触发发货`,
-    })
-    return []
+    // 平台发货只需要订单号, 只有聊天动作才需要会话 — 缺会话照常发货 (凭证在订单里可见),
+    // 缺买家则无法定位会话, 同样只做平台发货; 这里是唯一发货入口, 绝不能再因此放弃发货
+    logWarn(`[${cookieId}] 订单 ${orderId} 缺少会话/买家信息 (chatId=${chatId ? '有' : '无'}, buyerId=${buyerId ? '有' : '无'}), 仅执行平台发货, 不发聊天消息`)
   }
-  return autoDeliver(db, cookieId, { orderId, itemId: msg.itemId, buyerId, chatId }, opts, {
-    content: `[系统卡片] ${msg.redReminder}`,
-    senderNick: '交易消息',
-  })
+  return autoDeliver(
+    db,
+    cookieId,
+    { orderId, itemId: msg.itemId || orderRow?.item_id || '', buyerId, chatId },
+    opts,
+    {
+      content: `[系统卡片] ${msg.redReminder}`,
+      senderNick: '交易消息',
+    },
+  )
 }
 
 /* ---------------------------------- 订单落库 ---------------------------------- */
@@ -861,103 +865,6 @@ async function upsertOrderPending(
       [ctx.orderId, ctx.itemId || '', ctx.buyerId || '', cookieId, ctx.chatId || ''],
     )
     .catch(() => {})
-}
-
-/**
- * 交易完成兜底发货: [买家确认收货，交易成功] 等交易终结卡片到达时, 资金已锁定;
- * 若关联订单未经本系统发货 (付款卡片丢失/变体/解析失败), 此处是最后补发窗口。
- * 订单定位: 卡片订单号 → 订单缺失时用卡片信息补建 → 订单号缺失时回退该会话最近一条未发货订单。
- */
-async function deliverOnTradeComplete(
-  db: Awaited<ReturnType<typeof getDb>>,
-  cookieId: string,
-  msg: ParsedChatMessage,
-  opts: BrainOptions,
-): Promise<EngineAction[]> {
-  const orderId = extractOrderId(msg.raw)
-  let order = orderId
-    ? await db
-        .get<any>(
-          'SELECT order_id, item_id, buyer_id, chat_id, order_status, system_shipped FROM orders WHERE order_id = ?',
-          [orderId],
-        )
-        .catch(() => null)
-    : null
-
-  // 订单行缺失 (付款卡片完全丢失): 用交易成功卡片信息补建, status=completed (资金已锁定, 未发货)
-  if (!order && orderId) {
-    await db
-      .run(
-        `INSERT INTO orders (order_id, item_id, buyer_id, order_status, cookie_id, chat_id, version, system_shipped)
-         VALUES (?, ?, ?, 'completed', ?, ?, 1, 0)
-         ON CONFLICT(order_id) DO NOTHING`,
-        [orderId, msg.itemId || '', msg.senderUserId || '', cookieId, msg.chatId || ''],
-      )
-      .catch(() => {})
-    order = await db
-      .get<any>(
-        'SELECT order_id, item_id, buyer_id, chat_id, order_status, system_shipped FROM orders WHERE order_id = ?',
-        [orderId],
-      )
-      .catch(() => null)
-  }
-
-  // 订单号不可用: 回退该会话最近一条未发货订单 (交易成功卡片与付款卡片同一会话)
-  if (!order) {
-    order = await db
-      .get<any>(
-        `SELECT order_id, item_id, buyer_id, chat_id, order_status, system_shipped FROM orders
-         WHERE cookie_id = ? AND chat_id = ? AND system_shipped = 0 AND order_status NOT IN ('shipped', 'closed')
-         ORDER BY updated_at DESC LIMIT 1`,
-        [cookieId, msg.chatId],
-      )
-      .catch(() => null)
-  }
-
-  // 未发货判定: system_shipped 为本系统发货标记; shipped(人工发货)/closed(交易关闭) 不补发
-  const undelivered =
-    order &&
-    Number(order.system_shipped ?? 0) !== 1 &&
-    !['shipped', 'closed'].includes(String(order.order_status || ''))
-  if (!undelivered) {
-    // 已发货/已关闭/无关联订单: 维持系统通知语义, 不进回复链
-    await addLog(db, cookieId, msg, opts, {
-      process_status: 'skipped',
-      decision_reason: 'system_notice',
-      reply_strategy: 'none',
-    })
-    return []
-  }
-
-  const targetOrderId = String(order.order_id)
-  const buyerId = String(order.buyer_id || msg.senderUserId || '')
-  const chatId = String(msg.chatId || order.chat_id || '')
-  if (!chatId || !buyerId) {
-    logWarn(`[${cookieId}] 交易成功兜底: 订单 ${targetOrderId} 缺少会话/买家信息 (chatId=${chatId ? '有' : '无'}, buyerId=${buyerId ? '有' : '无'}), 跳过补发`)
-    await addLog(db, cookieId, msg, opts, {
-      process_status: 'skipped',
-      decision_reason: 'delivery_failed',
-      reply_strategy: 'none',
-      reply_text: `交易成功兜底: 订单 ${targetOrderId} 缺少会话/买家信息, 无法补发`,
-    })
-    return []
-  }
-
-  // 交易成功 = 买家已付款: 订单落为待发货 (不回退已发货/已完成状态), 补齐买家/会话信息
-  await upsertOrderPending(db, cookieId, {
-    orderId: targetOrderId,
-    itemId: String(msg.itemId || order.item_id || ''),
-    buyerId,
-    chatId,
-  })
-  logWarn(`[${cookieId}] 交易成功兜底: 订单 ${targetOrderId} 未经本系统发货, 触发补发`)
-  return autoDeliver(
-    db,
-    cookieId,
-    { orderId: targetOrderId, itemId: String(msg.itemId || order.item_id || ''), buyerId, chatId },
-    opts,
-    { content: msg.content, senderNick: msg.senderNick },
-  )
 }
 
 /* ---------------------------------- 回复链 ---------------------------------- */
@@ -1400,6 +1307,96 @@ async function callDashscopeAppApi(baseUrl: string, apiKey: string, systemPrompt
 
 /* ---------------------------------- 自动发货 ---------------------------------- */
 
+/** 平台发货瞬时拒绝判定 (状态未同步/风控限流/网关抖动), 业务性拒绝不重试。 */
+function isTransientConsignError(message: string): boolean {
+  return /ORDER_STATUS_ERROR|FAIL_SYS_|FAIL_BIZ_COMMON_SYSTEM_ERROR|SYSTEM_ERROR|系统繁忙|超时|timeout|ECONN|fetch failed/i.test(
+    message,
+  )
+}
+
+/**
+ * 跨实例发货认领: 3 分钟内同一订单只允许一个执行者 (edge 多 isolate / 多进程并发都成立)。
+ * 订单行缺失时先补建最小行再认领 (远程兜底拿到的订单号可能尚未落库)。
+ */
+async function claimDelivery(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  orderId: string,
+): Promise<boolean> {
+  const tryClaim = async (): Promise<boolean> => {
+    const r = await db.run(
+      `UPDATE orders SET delivery_claim_at = CURRENT_TIMESTAMP
+       WHERE order_id = ? AND COALESCE(system_shipped, 0) = 0
+         AND (delivery_claim_at IS NULL OR delivery_claim_at <= datetime('now', '-3 minutes'))`,
+      [orderId],
+    )
+    return Number(r?.changes || 0) === 1
+  }
+  if (await tryClaim()) return true
+  const exists = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [orderId])
+  if (exists) return false
+  await db
+    .run(
+      `INSERT INTO orders (order_id, cookie_id, order_status, version, system_shipped)
+       VALUES (?, ?, 'pending_ship', 1, 0)`,
+      [orderId, cookieId],
+    )
+    .catch(() => {})
+  return await tryClaim()
+}
+
+/** 释放认领 (发货未达成时调用, 让后续触发可重试)。 */
+async function releaseDeliveryClaim(db: Awaited<ReturnType<typeof getDb>>, orderId: string): Promise<void> {
+  await db
+    .run('UPDATE orders SET delivery_claim_at = NULL WHERE order_id = ? AND COALESCE(system_shipped, 0) = 0', [orderId])
+    .catch(() => {})
+}
+
+/**
+ * 无需邮寄发货 (带有限重试)。平台在付款事件刚落库的几秒内常报 ORDER_STATUS_ERROR::订单状态不正确,
+ * 等几秒状态同步即成功; 只对瞬时错误重试, 业务性拒绝 (无权限/参数错) 立即返回。
+ * 最终失败时回查订单真实状态并附在原因里, 避免只留一句「订单状态不正确」无从排查。
+ */
+async function consignOrderWithRetry(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  orderId: string,
+  baseCookie: string,
+  tradeText: string,
+): Promise<{ success: boolean; message: string }> {
+  const retryDelays = [3000, 8000]
+  let cookie = baseCookie
+  let message = ''
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    if (attempt > 0) {
+      await sleep(retryDelays[attempt - 1] ?? 0)
+      // 重试前取库内最新 Cookie: 保活链路可能刚轮换会话, 用最新会话再试
+      const row = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [cookieId])
+      if (row?.value) cookie = String(row.value)
+    }
+    const confirm = await confirmOrderShipped(cookie, orderId, tradeText)
+    if (confirm.finalCookieStr) {
+      cookie = await persistCookieRotation(db, cookieId, cookie, confirm.finalCookieStr)
+    }
+    if (confirm.success) return { success: true, message: confirm.message }
+    message = confirm.message
+    if (!isTransientConsignError(message)) return { success: false, message }
+    logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货第 ${attempt + 1} 次被平台拒绝: ${message.slice(0, 120)}`)
+  }
+
+  const detail = await fetchOrderDetail(cookie, orderId)
+  if (detail.finalCookieStr) {
+    await persistCookieRotation(db, cookieId, cookie, detail.finalCookieStr)
+  }
+  if (detail.detail) {
+    const statusText = detail.detail.status_text || detail.detail.order_status
+    message = `${message} | 平台订单状态: ${statusText}`
+  } else if (detail.retMsg) {
+    message = `${message} | 订单状态回查失败: ${detail.retMsg.slice(0, 80)}`
+  }
+  return { success: false, message }
+}
+
 /**
  * 自动发货主流程 (语义对齐 butler _handle_auto_delivery + _auto_delivery)。
  * 调用前提: 订单已落库为 pending_ship (付款触发由调用方先 upsert)。
@@ -1414,26 +1411,15 @@ async function autoDeliver(
 ): Promise<EngineAction[]> {
   const orderId = ctx.orderId
 
-  // 订单归属三重校验 (防伪造文本/串号误发)
-  const order = await db.get<any>(
-    'SELECT order_id, cookie_id, item_id, buyer_id, order_status, quantity, system_shipped FROM orders WHERE order_id = ?',
-    [orderId],
-  )
-  if (order) {
-    if (order.cookie_id && String(order.cookie_id) !== String(cookieId)) return []
-    if (order.item_id && ctx.itemId && String(order.item_id) !== String(ctx.itemId)) return []
-    if (order.buyer_id && ctx.buyerId && String(order.buyer_id) !== String(ctx.buyerId)) return []
-  }
-  const localStatus = order?.order_status
-
-  // 决策日志桩: 发货动作在决策日志中全程可见 (成功 = 自动发货, 失败/跳过原因均可追溯)
+  // 决策日志桩: 发货动作在决策日志中全程可见 (成功 = 自动发货, 失败/跳过原因均可追溯)。
+  // (v2.1.19) 定义前移到归属校验之前 — 拦截/串号类失败同样落 delivery_failed 留痕, 不再静默。
   const logMsg: ParsedChatMessage = {
     kind: 'chat',
     chatId: ctx.chatId || '',
     senderUserId: ctx.buyerId || '',
     senderNick: String(trigger?.senderNick || ctx.buyerId || '交易消息'),
     content: String(trigger?.content || `[自动发货] 订单 ${orderId}`).slice(0, 500),
-    itemId: ctx.itemId || '',
+    itemId: String(ctx.itemId || ''),
     createTime: 0,
     sessionType: '1',
     isSelf: false,
@@ -1447,6 +1433,30 @@ async function autoDeliver(
       reply_text: reason.slice(0, 400),
     })
   }
+
+  // 订单归属三重校验 (防伪造文本/串号误发); (v2.1.19) 拦截原因落决策日志一眼可见, 不再静默 return
+  const order = await db.get<any>(
+    'SELECT order_id, cookie_id, item_id, buyer_id, order_status, quantity, system_shipped FROM orders WHERE order_id = ?',
+    [orderId],
+  )
+  if (order) {
+    if (order.cookie_id && String(order.cookie_id) !== String(cookieId)) {
+      logWarn(`[${cookieId}] 订单 ${orderId} 归属账号 ${order.cookie_id} 与当前触发账号不符, 拦截自动发货 (防串号误发)`)
+      await failLog(`订单 ${orderId} 归属账号 ${order.cookie_id} 与当前触发账号 ${cookieId} 不符, 已拦截自动发货 (防串号误发; 若为串号请删除账号重新扫码)`)
+      return []
+    }
+    if (order.item_id && ctx.itemId && String(order.item_id) !== String(ctx.itemId)) {
+      logWarn(`[${cookieId}] 订单 ${orderId} 商品与触发卡片不符 (订单 ${order.item_id} / 卡片 ${ctx.itemId}), 拦截自动发货`)
+      await failLog(`订单 ${orderId} 商品与触发卡片不符 (订单商品 ${order.item_id} / 卡片商品 ${ctx.itemId}), 已拦截自动发货`)
+      return []
+    }
+    if (order.buyer_id && ctx.buyerId && String(order.buyer_id) !== String(ctx.buyerId)) {
+      logWarn(`[${cookieId}] 订单 ${orderId} 买家与触发卡片不符 (订单 ${order.buyer_id} / 卡片 ${ctx.buyerId}), 拦截自动发货`)
+      await failLog(`订单 ${orderId} 买家与触发卡片不符 (订单买家 ${order.buyer_id} / 卡片买家 ${ctx.buyerId}), 已拦截自动发货`)
+      return []
+    }
+  }
+  const localStatus = order?.order_status
 
   // 已发货判定以 system_shipped (本系统发货标记) 为准, 不再误伤 completed (交易成功但本系统未发货);
   // shipped = 人工已发货 / closed = 交易关闭(退款), 均不补发。
@@ -1487,26 +1497,39 @@ async function autoDeliver(
     return []
   }
 
+  // 跨实例发货认领: edge 多 isolate / 多进程会同时处理同一笔付款, 内存锁只在单实例内有效。
+  // 认领成功者独占本次发货, 其余立即退出 — 防重复发货靠这一行原子 UPDATE, 不靠进程内状态。
+  if (!(await claimDelivery(db, cookieId, orderId))) {
+    logWarn(`[${cookieId}] 订单 ${orderId} 正由其它执行者发货中 (已认领), 本次跳过`)
+    await failLog(`订单 ${orderId} 正由其它执行者发货中 (3 分钟内已认领), 本次跳过; 确认未发货可在订单页手动发货`)
+    return []
+  }
+  let shipped = false
+
   const run = (async () => {
     try {
       return await (async () => {
     const buyerId = ctx.buyerId || order?.buyer_id || ''
     const chatId = ctx.chatId || order?.chat_id || ''
+    // 商品 ID 回填 (v2.1.18): 卡片变体可能不带商品 ID, 订单号已知时订单行必有 item_id
+    // (落库时写入) — 发货规则按商品直配 (trigger_type=payment) 依赖它, 缺失会导致规则
+    // 永不失配「无匹配发货规则」(发货断链点)
+    const itemId = String(ctx.itemId || order?.item_id || '')
 
     // 商品归属校验: 商品必须属于当前账号; 缺失时按需拉取详情补齐 (butler get_item_info 行为)
     // item_price 必须查出: deliverVars.{price} 与订单金额回填依赖它 (缺列曾致 {price} 永远空串)
-    let item = ctx.itemId
+    let item = itemId
       ? await db.get<any>(
           'SELECT item_id, item_title, item_price, item_description, item_detail, multi_quantity_delivery FROM item_info WHERE cookie_id = ? AND item_id = ?',
-          [cookieId, ctx.itemId],
+          [cookieId, itemId],
         )
       : null
-    if (!item && ctx.itemId) {
-      item = await backfillItemInfo(db, cookieId, ctx.itemId)
+    if (!item && itemId) {
+      item = await backfillItemInfo(db, cookieId, itemId)
     }
     if (!item) {
-      logWarn(`[${cookieId}] 商品 ${ctx.itemId || '未知'} 不属于当前账号, 跳过自动发货`)
-      await failLog(`商品 ${ctx.itemId || '未知'} 不属于当前账号, 跳过自动发货`)
+      logWarn(`[${cookieId}] 商品 ${itemId || '未知'} 不属于当前账号, 跳过自动发货`)
+      await failLog(`商品 ${itemId || '未知'} 不属于当前账号, 跳过自动发货`)
       return []
     }
 
@@ -1517,7 +1540,7 @@ async function autoDeliver(
        ORDER BY id ASC`,
       [cookieId],
     )
-    const paymentRules = rules.filter((r) => r.trigger_type === 'payment' && r.item_id === ctx.itemId)
+    const paymentRules = rules.filter((r) => r.trigger_type === 'payment' && r.item_id === itemId)
     let rule = paymentRules[0] || null
     if (!rule) {
       const haystack = `${item.item_title || ''} ${item.item_description || ''} ${item.item_detail || ''}`.toLowerCase().trim()
@@ -1542,7 +1565,7 @@ async function autoDeliver(
           type: 'delivered',
           cookieId,
           title: '自动发货失败 · 无匹配发货规则',
-          fields: { 订单号: orderId, 商品ID: ctx.itemId || '未知', 原因: '请检查发货规则 (商品直配或关键词匹配)' },
+          fields: { 订单号: orderId, 商品ID: itemId || '未知', 原因: '请检查发货规则 (商品直配或关键词匹配)' },
           link: '/delivery',
         },
         orderId,
@@ -1590,7 +1613,7 @@ async function autoDeliver(
       title: String(item.item_title || ''),
       price: String(item.item_price || ''),
       // 商品ID是 API 卡券按商品匹配资源 (autoship/cards-hub body.item_id) 的必需上下文, 恒可用
-      item_id: String(ctx.itemId || ''),
+      item_id: String(itemId || ''),
       apikey: String(apiConf.api_key || ''),
       username: String(conv?.peer_nick || buyerId || ''),
       userid: String(buyerId || ''),
@@ -1606,7 +1629,7 @@ async function autoDeliver(
       const key = String(v.var_key || '')
       if (!key || key in deliverVars) continue
       if (v.category === 'item') {
-        if (key === 'item_id') deliverVars[key] = String(ctx.itemId || '')
+        if (key === 'item_id') deliverVars[key] = String(itemId || '')
         else if (key === 'desc') deliverVars[key] = String(item.item_description || '')
         else if (key === 'detail') deliverVars[key] = String(item.item_detail || '')
         else if (key === 'quantity') deliverVars[key] = String(order?.quantity || '1')
@@ -1664,7 +1687,7 @@ async function autoDeliver(
         const finalCode = await persistCardCode(
           db,
           card,
-          { cookieId, itemId: String(ctx.itemId || ''), orderId, buyerId },
+          { cookieId, itemId: String(itemId || ''), orderId, buyerId },
           extract.generatedCodes[i],
         )
         if (finalCode && finalCode !== extract.generatedCodes[i]) {
@@ -1700,14 +1723,13 @@ async function autoDeliver(
       // (v2.1.6) 决策后台 sleep 硬上限 60s: delay_seconds 配置过大曾拖垮决策 (占位3分钟即判失效,
       // 代理重报死循环, 发货/发消息全部停滞); 卡券延迟语义保留, 仅封顶防决策超时
       if (delayMs > 0) await sleep(Math.min(delayMs, 60_000))
-      const confirm = await confirmOrderShipped(
-        String(accountRow?.value || ''),
+      const confirm = await consignOrderWithRetry(
+        db,
+        cookieId,
         orderId,
+        String(accountRow?.value || ''),
         voucherTexts.join('\n').slice(0, 1000),
       )
-      if (confirm.finalCookieStr && confirm.finalCookieStr !== accountRow?.value) {
-        await db.run('UPDATE cookies SET value = ? WHERE id = ?', [confirm.finalCookieStr, cookieId]).catch(() => {})
-      }
       await db
         .run(
           'UPDATE orders SET consign_status = ?, consign_message = ?, consign_at = CURRENT_TIMESTAMP WHERE order_id = ?',
@@ -1716,9 +1738,28 @@ async function autoDeliver(
         .catch(() => {})
       logWarn(`[${cookieId}] 订单 ${orderId} 无需邮寄发货: ${confirm.success ? '成功 (发货凭证已提交平台)' : `失败 (${confirm.message.slice(0, 120)})`}`)
       if (!confirm.success) {
-        // 决策日志必留痕: 发货接口失败的明确原因 (cookie 失效需扫码/风控/代理网关不可达/订单状态瞬时误报),
-        // message 已由 mtop 层归类为「一眼清」结论; 未标记已发货、未设冷却, 后续付款卡片/提醒发货触发自动重试
-        await failLog(`订单 ${orderId} 自动发货失败 — 无需邮寄发货接口未达成: ${confirm.message.slice(0, 300)} (未标记已发货, 后续触发将自动重试)`)
+        // 平台最终拒绝: 不标记已发货/不降级为聊天消息, 但必须留下可见日志 + 通知 —
+        // 静默 return 会让「为什么没发货」在后台完全查不到。consignOrderWithRetry 已做
+        // 3 次有界重试 (瞬时拒绝), message 已由 mtop 层翻译人话; 终失败已回查平台订单真实状态。
+        // 本系统未标记已发货/未设冷却, 买家催发货/卡片重推时防重链自动重试。
+        const transient = /ORDER_STATUS_ERROR|订单状态不正确/.test(confirm.message)
+        await failLog(
+          `订单 ${orderId} 自动发货失败: 无需邮寄发货接口返回「${confirm.message.slice(0, 240)}」; 已重试 3 次, 发货内容未提交, 订单未标记已发货${transient ? ' (若为平台状态同步延迟, 买家催发货/卡片重推时自动重试)' : ''}`,
+        )
+        dispatchNotify(
+          {
+            type: 'delivered',
+            cookieId,
+            title: '自动发货失败 · 平台拒绝发货',
+            fields: {
+              订单号: orderId,
+              商品ID: itemId || '未知',
+              平台返回: confirm.message.slice(0, 120),
+            },
+            link: '/orders',
+          },
+          orderId,
+        )
         return []
       }
       viaVoucher = voucherTexts.length > 0
@@ -1727,8 +1768,8 @@ async function autoDeliver(
     const actions: EngineAction[] = []
     // 卡券内容交付 (是否发送/发什么由卡券管理配置决定):
     // (v2.1.7) 无需邮寄发货成功时文本内容已随发货凭证提交平台, 不再占用聊天消息; 图片内容仍聊天发送。
-    // 其余模式 (仅发消息/跟随账号) 保持原行为: 文本+图片均聊天发送
-    for (let i = 0; i < total; i++) {
+    // 其余模式 (仅发消息/跟随账号) 保持原行为: 文本+图片均聊天发送 (缺会话/买家时只发货不发消息)
+    for (let i = 0; i < total && chatId && buyerId; i++) {
       const content = extract.items[i % extract.items.length]
       for (const part of content.parts) {
         if (part.kind === 'text') {
@@ -1757,7 +1798,7 @@ async function autoDeliver(
     }
     // 消息回复 (卡券级附加消息): 留空则发货时不同时发送消息; 支持发货变量 ({shareURL} = API 提取结果)
     const replyMsg = applyCardVars(String(card.description || '').trim(), deliverVars)
-    if (replyMsg) {
+    if (replyMsg && chatId && buyerId) {
       actions.push({
         type: 'send_text',
         account: cookieId,
@@ -1768,13 +1809,16 @@ async function autoDeliver(
       })
     }
 
+    // 发货已达成 (平台无需邮寄发货成功 / 仅发消息模式): 认领转正, 后续不再释放
+    shipped = true
+
     // 落库: 发货记录 + 订单状态 + 规则计数
     for (const content of extract.items) {
       await db
         .run(
           `INSERT INTO card_shipments (card_id, card_name, content, order_id, item_id, buyer_id, cookie_id)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [card.id, card.name, content.preview, orderId, ctx.itemId, buyerId, cookieId],
+          [card.id, card.name, content.preview, orderId, itemId, buyerId, cookieId],
         )
         .catch(() => {})
     }
@@ -1814,7 +1858,7 @@ async function autoDeliver(
         title: `自动发货成功 · ${card.name}`,
         fields: {
           订单号: orderId,
-          商品ID: ctx.itemId || '未知',
+          商品ID: itemId || '未知',
           发送内容: `${total} 份`,
           发货方式: viaVoucher ? '无需邮寄发货凭证 (买家在订单中查看, 不占聊天消息)' : '聊天消息',
           ...(extract.generatedCodes?.length ? { 卡密: extract.generatedCodes.join(', ') } : {}),
@@ -1830,20 +1874,24 @@ async function autoDeliver(
       // (v2.1.6) 发货全链路异常兜底: mtop 网关/任务/直连全挂、DB 异常等场景不再炸决策
       // (曾致: 占位被删 → 代理「决策超时失效」无限重报 → 不发货+无日志死循环)。
       // 落 delivery_failed 决策日志 + 通知, 决策正常终结, 代理重报后由防重链安全重试。
-      logWarn(`[${cookieId}] 订单 ${orderId} 自动发货异常: ${String(e?.message || e).slice(0, 200)}`)
-      // 异常原因归类 (cookie 失效/需扫码/风控/代理网关不可达/平台报错), 决策日志一眼清
-      await failLog(`自动发货异常 — ${classifyMtopFailure(String(e?.message || e)) || '未知异常'}`)
+      // (v2.1.19) 异常原因一眼清: 超时/网络/平台错误统一翻译人话 (Cookie 失效/代理不在线等), 不再只落英文堆栈。
+      const failReason = mtopFailMessage(String(e?.message || e)).slice(0, 300)
+      logWarn(`[${cookieId}] 订单 ${orderId} 自动发货异常: ${failReason}`)
+      await failLog(`自动发货异常: ${failReason}`)
       dispatchNotify(
         {
           type: 'delivered',
           cookieId,
           title: '自动发货异常',
-          fields: { 订单号: orderId, 异常: String(e?.message || e).slice(0, 120) },
+          fields: { 订单号: orderId, 异常: failReason.slice(0, 120) },
           link: '/orders',
         },
         orderId,
       )
       return []
+    } finally {
+      // 未发货 (无规则/卡券发完/平台拒绝/异常) 必须释放认领: 后续触发事件可立即重试
+      if (!shipped) await releaseDeliveryClaim(db, orderId)
     }
   })()
 
@@ -1864,9 +1912,7 @@ async function backfillItemInfo(
   if (!accountRow?.value) return null
   try {
     const { detail, finalCookieStr } = await fetchItemDetail(String(accountRow.value), itemId)
-    if (finalCookieStr && finalCookieStr !== accountRow.value) {
-      await db.run('UPDATE cookies SET value = ? WHERE id = ?', [finalCookieStr, cookieId]).catch(() => {})
-    }
+    await persistCookieRotation(db, cookieId, String(accountRow.value), finalCookieStr)
     if (!detail) return null
     await db
       .run(

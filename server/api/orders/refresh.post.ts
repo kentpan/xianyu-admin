@@ -13,6 +13,7 @@
  * 返回 { inserted, updated, blocked, skipped_deleted, accounts, mode, elapsed_ms, errors[] }。
  */
 import { fetchSellerOrders, cookieIdentityMismatch } from '../../utils/xianyu/mtop'
+import { persistCookieRotation } from '../../utils/xianyu/cookie-store'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
 import { isGatewayMode } from '../../utils/xianyu/gateway'
@@ -74,8 +75,9 @@ export default defineEventHandler(
               }
               const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
               if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+                const base = cookieStr
                 cookieStr = pg.finalCookieStr
-                await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, acct.id]).catch(() => {})
+                await persistCookieRotation(db, String(acct.id), base, cookieStr)
               }
               if (pg.retMsg) {
                 listErrors.push(`${acct.id}: ${pg.retMsg.slice(0, 120)}`)
@@ -135,8 +137,9 @@ export default defineEventHandler(
           }
           const pg = await fetchSellerOrders(cookieStr, page, 'ALL')
           if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) {
+            const base = cookieStr
             cookieStr = pg.finalCookieStr
-            await db.run('UPDATE cookies SET value = ? WHERE id = ?', [cookieStr, acct.id]).catch(() => {})
+            await persistCookieRotation(db, String(acct.id), base, cookieStr)
           }
           if (pg.retMsg) {
             listErrors.push(`${acct.id}: ${pg.retMsg.slice(0, 120)}`)

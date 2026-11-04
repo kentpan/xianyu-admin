@@ -47,7 +47,8 @@ import { publishChatEvent, publishSystemEvent, publishRiskEvent } from '../../ut
 import { consumeRate } from '../../utils/rate-limit'
 import { parseLosslessJson } from '../../utils/xianyu/lossless-json'
 import { parseSyncItem, type ParsedMessage } from '../../utils/xianyu/protocol'
-import { parseCookieStr } from '../../utils/xianyu/mtop'
+import { parseCookieStr, mtopFailMessage } from '../../utils/xianyu/mtop'
+import { mergeReportedCookies } from '../../utils/xianyu/cookie-store'
 
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
@@ -145,14 +146,15 @@ export default defineEventHandler(
       const account = String(ev?.account || '')
       if (!account) continue
       try {
-        // 动作执行结果回报: 代理按 log_id 回写发送结果, 决策日志的发送状态由此闭环
+        // 动作执行结果回报: 代理按 log_id 回写发送结果, 决策日志的发送状态由此闭环。
+        // (v2.1.19) 代理侧发送失败原因一眼清: Cookie 失效/风控/网络/超时统一翻译人话后落 error_message
         if (ev.type === 'action_result') {
           const logId = Number(ev.log_id || 0)
           if (logId > 0) {
             await db
               .run('UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?', [
                 ev.ok ? 'success' : 'failed',
-                String(ev.error || '').slice(0, 300),
+                mtopFailMessage(String(ev.error || '')).slice(0, 300),
                 logId,
               ])
               .catch(() => {})
@@ -169,6 +171,14 @@ export default defineEventHandler(
               }
             }
           }
+          continue
+        }
+
+        // ---- 代理侧 Cookie 轮换回报: WS 握手/保活/mtop 调用都会刷新 _m_h5_tk 等会话字段,
+        // 代理是唯一持有活跃会话的一方。不上报时后台库里的 Cookie 会随保活轮换而过期,
+        // 后台发货带着过期 token 请求平台必被拒 (ORDER_STATUS_ERROR / 登录失效) ----
+        if (ev.type === 'cookie') {
+          await mergeReportedCookies(db, account, String(ev.cookies || ev.value || '').slice(0, 20000))
           continue
         }
 

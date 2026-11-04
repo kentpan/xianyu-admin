@@ -14,6 +14,7 @@
  * 风控警报推送: 连败首次达到阈值时通过 onVerifyAlert 发射事件, SSE 端点转发给前端
  * 全局弹窗 — 事件驱动, 前端零轮询。
  */
+import { persistCookieRotation } from './cookie-store'
 
 export interface XyVerifyState {
   cookieId: string
@@ -142,10 +143,6 @@ export function getAllVerifyStates(): XyVerifyState[] {
 /**
  * 把滑块验证过程中闲鱼下发的 Set-Cookie 合并进账号 Cookie (DB + 引擎运行时热替换)。
  * 返回真实合并结果: added = 发生变化的字段数, x5sec = 是否出现了 x5* 赎回凭证。
- * 合并契约 (v2.1.18 加固): 删除指令 (Max-Age=0 / Expires 已过) 与空值对一律跳过 —
- * 只接受真实的新值覆盖。这份 cookie 是发货链全部 mtop 调用的签名身份, 主站对异常
- * 会话下发的清理指令若照写会把 unb 等身份字段抹空 (cookieIdentityMismatch 随即
- * 拦截远程拉单 → 自动发货三重兜底必落空), 因此任何调用方都无法再借本函数毒化身份。
  */
 export async function mergeSetCookiesIntoAccount(
   cookieId: string,
@@ -161,25 +158,12 @@ export async function mergeSetCookiesIntoAccount(
   let added = 0
   let x5sec = false
   for (const sc of list) {
-    const segments = String(sc).split(';')
-    const pair = segments[0] || ''
+    const [pair] = String(sc).split(';')
     const eq = pair.indexOf('=')
     if (eq <= 0) continue
     const name = pair.slice(0, eq).trim()
     const value = pair.slice(eq + 1).trim()
-    if (!name || !value) continue // 空值 = 清理/注销指令, 跳过 (绝不写空身份字段)
-    let expired = false
-    for (const attr of segments.slice(1)) {
-      const a = attr.trim().toLowerCase()
-      if (a.startsWith('max-age=')) {
-        const n = Number(a.slice(8))
-        if (Number.isFinite(n) && n <= 0) expired = true
-      } else if (a.startsWith('expires=')) {
-        const ts = Date.parse(a.slice(8))
-        if (Number.isFinite(ts) && ts <= Date.now()) expired = true
-      }
-    }
-    if (expired) continue // 删除指令同样跳过: 宁可保留旧值也绝不因服务端清理指令丢字段
+    if (!name) continue
     if (merged[name] !== value) added++
     merged[name] = value
     const lower = name.toLowerCase()
@@ -187,7 +171,7 @@ export async function mergeSetCookiesIntoAccount(
   }
   const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
   if (mergedStr !== String(row.value)) {
-    await db.run('UPDATE cookies SET value = ? WHERE id = ?', [mergedStr, cookieId]).catch(() => {})
+    await persistCookieRotation(db, cookieId, String(row.value), mergedStr)
     // 引擎在线时热替换 (动态引入避免 verify-state ↔ engine-manager 循环依赖)
     try {
       const em: any = await import('./engine-manager')

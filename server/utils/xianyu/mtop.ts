@@ -76,46 +76,6 @@ export function cookieIdentityMismatch(cookieId: string, cookieStr: string): str
   return ''
 }
 
-/**
- * mtop 失败原因统一分类 (决策日志「一眼清」用):
- * 把平台原始 ret / 网络异常字符串翻译成明确的人类结论 —
- * cookie 失效需重新扫码 / 风控验证 / 代理网关不可达 / 平台业务报错。
- *
- * @returns 空串表示无可归类内容 (调用方保留原文); 非空即直接可展示的失败结论
- */
-export function classifyMtopFailure(raw: string): string {
-  const s = String(raw || '').trim()
-  if (!s) return ''
-  // 登录态失效: mtop 会话/ token 类错误码 (token 过期 mtopCall 内部已自动重试, 仍冒出即会话死亡)
-  if (
-    /SESSION_EXPIRED|SESSION_CHANGED|FAIL_SYS_TOKEN\.\w+|TOKEN_EXOIRED|NOT_LOGIN|NEED_LOGIN|LOGIN_REQUIRED|未登录|登录态|登录已过期/i.test(
-      s,
-    )
-  ) {
-    return '登录态已失效 (Cookie 失效) — 需要重新扫码登录'
-  }
-  // Cookie 身份串号 (verify-state 合并毒化/顶号残留): 明示重扫
-  if (/Cookie 身份与账号不符/.test(s)) return 'Cookie 身份与账号不符 — Cookie 属于其他账号会话, 需要删除该账号后重新扫码登录'
-  // 风控/验证码
-  if (/RGV587|punish|x5sec|验证码|风控|SLAVER/i.test(s)) {
-    return '触发风控验证 — 请到「账号管理」完成验证或稍后重试'
-  }
-  // 订单状态类 (发货先于付款到达的典型瞬时误报, 会自动重试, 不误导排查)
-  if (/ORDER_STATUS_ERROR|订单状态不正确/i.test(s)) {
-    return '平台报订单状态不正确 — 多为发货先于付款事件到达 (买家尚未付款), 付款确认后自动重试'
-  }
-  // 代理/网关/网络层: 超时、连接失败、网关 5xx
-  if (
-    /timeout|timed?\s*out|abort|ECONN|EAI_AGAIN|ENOTFOUND|EPROTO|fetch failed|socket|network|500|502|503|504|Bad Gateway|Gateway|网关|不可达/i.test(
-      s,
-    )
-  ) {
-    return '代理/网关请求失败 (网络不可达或超时) — 请检查代理侧连通性'
-  }
-  // 平台业务报错 (频率限制等) 原文透出
-  return `平台接口报错: ${s.slice(0, 120)}`
-}
-
 /** 把 jar 序列化为 cookie 字符串。 */
 export function cookieHeader(jar: Map<string, string>): string {
   return Array.from(jar.entries())
@@ -161,6 +121,44 @@ function numericIdOrSelf(v: unknown): number | string {
   if (!s) return 0
   const num = Number(s)
   return Number.isSafeInteger(num) && String(num) === s ? num : s
+}
+
+/**
+ * 平台错误/传输异常 → 一眼清的人话原因 (v2.1.19):
+ * 回复决策日志/发货失败留痕/拉单报错统一由本函数翻译 — 原始错误码保留在括号内供深度排查,
+ * 人话在前让「Cookie 失效/风控/订单状态不对/代理不在线」无需查表即可定位处置动作。
+ * 识别不了的原样返回 (不编造原因); 已含人话翻译的输入幂等 (原始码子串仍在, 不重复拼接)。
+ */
+export function describeMtopFailure(raw: string): string {
+  const s = String(raw || '')
+  if (!s) return ''
+  if (/SESSION_EXPIRED|SESSION_OUT|NOTLOGGEDIN|NOT_LOGIN|FAIL_SYS_ACCESS_TOKEN|未登录|登录态失效|login\s*required/i.test(s))
+    return 'Cookie 已失效 (登录会话过期), 需要到「账号管理」重新扫码登录'
+  if (/FAIL_SYS_TOKEN_EXOIRED|FAIL_SYS_TOKEN_EXPIRED/i.test(s))
+    return '签名令牌 (_m_h5_tk) 过期且轮换重试仍失败, 请到「账号管理」重新扫码登录'
+  if (/FAIL_SYS_USER_VALIDATE|RGV587|punish|x5sec|验证码|滑块/i.test(s))
+    return '触发平台风控 (滑块/身份验证), 已按冷却自动退避; 持续出现请到「账号管理」检查账号状态'
+  if (/ORDER_STATUS_ERROR|订单状态不正确|ORDER_NOT_EXIST|订单不存在/i.test(s))
+    return '平台拒绝: 订单状态不正确 (可能未付款/已关闭/已退款, 或发货早于平台状态同步)'
+  if (/ILLEGAL_ACCESS|FORBIDDEN|无权限|PERMISSION/i.test(s))
+    return '平台拒绝: 当前会话无此操作权限 (常见为 Cookie 会话权限不足)'
+  if (/TIMEOUT|TimeoutError|aborted?|ETIMEDOUT/i.test(s))
+    return '网络请求超时 (代理模式请检查代理网关/任务通道在线状态; 直连模式请检查服务器出口网络)'
+  if (/fetch\s*failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket\s*hang|network|EPROTO/i.test(s))
+    return '网络连接失败 (代理模式请检查代理在线状态; 直连模式请检查服务器出口网络)'
+  return ''
+}
+
+/** 组合输出: 「人话原因 (原始错误)」— 人话一眼清, 原始码不丢; 无匹配人话时原样返回。
+ *  幂等守卫: 输入已是「人话前置」形态时原样返回, 绝不二次包裹 (链路上游已翻译的文本
+ *  再次经过翻译点 <如拉单 retMsg → 异常透传> 不产生嵌套括号)。 */
+export function mtopFailMessage(raw: string): string {
+  const s = String(raw || '').trim()
+  if (!s) return '未知错误'
+  const reason = describeMtopFailure(s)
+  if (!reason) return s
+  if (s.startsWith(reason)) return s
+  return `${reason} (${s.slice(0, 100)})`
 }
 
 /**
@@ -599,8 +597,8 @@ export async function confirmOrderShipped(
   if (retStr.includes('ORDER_ALREADY_DELIVERY') || retStr.includes('已发货成功')) {
     return { success: true, message: '订单已是已发货状态 (无需邮寄发货达成)', finalCookieStr: r.cookieStr }
   }
-  // 失败原因统一归类 (cookie 失效/需扫码/风控/代理侧/平台报错), 决策日志直接展示
-  return { success: false, message: classifyMtopFailure(retStr) || '确认发货失败', finalCookieStr: r.cookieStr }
+  // (v2.1.19) 失败原因一眼清: 原始码 + 人话翻译 (Cookie 失效/风控/订单状态/网络/代理)
+  return { success: false, message: mtopFailMessage(retStr || '确认发货失败'), finalCookieStr: r.cookieStr }
 }
 
 /**
@@ -623,7 +621,8 @@ export async function freeshippingOrder(
   if (retStr.includes('SUCCESS')) {
     return { success: true, message: '免拼发货成功', finalCookieStr: r.cookieStr }
   }
-  return { success: false, message: classifyMtopFailure(retStr) || '免拼发货失败', finalCookieStr: r.cookieStr }
+  // (v2.1.19) 失败原因一眼清 (同 confirmOrderShipped)
+  return { success: false, message: mtopFailMessage(retStr || '免拼发货失败'), finalCookieStr: r.cookieStr }
 }
 
 // ============ 订单查询 (语义对齐 butler order_fetcher_optimized._parse_api_response) ============
@@ -700,7 +699,8 @@ export async function fetchOrderDetail(
     retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
   }
   if (!retStr.includes('SUCCESS')) {
-    return { detail: null, retMsg: retStr || '订单详情查询失败', finalCookieStr: r.cookieStr }
+    // (v2.1.19) 查单失败原因一眼清 (同 fetchSellerOrders, 流向订单刷新报错/详情对账留痕)
+    return { detail: null, retMsg: mtopFailMessage(retStr || '订单详情查询失败'), finalCookieStr: r.cookieStr }
   }
 
   const d = r.data || {}
@@ -890,7 +890,8 @@ export async function fetchSellerOrders(
   )
   const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
   if (!retStr.includes('SUCCESS')) {
-    return { ...empty, retMsg: retStr || '卖家订单列表查询失败', finalCookieStr: r.cookieStr }
+    // (v2.1.19) 拉单失败原因一眼清: retMsg 流向决策日志/一键同步报错/发货兑底留痕, 统一人话翻译
+    return { ...empty, retMsg: mtopFailMessage(retStr || '卖家订单列表查询失败'), finalCookieStr: r.cookieStr }
   }
   const module = r.data?.module || {}
   const rawItems = Array.isArray(module.items) ? module.items : []
