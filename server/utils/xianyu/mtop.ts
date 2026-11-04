@@ -671,18 +671,23 @@ function normalizeOrderStatus(raw: unknown): string {
  * 实查一个订单的详情 (api=mtop.idle.web.trade.order.detail, 与 goofish 订单详情页同源接口)。
  * 用于订单刷新: 状态 / 买家 / 金额 / 收货人信息对账。
  *
+ * (v2.2.7) 支持 transport 透传: CF Pages edge 出口到 h5api.m.goofish.com 被墙,
+ * 独立代理模式 (无公网入站) 必须经任务通道转发 — 订单详情单条刷新接口同需分流,
+ * 直连在 edge 下只会超时 502。
+ *
  * @returns { detail, retMsg, finalCookieStr } — detail 为 null 表示未取到 (风控/无权限), retMsg 携带平台原始错误
  */
 export async function fetchOrderDetail(
   cookieStr: string,
   orderId: string,
+  opts: { transport?: MtopTransport } = {},
 ): Promise<{ detail: XianyuOrderDetail | null; retMsg: string; finalCookieStr: string }> {
   if (!orderId) return { detail: null, retMsg: '缺少订单号', finalCookieStr: cookieStr }
   let r = await mtopCall<any>(
     'mtop.idle.web.trade.order.detail',
     { orderId: String(orderId), role: 'seller' },
     cookieStr,
-    { method: 'POST' },
+    { method: 'POST', transport: opts.transport },
   )
   let retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
   // 瞬时风控重试 (v2.1.12): 闲鱼对该接口限流时返回 FAIL_BIZ_COMMON_SYSTEM_ERROR2
@@ -694,7 +699,7 @@ export async function fetchOrderDetail(
       'mtop.idle.web.trade.order.detail',
       { orderId: String(orderId), role: 'seller' },
       r.cookieStr || cookieStr,
-      { method: 'POST' },
+      { method: 'POST', transport: opts.transport },
     )
     retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
   }

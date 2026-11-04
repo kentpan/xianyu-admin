@@ -82,7 +82,12 @@ export async function upsertSoldOrder(
   const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
   // 动态拼 created_at: 解析成功才写/回填, 失败时插入走列默认值、更新保留本地
-  const timeCols = statusTimes.filter(([, , v]) => v).map(([col]) => `, ${col}`)
+  // (v2.2.7) 必须join成字符串: timeCols 是数组, 模板 ${timeCols} 会用 Array.toString()
+  // (元素间逗号+空格连接) 插值 — ≥2 个状态时间同时存在时列名列表变成
+  // ", paid_at,, shipped_at" 双逗号 → SQLite "near \",\": syntax error" (线上 D1 报错
+  // offset 280 与 [shipped_at+finished_at] 组合逐字节吻合), 逐单落库全败且被旧版
+  // .catch 吞错, 表现为全量列表空/状态永不更新。placeholders 一侧原本已 join, 对齐。
+  const timeCols = statusTimes.filter(([, , v]) => v).map(([col]) => `, ${col}`).join('')
   const timePlaceholders = statusTimes.filter(([, , v]) => v).map(() => ', ?').join('')
   const cols = `order_id, item_id, buyer_id, order_status, cookie_id, amount, quantity, is_bargain,
                 receiver_name, receiver_phone, receiver_address, version, system_shipped${createdAt ? ', created_at' : ''}${timeCols}`
@@ -224,12 +229,18 @@ export async function upsertSoldOrderFull(
   ]
   const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
-  const timeCols = statusTimes.filter(([, v]) => v).map(([col]) => `, ${col}`)
+  // (v2.2.7) 必须join成字符串 (与 upsertSoldOrder 同一病灶): 数组插值在 ≥2 个状态时间
+  // 同时存在时产生 ",, " 双逗号 → "near \",\": syntax error at offset 280" (线上实锤),
+  // 全量订单逐单落库全败 → 趋势 tab 全量列表永远为空、同步订单永远 0 落库
+  const timeCols = statusTimes.filter(([, v]) => v).map(([col]) => `, ${col}`).join('')
   const timePlaceholders = statusTimes.filter(([, v]) => v).map(() => ', ?').join('')
+  // (v2.2.7) sync_source 必须随首次插入写入: 仅写在 ON CONFLICT UPDATE 分支时, 首次
+  // 落库的订单该列为默认空串, 趋势 tab 全量列表 (scope=full 以 sync_source='full_sync'
+  // 为口径之一) 永远查不到首同步订单 — 只有二次同步才被打标, "同步后列表仍为空"。
   const cols = `order_id, item_id, item_title, buyer_id, buyer_nick, seller_id, item_price, order_status, cookie_id,
                 amount, quantity, is_bargain, receiver_name, receiver_phone, receiver_address,
-                version, system_shipped${createdAt ? ', created_at' : ''}${timeCols}`
-  const vals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0${createdAt ? ', ?' : ''}${timePlaceholders}`
+                version, system_shipped, sync_source${createdAt ? ', created_at' : ''}${timeCols}`
+  const vals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'full_sync'${createdAt ? ', ?' : ''}${timePlaceholders}`
   const base = [
     o.order_id,
     o.item_id || '',

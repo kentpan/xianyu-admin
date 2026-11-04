@@ -15,7 +15,7 @@
  * 跨实例/多进程可见, 内存队列不可用。
  */
 import type { MtopTransport, SellerOrderItem, SellerOrderItemFull } from './mtop'
-import { fetchSellerOrders, fetchSellerOrdersFull } from './mtop'
+import { fetchOrderDetail, fetchSellerOrders, fetchSellerOrdersFull } from './mtop'
 import { persistCookieRotation } from './cookie-store'
 import { parseLosslessJson } from './lossless-json'
 import { getDb } from '../db'
@@ -78,6 +78,11 @@ async function sweepStaleTasks(db: Awaited<ReturnType<typeof getDb>>): Promise<v
 
 /** 任务轮询参数硬上限 (CF 请求预算内)。 */
 const TASK_TIMEOUT_CAP_MS = 25_000
+
+/** 任务通道瞬时不可用错误 (代理未及时领取/任务过期): 同一请求重试一次通常即过 (幂等读)。 */
+function isTaskTimeoutMsg(msg: string): boolean {
+  return /任务等待超时|任务过期|代理未及时领取/.test(String(msg || ''))
+}
 
 /**
  * 通用任务分发: 写任务行 + 轮询等待代理回报 (同步语义, 调用方无感知)。
@@ -205,7 +210,9 @@ export async function fetchOrdersViaProxy(
       errors.push('任务通道整体时间预算耗尽 (代理未及时领取/回报), 已拉取部分页')
       break
     }
-    const pg = await fetchSellerOrders(cookieStr, page, queryCode, {
+    // (v2.2.7) 任务超时重试一次: 代理 3s 轮询 + 执行回報存在抖动 (线上实锤: 首页任务
+    // 超时但后续页正常拉回), 幂等读重试一次即过; 仍超时才如实报错 (预算内才重试)
+    let pg = await fetchSellerOrders(cookieStr, page, queryCode, {
       transport: taskChannelTransport(db, remain),
     }).catch((e: any) => ({
       items: [] as SellerOrderItem[],
@@ -214,6 +221,17 @@ export async function fetchOrdersViaProxy(
       retMsg: String(e?.message || e).slice(0, 200),
       finalCookieStr: cookieStr,
     }))
+    if (pg.retMsg && isTaskTimeoutMsg(pg.retMsg) && deadline - Date.now() > 8_000) {
+      pg = await fetchSellerOrders(cookieStr, page, queryCode, {
+        transport: taskChannelTransport(db, deadline - Date.now()),
+      }).catch((e: any) => ({
+        items: [] as SellerOrderItem[],
+        nextPage: false,
+        totalCount: 0,
+        retMsg: String(e?.message || e).slice(0, 200),
+        finalCookieStr: cookieStr,
+      }))
+    }
     if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
     if (pg.retMsg) {
       errors.push(String(pg.retMsg).slice(0, 200))
@@ -297,7 +315,8 @@ export async function fetchOrdersFullViaProxy(
       errors.push('任务通道整体时间预算耗尽 (代理未及时领取/回报), 已拉取部分页')
       break
     }
-    const pg = await fetchSellerOrdersFull(cookieStr, page, 'ALL', {
+    // (v2.2.7) 任务超时重试一次 (幂等读, 预算内才重试): 首页任务抖动超时不再拖垮整次同步
+    let pg = await fetchSellerOrdersFull(cookieStr, page, 'ALL', {
       transport: taskChannelTransport(db, remain),
     }).catch((e: any) => ({
       items: [] as SellerOrderItemFull[],
@@ -306,6 +325,17 @@ export async function fetchOrdersFullViaProxy(
       retMsg: String(e?.message || e).slice(0, 200),
       finalCookieStr: cookieStr,
     }))
+    if (pg.retMsg && isTaskTimeoutMsg(pg.retMsg) && deadline - Date.now() > 8_000) {
+      pg = await fetchSellerOrdersFull(cookieStr, page, 'ALL', {
+        transport: taskChannelTransport(db, deadline - Date.now()),
+      }).catch((e: any) => ({
+        items: [] as SellerOrderItemFull[],
+        nextPage: false,
+        totalCount: 0,
+        retMsg: String(e?.message || e).slice(0, 200),
+        finalCookieStr: cookieStr,
+      }))
+    }
     if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
     if (pg.retMsg) {
       errors.push(String(pg.retMsg).slice(0, 200))
@@ -318,4 +348,59 @@ export async function fetchOrdersFullViaProxy(
   // _m_h5_tk 轮换回写 (与直连/网关模式同语义), 保证下次请求用最新签名凭证
   await persistCookieRotation(db, id, String(acct?.value || ''), cookieStr)
   return { items, errors, viaProxy: true }
+}
+
+/* ------------------- 订单详情单条实查 (v2.2.7): 任务通道透传 -------------------
+ * 背景: /api/orders/:id/refresh (订单列表上的单条精修) 在 CF Pages edge 下原先直连
+ * mtop.idle.web.trade.order.detail — edge 出口到 h5api.m.goofish.com 被墙, 必超时 502
+ * (图 1 线上实锤)。分流模式与付款拉单兜底同源: 网关已登记 → mtopFetch 自动优先透传
+ * (调用方直接用 fetchOrderDetail 即可); 独立代理 (主动外呼, 无公网入站) → 本函数走
+ * http_fetch 任务通道; 内置引擎 → 调用方本机直连。详情解析主权 100% 在后台 mtop 层,
+ * 代理零解析, 与全量订单同步同构。 */
+
+/**
+ * 经任务通道实查一个订单的详情 (后台构造并签名, 代理纯透传, 后台无损解析)。
+ * Cookie 以数据库为唯一真源; _m_h5_tk 轮换回写与直连/网关模式同语义。
+ * 超时/失败不抛异常 — retMsg 如实携带原因, detail 为 null。
+ */
+export async function fetchOrderDetailViaProxy(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  orderId: string,
+  timeoutMs = 25_000,
+): Promise<{ detail: Awaited<ReturnType<typeof fetchOrderDetail>>['detail']; retMsg: string; finalCookieStr: string }> {
+  const id = String(cookieId)
+  const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [id]).catch(() => null)
+  const cookieStr = String(acct?.value || '')
+  if (!cookieStr) return { detail: null, retMsg: `账号 ${id} Cookie 为空 (数据库无该账号凭证)`, finalCookieStr: '' }
+
+  const budgetMs = Math.min(Math.max(timeoutMs, 3_000), TASK_TIMEOUT_CAP_MS)
+  const transport = taskChannelTransport(db, budgetMs)
+  // (v2.2.7) 任务超时重试一次 (幂等读): fetchOrderDetail 内部可能含 token 轮换 +
+  // 风控重试两次 mtop 调用, 每次都是独立任务, 预算内由 dispatchProxyTask 自行约束
+  const r = await fetchOrderDetail(cookieStr, String(orderId), { transport }).catch((e: any) => ({
+    detail: null,
+    retMsg: String(e?.message || e).slice(0, 200),
+    finalCookieStr: cookieStr,
+  }))
+  if (r.detail) {
+    await persistCookieRotation(db, id, cookieStr, String(r.finalCookieStr || ''))
+    return { detail: r.detail, retMsg: '', finalCookieStr: String(r.finalCookieStr || '') }
+  }
+  const retMsg = String(r.retMsg || '')
+  if (retMsg && isTaskTimeoutMsg(retMsg)) {
+    const retry = await fetchOrderDetail(cookieStr, String(orderId), { transport }).catch((e: any) => ({
+      detail: null,
+      retMsg: String(e?.message || e).slice(0, 200),
+      finalCookieStr: cookieStr,
+    }))
+    if (retry.detail || !isTaskTimeoutMsg(String(retry.retMsg || ''))) {
+      await persistCookieRotation(db, id, cookieStr, String(retry.finalCookieStr || ''))
+      return { detail: retry.detail, retMsg: String(retry.retMsg || ''), finalCookieStr: String(retry.finalCookieStr || '') }
+    }
+    await persistCookieRotation(db, id, cookieStr, String(retry.finalCookieStr || ''))
+    return { detail: null, retMsg: `${retMsg}; 重试仍超时`, finalCookieStr: String(retry.finalCookieStr || '') }
+  }
+  await persistCookieRotation(db, id, cookieStr, String(r.finalCookieStr || ''))
+  return { detail: null, retMsg, finalCookieStr: String(r.finalCookieStr || '') }
 }

@@ -5,6 +5,8 @@
  */
 import { fetchOrderDetail } from '../../../utils/xianyu/mtop'
 import { persistCookieRotation } from '../../../utils/xianyu/cookie-store'
+import { fetchOrderDetailViaProxy, isProxyEngineMode } from '../../../utils/xianyu/order-task'
+import { isGatewayMode } from '../../../utils/xianyu/gateway'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -21,8 +23,32 @@ export default defineEventHandler(
     if (!acct) throw new ApiError(404, '订单归属的账号不存在或已删除')
     if (!acct.value) throw new ApiError(400, '账号 Cookie 为空, 请先重新扫码登录')
 
-    // fetchOrderDetail is auto-imported by Nitro from server/utils/xianyu/mtop.ts
-    const { detail, retMsg, finalCookieStr } = await fetchOrderDetail(acct.value, id)
+    // (v2.2.7) 分流 (与付款拉单兑底 brain.ts 同源; CF edge 出口到闲鱼 mtop 被墙, 原先
+    // 无分流直连必超时 502 — 图 1 线上实锤):
+    //  ① 独立代理 + 已登记公网网关 → mtopFetch 自动优先网关透传 (秒级直返)
+    //  ② 独立代理无网关 (主动外呼部署形态, 线上即此) → http_fetch 任务通道
+    //  ③ 内置引擎/本地部署 → 本机直连
+    // 详情解析主权 100% 在后台 mtop 层, 代理零解析; 精修语义不变 (单条详情对账回写,
+    // 在订单列表上按需单独请求, 不与全量同步混淆)。
+    let result: Awaited<ReturnType<typeof fetchOrderDetail>> | null = null
+    if (await isProxyEngineMode(db)) {
+      if (await isGatewayMode(db)) {
+        try {
+          result = await fetchOrderDetail(acct.value, id)
+        } catch {
+          result = null // 网关不可达/鉴权失败 → 落任务通道兑底
+        }
+      }
+      if (!result) result = await fetchOrderDetailViaProxy(db, cookieId, id, 25_000)
+    } else {
+      try {
+        result = await fetchOrderDetail(acct.value, id)
+      } catch (e: any) {
+        // (v2.2.7) 直连失败不再抛裸异常让 edge 返回无上下文的 502: 如实携带原因
+        throw new ApiError(502, `闲鱼接口请求失败: ${String(e?.message || e).slice(0, 160)}`)
+      }
+    }
+    const { detail, retMsg, finalCookieStr } = result
 
     // 回写轮换后的 cookie (尤其是 _m_h5_tk)
     await persistCookieRotation(db, cookieId, String(acct.value), finalCookieStr)
