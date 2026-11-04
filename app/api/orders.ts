@@ -3,11 +3,16 @@ import { useApi } from '~/composables/useApi'
 export interface Order {
   order_id: string
   item_id: string | null
+  item_title?: string | null
   buyer_id: string | null
+  buyer_nick?: string | null
+  seller_id?: string | null
   spec_name: string | null
   spec_value: string | null
   quantity: string | null
   amount: string | null
+  /** 商品真实单价 (v2.2.6 全量同步解析, 响应未携带为空串/null)。 */
+  item_price?: string | null
   order_status: string
   cookie_id: string | null
   chat_id?: string
@@ -22,7 +27,6 @@ export interface Order {
   shipped_at?: string | null
   finished_at?: string | null
   cancelled_at?: string | null
-  item_title?: string | null
   cookie_remark?: string | null
 }
 
@@ -43,6 +47,8 @@ export interface OrderQuery {
   dateTo?: string
   amountMin?: string
   amountMax?: string
+  /** v2.2.5 归属筛选: mine=已添加账号 / other=非已添加账号 / 默认 all 不过滤 */
+  scope?: 'mine' | 'other' | 'all'
 }
 
 export interface BatchOrdersResult {
@@ -111,6 +117,26 @@ export function refreshAllOrders(body: { cookie_id?: string } = {}) {
   return useApi().post<RefreshAllResult>('/api/orders/refresh', body)
 }
 
+/* ==================== 全量订单同步 (v2.2.6, 闲鱼趋势 tab) ==================== */
+
+export interface SyncAllResult {
+  inserted: number
+  updated: number
+  skipped_deleted: number
+  accounts: number
+  errors: string[]
+  mode?: string
+  elapsed_ms?: number
+}
+
+/**
+ * 全量订单同步: 2.1.7 订单拉取链路独立移植 — 不判断区分账号拉取全部状态订单入库
+ * (商品名称/买家昵称/卖家身份随单真实落库), 闲鱼趋势 tab「同步订单」按钮数据源。
+ */
+export function syncAllOrders(body: { pages?: number } = {}) {
+  return useApi().post<SyncAllResult>('/api/orders/sync-all', body)
+}
+
 export function manualShip(body: { order_id: string; mode: string }) {
   return useApi().post('/api/orders/manual-ship', body)
 }
@@ -121,4 +147,30 @@ export function importOrders(orders: any[]) {
 
 export function exportOrders() {
   return useApi().get<ExportOrdersResult>('/api/orders/export')
+}
+
+/* ==================== 闲鱼趋势 (v2.2.5) ==================== */
+
+export interface TrendMetricDay extends Record<string, any> {
+  date: string
+  label: string
+  count: number
+  revenue: number
+  paid: number
+  received: number
+  refunded: number
+}
+
+export interface OrderTrends {
+  days: TrendMetricDay[]
+  metrics: {
+    totals: { all: number; paid: number; received: number; refunded: number }
+    week: { all: number; paid: number; received: number; refunded: number; revenue: number }
+  }
+  other_total: number
+}
+
+/** 闲鱼趋势: 近7天全部账号订单趋势 + 已付款/已收货/已退款核心指标 (真实库内数据) */
+export function getOrderTrends() {
+  return useApi().get<OrderTrends>('/api/orders/trends')
 }

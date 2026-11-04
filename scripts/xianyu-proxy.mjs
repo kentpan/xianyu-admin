@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.2.0; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.2.6; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -151,8 +151,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.2.2 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.2.2'
+// XY_PKG_VERSION 读取, 缺省 2.2.6 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.2.6'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
@@ -207,6 +207,58 @@ if (dotenvInfo && dotenvInfo.injected.length) {
 
 /** 多后台形态: >1 = 消息/会话并行推送到全部活跃后台; 单后台所有行为与旧版契约完全一致 */
 const MULTI_ADMIN = ADMIN_URLS.length > 1
+
+/* --------------------- 来源域名检测 (v2.2.5) ---------------------
+ * XY_ADMIN_URL 配置的后台域名白名单 (最多 3 个, 精准匹配 host[:非标端口])。
+ * 规则: 浏览器发起的请求携带 Origin/Referer 头, 其来源域名若既不是本代理自身
+ * (Host 头 = 直连面板的正常访问形态), 也不在 XY_ADMIN_URL 后台域名白名单内,
+ * 则直接 403 拒绝 — 任意第三方网页/站点对代理 HTTP 服务 (/health /gateway 面板)
+ * 的浏览器侧访问一律拦截。
+ * 服务端到服务端请求 (无 Origin/Referer 头, 如 /health 探测、/gateway 转发、curl)
+ * 不携带浏览器来源, 不受本检测影响, 各端点原有鉴权 (Bearer/会话) 照常生效。 */
+
+/** host 规范化: 统一小写, 剥离默认端口 (80/443) 后精准比对; 非标端口参与匹配 */
+function normalizeHostForCompare(rawHost) {
+  let host = String(rawHost || '').trim().toLowerCase()
+  if (!host) return ''
+  host = host.replace(/\/+$/, '')
+  try {
+    const u = new URL(host.includes('://') ? host : `http://${host}`)
+    const hostname = u.hostname.toLowerCase()
+    let port = u.port
+    if (port === '80' || port === '443') port = ''
+    return port ? `${hostname}:${port}` : hostname
+  } catch {
+    return host
+  }
+}
+
+const ADMIN_ALLOWED_HOSTS = new Set(ADMIN_URLS.map((u) => normalizeHostForCompare(u)).filter(Boolean))
+
+/** 提取请求来源域名: Origin 优先, Referer 兜底; 无浏览器来源头返回 '' (服务端调用形态) */
+function requestSourceHost(req) {
+  const origin = String(req.headers.origin || '').trim()
+  const referer = String(req.headers.referer || '').trim()
+  const raw = origin || referer
+  if (!raw) return ''
+  return normalizeHostForCompare(raw)
+}
+
+/** 来源不在白名单 → 返回 true 并已写 403 响应; 来源合法/无来源 → 返回 false 放行 */
+function rejectForeignSource(req, res, pathname) {
+  const source = requestSourceHost(req)
+  if (!source) return false
+  const selfHost = normalizeHostForCompare(req.headers.host)
+  if (selfHost && source === selfHost) return false
+  if (ADMIN_ALLOWED_HOSTS.has(source)) return false
+  log(`⚠ 来源拦截: ${req.method} ${pathname} 来源域名 ${source} 不在 XY_ADMIN_URL 后台域名白名单 (${[...ADMIN_ALLOWED_HOSTS].join(' | ')}), 已拒绝 (仅本代理自身直连与已配置后台域名放行)`)
+  res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify({
+    ok: false,
+    error: `来源域名 ${source} 不在代理后台域名白名单内, 已拒绝 (XY_ADMIN_URL 配置的 ${ADMIN_ALLOWED_HOSTS.size} 个域名与本代理自身可访问)`,
+  }))
+  return true
+}
 
 /**
  * 后台登记表 (v2.2.0): 每个后台独立的连接信息/活跃态/推送健康。
@@ -426,20 +478,63 @@ function platformParts() {
   }
 }
 
+// UA 版本跨进程持久化 (v2.2.4 账号保活加固, 与后台 chrome-ua.ts 同源): 缓存文件与脚本同目录。
+// 部署机 Chromium 升级/容器重建导致的 UA 版本跳变 = 闲鱼视角「设备环境变化」,
+// 会触发「登录环境异常 → 重新登录 + 人脸核验」; 同一账号 UA 稳定是风控底线。
+const UA_CACHE_FILE = (() => {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url))
+    return path.join(dir, '.xy-ua-cache.json')
+  } catch {
+    return path.join(process.cwd(), '.xy-ua-cache.json')
+  }
+})()
+
+function loadCachedUAVersion() {
+  try {
+    if (!existsSync(UA_CACHE_FILE)) return { version: '', detected: false }
+    const raw = JSON.parse(readFileSync(UA_CACHE_FILE, 'utf8'))
+    const v = String(raw?.version || '')
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(v)) return { version: '', detected: false }
+    return { version: v, detected: raw?.source === 'detected' }
+  } catch {
+    return { version: '', detected: false }
+  }
+}
+
+function saveCachedUAVersion(version, detected) {
+  try {
+    writeFileSync(UA_CACHE_FILE, JSON.stringify({ version, source: detected ? 'detected' : 'fallback', platform: process.platform, at: new Date().toISOString() }))
+  } catch {}
+}
+
 function resolveChromeUA() {
   if (_uaInfo) return _uaInfo
   const p = platformParts()
   let version = ''
-  try {
-    const bin = findChromiumBinary()
-    if (bin) {
-      const out = execFileSync(bin, ['--version'], { timeout: 5000, encoding: 'utf8' })
-      const m = String(out).match(/(\d+\.\d+\.\d+\.\d+)/)
-      if (m) version = m[1]
+  let source = 'fallback'
+  // 文件缓存优先: 上次探测到真实浏览器版本时直接复用 (跨重启稳定, 不随部署机 Chromium 升级漂移)
+  const cached = loadCachedUAVersion()
+  if (cached.detected && cached.version) {
+    version = cached.version
+    source = 'cached'
+  } else {
+    try {
+      const bin = findChromiumBinary()
+      if (bin) {
+        const out = execFileSync(bin, ['--version'], { timeout: 5000, encoding: 'utf8' })
+        const m = String(out).match(/(\d+\.\d+\.\d+\.\d+)/)
+        if (m) {
+          version = m[1]
+          source = 'detected'
+        }
+      }
+    } catch {}
+    if (!version) {
+      version = FALLBACK_UA.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '133.0.0.0'
     }
-  } catch {}
-  if (!version) {
-    version = FALLBACK_UA.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '133.0.0.0'
+    // 探测成功或首次回退都落盘 (下次启动不再漂移)
+    saveCachedUAVersion(version, source === 'detected')
   }
   const major = version.split('.')[0]
   _uaInfo = {
@@ -447,8 +542,9 @@ function resolveChromeUA() {
     secChUa: `"Google Chrome";v="${major}", "Chromium";v="${major}", "Not?A_Brand";v="99"`,
     secChUaPlatform: p.chPlatform,
     version,
+    source,
   }
-  log(`UA 真源: Chrome/${version} (${p.chPlatform})`)
+  log(`UA 真源: Chrome/${version} (${p.chPlatform}) source=${source}`)
   return _uaInfo
 }
 
@@ -1950,6 +2046,8 @@ async function pollTasksOnce(b) {
     try { payload = JSON.parse(String(task?.payload || '{}')) } catch {}
     let result
     try {
+      // v2.2.6 定稿: 仅 http_fetch (纯透传, 全量订单同步亦走此通道) / send_message 两类任务 —
+      // fetch_orders_full 代理本地解析任务已废弃 (解析主权 100% 收归后台, 与 http_fetch 合并)
       result = task?.type === 'http_fetch'
         ? await executeHttpFetchTask(payload, taskId)
         : task?.type === 'send_message'
@@ -2920,6 +3018,8 @@ if (PROXY_PORT > 0) {
       pathname = u.pathname
       query = u.searchParams
     } catch {}
+    // 来源域名检测 (v2.2.5): 浏览器来源非本代理自身且非 XY_ADMIN_URL 后台域名 → 直接拒绝
+    if (rejectForeignSource(req, res, pathname)) return
     if (pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
       res.end(

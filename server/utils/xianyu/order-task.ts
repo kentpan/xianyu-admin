@@ -14,8 +14,8 @@
  * CF serverless 同一动因 (与扫码登录会话落库 qr_login_sessions 相同): 任务行落库,
  * 跨实例/多进程可见, 内存队列不可用。
  */
-import type { MtopTransport, SellerOrderItem } from './mtop'
-import { fetchSellerOrders } from './mtop'
+import type { MtopTransport, SellerOrderItem, SellerOrderItemFull } from './mtop'
+import { fetchSellerOrders, fetchSellerOrdersFull } from './mtop'
 import { persistCookieRotation } from './cookie-store'
 import { parseLosslessJson } from './lossless-json'
 import { getDb } from '../db'
@@ -230,4 +230,72 @@ export async function sendTextViaProxy(
   if (r.ok) return { ok: true, error: '' }
   const err = String(r.data?.error || r.errors[0] || '代理发送失败')
   return { ok: false, error: err }
+}
+
+/* ---------------- 全量订单同步 (v2.2.6): 任务通道逐页纯透传 ----------------
+ * 解析主权收归后台铁律 (v2.2.6 定稿): 全量订单的签名/调用/解析全部在后台完成,
+ * 代理只经既有 http_fetch 任务原样转发请求并回报原始响应文本 — 与直连/网关模式
+ * 共用同一套后台解析层 (fetchSellerOrdersFull), 代理零解析零业务字段。
+ * 早期试行的 fetch_orders_full 代理本地解析任务已废弃移除 (代理端与后台各解析
+ * 一遍的双份维护重演 v2.1.9 前的精度丢失病灶), 改透传后与既有 http_fetch 通道
+ * 完全重合, 直接合并 — 代理侧无任何新增任务类型。
+ * 全量语义不变: 不判断区分账号, 拉到的全部订单回后台原样入库 (账号区分不做)。 */
+
+export interface FetchOrdersFullTaskOptions {
+  /** 拉取页数 (每页 30 单, 逐页任务透传, 页间 400ms 限速)。 */
+  pages?: number
+  /** 整体时间预算毫秒 (请求预算内, 逐页扣减)。 */
+  timeoutMs?: number
+}
+
+/**
+ * 经任务通道拉取卖家订单列表 (全量完整解析版, 逐页 http_fetch 纯透传):
+ * 请求由后台 fetchSellerOrdersFull→mtopCall 构造并签名 (含 _m_h5_tk 轮换/token
+ * 过期重试), 代理原样转发, 响应由后台无损解析并标准化完整字段 (19 位订单号/
+ * 商品名称/买家昵称/状态时间不落 double) — 与既有 fetchOrdersViaProxy 完全同构,
+ * 仅解析层为 Full 版。超时/失败不抛异常 — errors 如实携带原因, items 可能为空。
+ */
+export async function fetchOrdersFullViaProxy(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  opts: FetchOrdersFullTaskOptions = {},
+): Promise<{ items: SellerOrderItemFull[]; errors: string[]; viaProxy: boolean }> {
+  const items: SellerOrderItemFull[] = []
+  const errors: string[] = []
+  const id = String(cookieId)
+  const acct = await db.get<{ value: string }>('SELECT value FROM cookies WHERE id = ?', [id]).catch(() => null)
+  let cookieStr = String(acct?.value || '')
+  if (!cookieStr) return { items, errors: [`账号 ${id} Cookie 为空 (数据库无该账号凭证)`], viaProxy: true }
+
+  const budgetMs = Math.min(Math.max(opts.timeoutMs || 20_000, 3_000), TASK_TIMEOUT_CAP_MS)
+  const deadline = Date.now() + budgetMs
+  const pages = Math.min(Math.max(opts.pages || 1, 1), 5)
+  let page = 1
+  while (page <= pages) {
+    const remain = deadline - Date.now()
+    if (remain < 3_000) {
+      errors.push('任务通道整体时间预算耗尽 (代理未及时领取/回报), 已拉取部分页')
+      break
+    }
+    const pg = await fetchSellerOrdersFull(cookieStr, page, 'ALL', {
+      transport: taskChannelTransport(db, remain),
+    }).catch((e: any) => ({
+      items: [] as SellerOrderItemFull[],
+      nextPage: false,
+      totalCount: 0,
+      retMsg: String(e?.message || e).slice(0, 200),
+      finalCookieStr: cookieStr,
+    }))
+    if (pg.finalCookieStr && pg.finalCookieStr !== cookieStr) cookieStr = pg.finalCookieStr
+    if (pg.retMsg) {
+      errors.push(String(pg.retMsg).slice(0, 200))
+      break
+    }
+    items.push(...pg.items)
+    if (!pg.nextPage || !pg.items.length) break
+    page++
+  }
+  // _m_h5_tk 轮换回写 (与直连/网关模式同语义), 保证下次请求用最新签名凭证
+  await persistCookieRotation(db, id, String(acct?.value || ''), cookieStr)
+  return { items, errors, viaProxy: true }
 }

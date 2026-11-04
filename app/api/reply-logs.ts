@@ -17,14 +17,17 @@ export interface ReplyLog {
   reply_text: string
   error_message: string
   send_status: string
+  is_test?: number
   created_at: string
 }
 
-export function getReplyLogs(params?: { cookie_id?: string; keyword?: string; strategy?: string; limit?: number; offset?: number }) {
+export function getReplyLogs(params?: { cookie_id?: string; keyword?: string; strategy?: string; limit?: number; offset?: number; test?: boolean; since_id?: number }) {
   const query: Record<string, string | number> = {}
   if (params?.cookie_id) query.cookie_id = params.cookie_id
   if (params?.keyword) query.keyword = params.keyword
   if (params?.strategy) query.strategy = params.strategy
+  if (params?.test) query.test = '1'
+  if (params?.since_id && params.since_id > 0) query.since_id = params.since_id
   query.limit = params?.limit ?? 100
   query.offset = params?.offset ?? 0
   return useApi().get<{ logs: ReplyLog[]; total: number; limit: number; offset: number }>(

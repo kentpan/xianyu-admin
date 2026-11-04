@@ -1,5 +1,5 @@
 /**
- * POST /api/engine/orders-sync — 代理定时触发的订单自动同步 (仅拉待发货订单)。
+ * POST /api/engine/orders-sync — 代理定时触发的订单自动同步 (v2.2.5: 拉全部状态订单)。
  *
  * 背景: 内置引擎 (自托管 Node) 时代, engine-manager orderSyncTick 每 30 分钟按
  * NOT_SHIP 每账号拉 1 页待发货订单入库 — 新单自动到账的核心通道。上 CF Pages 后
@@ -8,7 +8,10 @@
  * 恢复方式 (v2.1.12): 唯一的长驻进程 = 独立代理。代理按后台下发的
  * intervals.order_sync_seconds 定时 POST 本端点 (Bearer 引擎令牌), 后台收到触发后
  * 走既有任务通道 (dispatchProxyTask http_fetch → 代理转发 → 后台解析入库) 完成
- * NOT_SHIP 待发货拉单 — 代理零解析不变, 解析/入库主权 100% 在后台。
+ * 全状态订单拉单 — 代理零解析不变, 解析/入库主权 100% 在后台。
+ *
+ * v2.2.5: queryCode 由 NOT_SHIP 改为 ALL (订单管理「闲鱼趋势」需要全状态数据);
+ * 待发货订单仍包含其中, 新单自动到账/自动发货兜底链路语义不变 (超集拉取)。
  *
  * 鉴权: 标准 Authorization: Bearer <token> (requireEngine, 与 /api/engine/* 同源)。
  * 仅「使用中」(is_active=1) 引擎可触发; 并发触发以进程内闸门防重 (CF 多隔离实例下
@@ -61,7 +64,7 @@ export default defineEventHandler(
           continue
         }
         const r = await fetchOrdersViaProxy(db, String(acct.id), {
-          queryCode: 'NOT_SHIP',
+          queryCode: 'ALL',
           pages: 2,
           timeoutMs: 25_000,
         })
@@ -86,7 +89,7 @@ export default defineEventHandler(
           skipped_deleted: skippedDeleted,
           errors,
         },
-        inserted ? `待发货订单自动同步: 新增 ${inserted}, 更新 ${updated}` : '待发货订单自动同步完成 (无新单)',
+        inserted ? `全状态订单自动同步: 新增 ${inserted}, 更新 ${updated}` : '全状态订单自动同步完成 (无新单)',
       )
     } finally {
       inFlight = false

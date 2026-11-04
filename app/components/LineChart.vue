@@ -1,38 +1,19 @@
 <template>
   <div class="w-full">
-    <svg :viewBox="`0 0 ${w} ${h}`" :width="w" :height="h" class="overflow-visible">
-      <!-- Grid lines -->
-      <g stroke="currentColor" class="text-slate-200 dark:text-slate-700" stroke-width="1">
-        <line v-for="i in 4" :key="i" :x1="padL" :x2="w - padR" :y1="padT + ((h - padT - padB) / 4) * (i - 1)" :y2="padT + ((h - padT - padB) / 4) * (i - 1)" stroke-dasharray="3 3" opacity="0.5" />
-      </g>
-      <!-- Area fill -->
-      <defs>
-        <linearGradient :id="gradId" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" :stop-color="color" stop-opacity="0.25" />
-          <stop offset="100%" :stop-color="color" stop-opacity="0" />
-        </linearGradient>
-      </defs>
-      <path v-if="areaPath" :d="areaPath" :fill="`url(#${gradId})`" />
-      <!-- Line -->
-      <path v-if="linePath" :d="linePath" fill="none" :stroke="color" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-      <!-- Data points -->
-      <g>
-        <circle v-for="(p, i) in points" :key="i" :cx="p.x" :cy="p.y" :r="hover === i ? 5 : 3.5" :fill="color" stroke="white" stroke-width="1.5" class="transition-all cursor-pointer" @mouseenter="hover = i" @mouseleave="hover = -1" />
-      </g>
-      <!-- X axis labels -->
-      <g class="text-slate-400" font-size="11" text-anchor="middle">
-        <text v-for="(p, i) in points" :key="i" :x="p.x" :y="h - 4">{{ labels[i] }}</text>
-      </g>
-    </svg>
-    <!-- Tooltip -->
-    <div v-if="hover >= 0 && points[hover]" class="text-xs text-slate-500 dark:text-slate-400 text-center mt-1">
-      <span class="font-medium text-slate-700 dark:text-slate-200">{{ labels[hover] }}</span>: {{ data[hover] }} {{ unit }}
-    </div>
+    <canvas ref="canvasEl" :style="{ width: '100%', height: height + 'px' }" role="img" :aria-label="`折线图: ${unit || '数值'}趋势`"></canvas>
+    <!-- Tooltip: chart.js 自带交互提示, 此处保留与旧版一致的数据摘要 (无障碍/打印兜底) -->
+    <div class="sr-only">{{ labels.join(' / ') }} = {{ data.join(', ') }} {{ unit }}</div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+/**
+ * LineChart — chart.js 折线图 (v2.2.5: 由手写 SVG 迁移到 chart.js, 工作台/订单趋势统一图表引擎)。
+ * Props API 与旧版 SVG 实现完全一致 (data/labels/color/unit/height), 调用方零改动。
+ * chart.js 仅在客户端挂载后初始化 (SSR 只渲染空 canvas), 数据/主题变化自动 update。
+ */
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Chart, LineController, LineElement, PointElement, Filler, LinearScale, CategoryScale, Tooltip, Legend } from 'chart.js'
 
 const props = withDefaults(defineProps<{
   data: number[]
@@ -46,39 +27,125 @@ const props = withDefaults(defineProps<{
   height: 180,
 })
 
-const hover = ref(-1)
-const gradId = `line-grad-${Math.random().toString(36).slice(2, 8)}`
+// chart.js 树摇登记: 本组件用到的控制器/元素/比例尺/交互件 (不用全量 registerables)
+Chart.register(LineController, LineElement, PointElement, Filler, LinearScale, CategoryScale, Tooltip, Legend)
 
-const w = 520
-const h = computed(() => props.height)
-const padL = 30
-const padR = 16
-const padT = 16
-const padB = 24
+const canvasEl = ref<HTMLCanvasElement | null>(null)
+let chart: Chart | null = null
+let themeObserver: MutationObserver | null = null
 
-const maxVal = computed(() => Math.max(...props.data, 1))
-const innerW = computed(() => w - padL - padR)
-const innerH = computed(() => h.value - padT - padB)
+function isDark(): boolean {
+  return typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+}
 
-const points = computed(() => {
-  const n = props.data.length
-  if (n === 0) return []
-  const step = n > 1 ? innerW.value / (n - 1) : 0
-  return props.data.map((v, i) => ({
-    x: padL + step * i,
-    y: padT + innerH.value - (v / maxVal.value) * innerH.value,
-  }))
+/** 主色 → 半透明填充色 (区域渐变用) */
+function alpha(hex: string, a: number): string {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex || '')
+  if (!m) return hex
+  const n = parseInt(m[1], 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`
+}
+
+function buildChart() {
+  if (!canvasEl.value || typeof document === 'undefined') return
+  const dark = isDark()
+  const grid = dark ? 'rgba(148, 163, 184, 0.15)' : 'rgba(100, 116, 139, 0.15)'
+  const tick = dark ? '#94a3b8' : '#64748b'
+
+  // 区域渐变 (canvas 2d context 级)
+  const ctx = canvasEl.value.getContext('2d')
+  const areaH = props.height
+  let fill: string | CanvasGradient = alpha(props.color, 0.22)
+  if (ctx) {
+    const g = ctx.createLinearGradient(0, 0, 0, areaH)
+    g.addColorStop(0, alpha(props.color, 0.28))
+    g.addColorStop(1, alpha(props.color, 0.02))
+    fill = g
+  }
+
+  chart?.destroy()
+  chart = new Chart(canvasEl.value, {
+    type: 'line',
+    data: {
+      labels: props.labels,
+      datasets: [
+        {
+          data: props.data,
+          borderColor: props.color,
+          backgroundColor: fill,
+          fill: true,
+          tension: 0.35,
+          borderWidth: 2.5,
+          pointRadius: 3.5,
+          pointHoverRadius: 5.5,
+          pointBackgroundColor: props.color,
+          pointBorderColor: dark ? '#0f172a' : '#ffffff',
+          pointBorderWidth: 1.5,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 400 },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: dark ? '#1e293b' : '#0f172a',
+          titleColor: '#f8fafc',
+          bodyColor: '#e2e8f0',
+          padding: 8,
+          displayColors: false,
+          callbacks: {
+            label: (item) => ` ${item.parsed.y}${props.unit ? ' ' + props.unit : ''}`,
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: tick, maxRotation: 0, autoSkip: false, font: { size: 11 } } },
+        y: {
+          beginAtZero: true,
+          grid: { color: grid, drawTicks: false },
+          border: { display: false },
+          ticks: { color: tick, font: { size: 11 }, maxTicksLimit: 5, precision: 0 },
+        },
+      },
+    },
+  })
+}
+
+onMounted(() => {
+  buildChart()
+  // 主题切换 (tailwind darkMode: 'class') → 重建图表以适配配色
+  themeObserver = new MutationObserver(() => buildChart())
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 })
 
-const linePath = computed(() => {
-  if (!points.value.length) return ''
-  return points.value.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+watch(
+  () => [props.data, props.labels, props.color],
+  () => {
+    if (chart) {
+      chart.data.labels = props.labels
+      chart.data.datasets[0].data = props.data
+      chart.data.datasets[0].borderColor = props.color
+      chart.data.datasets[0].pointBackgroundColor = props.color
+      chart.update()
+    } else {
+      buildChart()
+    }
+  },
+  { deep: true },
+)
+
+onBeforeUnmount(() => {
+  themeObserver?.disconnect()
+  themeObserver = null
+  chart?.destroy()
+  chart = null
 })
 
-const areaPath = computed(() => {
-  if (!points.value.length) return ''
-  const pts = points.value
-  const base = padT + innerH.value
-  return `M ${pts[0].x} ${base} ${pts.map((p) => `L ${p.x} ${p.y}`).join(' ')} L ${pts[pts.length - 1].x} ${base} Z`
+/** 供父级导出 PNG 用 (chart.js canvas.toBase64Image) */
+defineExpose({
+  toPngBase64: () => chart?.toBase64Image('image/png', 1) || '',
 })
 </script>

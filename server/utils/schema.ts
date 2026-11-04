@@ -141,7 +141,11 @@ const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS orders (
     order_id VARCHAR(64) PRIMARY KEY,
     item_id VARCHAR(64),
+    item_title VARCHAR(512) DEFAULT '',
     buyer_id VARCHAR(64),
+    buyer_nick VARCHAR(128) DEFAULT '',
+    seller_id VARCHAR(64) DEFAULT '',
+    item_price VARCHAR(32) DEFAULT '',
     spec_name VARCHAR(128),
     spec_value VARCHAR(128),
     quantity VARCHAR(16),
@@ -468,6 +472,7 @@ const SCHEMA: string[] = [
     reply_text TEXT,
     error_message TEXT,
     send_status VARCHAR(16) DEFAULT 'unknown',
+    is_test INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_autolog_cookie ON auto_reply_logs(cookie_id, id)`,
@@ -932,6 +937,9 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE orders ADD COLUMN consign_at TIMESTAMP`,
   // 跨实例发货认领时间戳: edge 多 isolate 并发时靠行级 UPDATE 原子性保证同一订单只有一个执行者
   `ALTER TABLE orders ADD COLUMN delivery_claim_at TIMESTAMP`,
+  // 自动发货仿真测试 (v2.2.4): 决策日志测试标志 — 模拟发货链路落的日志与真实发货完全
+  // 同构, 仅以 is_test=1 区分 (回复决策日志列表棕色[测试]徽章 + 自动发货页模拟终端实时输出)
+  `ALTER TABLE auto_reply_logs ADD COLUMN is_test INTEGER DEFAULT 0`,
   // 删除订单屏蔽表 (v2.1.9): 用户删除的订单号登记于此, 订单同步 (列表拉取/卡片兜底)
   // 命中即跳过 —— 否则删除后被下一轮同步原样恢复, 表现为「删都删不掉」
   `CREATE TABLE IF NOT EXISTS deleted_orders (
@@ -940,6 +948,13 @@ const MIGRATIONS: string[] = [
     reason VARCHAR(255) DEFAULT 'user_delete',
     deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+  // 全量订单同步 (v2.2.6): 商品名称/买家昵称/卖家身份/商品真实单价 真实解析落库 —— 卖家订单列表
+  // 接口响应里本身携带商品标题/买卖家数据/单价与各状态时间, 此前从未解析入库, 订单页商品列
+  // 只能 JOIN item_info 兑底 (非已添加账号的订单无 item_info 记录 → 只能显示 item_id)。老库 ALTER 幂等。
+  `ALTER TABLE orders ADD COLUMN item_title VARCHAR(512) DEFAULT ''`,
+  `ALTER TABLE orders ADD COLUMN buyer_nick VARCHAR(128) DEFAULT ''`,
+  `ALTER TABLE orders ADD COLUMN seller_id VARCHAR(64) DEFAULT ''`,
+  `ALTER TABLE orders ADD COLUMN item_price VARCHAR(32) DEFAULT ''`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

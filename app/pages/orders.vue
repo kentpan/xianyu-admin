@@ -20,6 +20,30 @@
       </template>
     </PageHeader>
 
+    <!-- Tab 切换 (v2.2.5): 我的订单 = 已添加账号订单 (筛选+列表) / 闲鱼趋势 = 全账号7天趋势 + 非已添加账号订单 -->
+    <div class="flex items-center gap-1 border-b border-slate-200 dark:border-slate-700" role="tablist" aria-label="订单视图切换">
+      <button
+        role="tab"
+        :aria-selected="activeTab === 'mine'"
+        class="px-4 py-2.5 -mb-px border-b-2 font-medium transition-colors flex items-center gap-1.5"
+        :class="activeTab === 'mine' ? 'border-brand-600 text-brand-600 dark:text-brand-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'"
+        @click="switchTab('mine')"
+      >
+        <Icon name="orders" /> 我的订单
+      </button>
+      <button
+        role="tab"
+        :aria-selected="activeTab === 'trend'"
+        class="px-4 py-2.5 -mb-px border-b-2 font-medium transition-colors flex items-center gap-1.5"
+        :class="activeTab === 'trend' ? 'border-brand-600 text-brand-600 dark:text-brand-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'"
+        @click="switchTab('trend')"
+      >
+        <Icon name="activity" /> 闲鱼趋势
+        <span v-if="trendOtherTotal > 0" class="badge bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-300">{{ trendOtherTotal }}</span>
+      </button>
+    </div>
+
+    <template v-if="activeTab === 'mine'">
     <!-- Filters -->
     <div class="card p-4">
       <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -131,7 +155,10 @@
                   <p class="truncate text-slate-800 dark:text-slate-100">{{ o.item_title || o.item_id || '—' }}</p>
                   <p v-if="o.spec_value" class="text-xs text-slate-400">{{ o.spec_name }}: {{ o.spec_value }}</p>
                 </td>
-                <td>{{ o.buyer_id || '—' }}</td>
+                <td class="max-w-[140px]">
+                  <p class="truncate">{{ o.buyer_nick || o.buyer_id || '—' }}</p>
+                  <p v-if="o.buyer_nick && o.buyer_id" class="text-xs text-slate-400 font-mono truncate">{{ o.buyer_id }}</p>
+                </td>
                 <td><span class="font-medium text-slate-700 dark:text-slate-200">¥{{ o.amount || '0' }}</span></td>
                 <td><OrderStatusBadge :status="o.order_status" /></td>
                 <td class="hidden lg:table-cell text-slate-500 dark:text-slate-400 max-w-[140px]">
@@ -199,6 +226,166 @@
         </div>
       </div>
     </div>
+
+    <!-- 我的订单 tab 结束 -->
+    </template>
+
+    <!-- ==================== 闲鱼趋势 tab (v2.2.5) ==================== -->
+    <template v-else>
+      <!-- 7天全账号订单趋势 (chart.js 柱线混合图, 点击查看核心指标) -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h3 class="font-semibold text-slate-900 dark:text-white">闲鱼趋势 · 近 7 天全部账号订单</h3>
+            <p class="text-xs text-slate-400 mt-0.5">含已添加与非已添加账号的全部订单 (真实交易时间口径) · 点击图表查看核心指标</p>
+          </div>
+          <div class="flex items-center gap-4 text-right">
+            <div>
+              <p class="text-xs text-slate-400">7天订单</p>
+              <p class="text-lg font-semibold text-slate-900 dark:text-white tabular-nums">{{ trendWeek.all }}</p>
+            </div>
+            <div>
+              <p class="text-xs text-slate-400">7天收入</p>
+              <p class="text-lg font-semibold text-emerald-600 tabular-nums">¥{{ trendWeek.revenue.toFixed(2) }}</p>
+            </div>
+            <button class="btn-primary !py-1.5 !px-3" @click="metricsOpen = true">
+              <Icon name="activity" /> 核心指标
+            </button>
+          </div>
+        </div>
+        <div v-if="trendLoading" class="p-10 flex items-center justify-center text-slate-400">
+          <Icon name="refresh" class="animate-spin mr-2" /> 加载趋势数据...
+        </div>
+        <template v-else>
+          <BarLineChart
+            v-if="trends.days.length"
+            :labels="trends.days.map(d => d.label)"
+            :bar-data="trends.days.map(d => d.count)"
+            :line-data="trends.days.map(d => d.revenue)"
+            bar-label="订单量(单)"
+            line-label="收入(¥)"
+            :height="240"
+            click-hint="点击查看已付款/已收货/已退款核心指标"
+            @activate="metricsOpen = true"
+          />
+          <EmptyState v-else message="暂无订单趋势数据" icon="activity" />
+        </template>
+      </div>
+
+      <!-- 非已添加账号订单分页列表 -->
+      <div class="card overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 dark:border-slate-700 flex items-center justify-between">
+          <div>
+            <h3 class="font-semibold text-slate-900 dark:text-white">非已添加账号的订单</h3>
+            <p class="text-xs text-slate-400 mt-0.5">历史同步或已删除账号的订单 (cookie_id 不在当前账号列表中), 共 {{ trendOtherTotal }} 条</p>
+          </div>
+          <button class="btn-secondary !py-1.5 !px-3" :disabled="otherSyncing" @click="syncTrendOrders">
+            <Icon name="refresh" :class="otherSyncing ? 'animate-spin' : ''" /> 同步订单
+          </button>
+        </div>
+        <div v-if="otherLoading" class="p-10 flex items-center justify-center text-slate-400">
+          <Icon name="refresh" class="animate-spin mr-2" /> 加载中...
+        </div>
+        <template v-else>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>订单号</th>
+                  <th>商品</th>
+                  <th>买家</th>
+                  <th>卖家账号</th>
+                  <th>金额</th>
+                  <th>状态</th>
+                  <th>交易时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="o in otherOrders" :key="o.order_id" class="cursor-pointer" @click="openDetail(o)">
+                  <td class="font-mono text-xs">{{ o.order_id }}</td>
+                  <td class="max-w-[200px]">
+                    <p class="truncate text-slate-800 dark:text-slate-100">{{ o.item_title || o.item_id || '—' }}</p>
+                    <p v-if="o.spec_value" class="text-xs text-slate-400">{{ o.spec_name }}: {{ o.spec_value }}</p>
+                  </td>
+                  <td class="max-w-[140px]">
+                    <p class="truncate">{{ o.buyer_nick || o.buyer_id || '—' }}</p>
+                    <p v-if="o.buyer_nick && o.buyer_id" class="text-xs text-slate-400 font-mono truncate">{{ o.buyer_id }}</p>
+                  </td>
+                  <td class="text-slate-500 dark:text-slate-400 max-w-[140px]"><p class="truncate font-mono">{{ o.cookie_id || '—' }}</p></td>
+                  <td>
+                    <span class="font-medium text-slate-700 dark:text-slate-200">¥{{ o.amount || '0' }}</span>
+                    <p v-if="o.item_price && o.item_price !== o.amount" class="text-xs text-slate-400">单价 ¥{{ o.item_price }}</p>
+                  </td>
+                  <td><OrderStatusBadge :status="o.order_status" /></td>
+                  <td class="text-slate-500 dark:text-slate-400">{{ formatTime(o.created_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <EmptyState v-if="!otherOrders.length" message="暂无非已添加账号的订单 (历史同步/已删除账号的订单会显示在这里)" icon="orders" />
+        </template>
+        <div v-if="trendOtherTotal > otherPageSize" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-slate-700">
+          <p class="text-xs text-slate-500">共 {{ trendOtherTotal }} 条，第 {{ otherPage }} / {{ otherTotalPages }} 页</p>
+          <div class="flex items-center gap-1 flex-wrap">
+            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="otherPage <= 1" @click="goOtherPage(otherPage - 1)">
+              <Icon name="chevronRight" class="rotate-180" />
+            </button>
+            <template v-for="(p, i) in otherPageItems" :key="`${p}-${i}`">
+              <span v-if="typeof p === 'string'" class="px-1.5 text-slate-400 select-none">{{ p }}</span>
+              <button
+                v-else
+                class="btn-secondary !px-2.5 !py-1.5 min-w-8"
+                :class="p === otherPage ? '!bg-brand-600 !text-white !border-brand-600 hover:!bg-brand-700' : ''"
+                :disabled="p === otherPage"
+                @click="goOtherPage(p)"
+              >
+                {{ p }}
+              </button>
+            </template>
+            <button class="btn-secondary !px-2.5 !py-1.5" :disabled="otherPage >= otherTotalPages" @click="goOtherPage(otherPage + 1)">
+              <Icon name="chevronRight" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ==================== 核心指标弹窗 (chart.js) ==================== -->
+    <ModalBase v-model="metricsOpen" title="闲鱼趋势 · 核心订单指标" size="lg">
+      <div class="space-y-6">
+        <!-- 指标数据面板 (全库累计 + 近7天) -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <StatCard label="订单总数" :value="metricsTotals.all" icon="orders" color="slate" :hint="`近7天 ${trendWeek.all} 单`" />
+          <StatCard label="已付款" :value="metricsTotals.paid" icon="cards" color="amber" :hint="`近7天 ${trendWeek.paid} 单`" />
+          <StatCard label="已收货" :value="metricsTotals.received" icon="delivery" color="emerald" :hint="`近7天 ${trendWeek.received} 单`" />
+          <StatCard label="已退款" :value="metricsTotals.refunded" icon="alert" color="rose" :hint="`近7天 ${trendWeek.refunded} 单`" />
+        </div>
+
+        <!-- 7天各指标趋势图表 (chart.js) -->
+        <div v-if="metricsTrendLoading" class="p-10 flex items-center justify-center text-slate-400">
+          <Icon name="refresh" class="animate-spin mr-2" /> 加载指标趋势...
+        </div>
+        <div v-else-if="trends.days.length" class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div>
+            <p class="text-xs text-slate-400 mb-1 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-amber-500" /> 已付款 (单/天)</p>
+            <LineChart :data="trends.days.map(d => d.paid)" :labels="trends.days.map(d => d.label)" color="#f59e0b" unit="单" :height="160" />
+          </div>
+          <div>
+            <p class="text-xs text-slate-400 mb-1 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500" /> 已收货 (单/天)</p>
+            <LineChart :data="trends.days.map(d => d.received)" :labels="trends.days.map(d => d.label)" color="#10b981" unit="单" :height="160" />
+          </div>
+          <div>
+            <p class="text-xs text-slate-400 mb-1 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-rose-500" /> 已退款 (单/天)</p>
+            <LineChart :data="trends.days.map(d => d.refunded)" :labels="trends.days.map(d => d.label)" color="#f43f5e" unit="单" :height="160" />
+          </div>
+        </div>
+        <EmptyState v-else message="暂无趋势数据" icon="activity" />
+        <p class="text-xs text-slate-400">口径: 已付款 = 待发货/已发货/已完成/退款中/已退款/处理中 (均已完成付款); 已收货 = 交易成功; 已退款 = 退款中/已退款。统计基于库内真实订单状态与交易时间。</p>
+      </div>
+      <template #footer>
+        <button class="btn-secondary" @click="metricsOpen = false">关闭</button>
+      </template>
+    </ModalBase>
 
     <!-- Detail drawer (只读信息 + 单订单精修编辑) -->
     <DetailDrawer v-model="detailOpen" :eyebrow="'订单详情'" :title="detail?.order_id || '—'">
@@ -343,8 +530,8 @@
 </template>
 
 <script setup lang="ts">
-import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi } from '~/api/orders'
-import type { Order } from '~/api/orders'
+import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, syncAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi, getOrderTrends } from '~/api/orders'
+import type { Order, OrderTrends } from '~/api/orders'
 import { getAccounts } from '~/api/accounts'
 import type { AccountLite } from '~/api/accounts'
 import { exportCsv } from '~/api/export'
@@ -372,6 +559,125 @@ const accounts = ref<AccountLite[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
+
+/* ==================== Tab 切换与闲鱼趋势 (v2.2.5) ==================== */
+
+/** activeTab: mine = 我的订单 (已添加账号, 筛选+列表) / trend = 闲鱼趋势 (全账号趋势+非已添加账号订单) */
+const activeTab = ref<'mine' | 'trend'>('mine')
+
+function switchTab(tab: 'mine' | 'trend') {
+  if (activeTab.value === tab) return
+  activeTab.value = tab
+  // 切入趋势 tab 时拉取趋势数据 + 非已添加账号订单分页列表 (每次切入都刷新, 保证徽标/列表/图表是最新的)
+  if (tab === 'trend') {
+    trendsLoaded = true
+    loadTrends()
+    loadOtherOrders()
+  }
+}
+
+const trends = ref<OrderTrends>({ days: [], metrics: { totals: { all: 0, paid: 0, received: 0, refunded: 0 }, week: { all: 0, paid: 0, received: 0, refunded: 0, revenue: 0 } }, other_total: 0 })
+const trendLoading = ref(false)
+const trendOtherTotal = ref(0)
+let trendsLoaded = false
+
+const metricsOpen = ref(false)
+const metricsTrendLoading = ref(false)
+
+const trendWeek = computed(() => trends.value.metrics?.week || { all: 0, paid: 0, received: 0, refunded: 0, revenue: 0 })
+const metricsTotals = computed(() => trends.value.metrics?.totals || { all: 0, paid: 0, received: 0, refunded: 0 })
+
+/** 闲鱼趋势: 近7天全账号订单趋势 + 核心指标 (真实库内数据) */
+async function loadTrends() {
+  trendLoading.value = true
+  metricsTrendLoading.value = true
+  try {
+    const r = await getOrderTrends()
+    trends.value = r
+    trendOtherTotal.value = Number(r.other_total) || 0
+  } catch (e: any) {
+    toast.error(e.message || '趋势数据加载失败')
+  } finally {
+    trendLoading.value = false
+    metricsTrendLoading.value = false
+  }
+}
+
+/* ---- 非已添加账号订单分页列表 (scope=other) ---- */
+const otherOrders = ref<Order[]>([])
+const otherLoading = ref(false)
+const otherPage = ref(1)
+const otherPageSize = ref(20)
+const otherTotalPages = computed(() => Math.max(1, Math.ceil(trendOtherTotal.value / otherPageSize.value)))
+
+/** 页码列表 (与我的订单分页同款省略号折叠) */
+const otherPageItems = computed<(number | string)[]>(() => {
+  const tp = otherTotalPages.value
+  const cur = otherPage.value
+  if (tp <= 7) return Array.from({ length: tp }, (_, i) => i + 1)
+  const picks = new Set<number>([1, tp, cur - 1, cur, cur + 1])
+  const arr = [...picks].filter((p) => p >= 1 && p <= tp).sort((a, b) => a - b)
+  const out: (number | string)[] = []
+  let prev = 0
+  for (const p of arr) {
+    if (p - prev > 1) out.push('…')
+    out.push(p)
+    prev = p
+  }
+  return out
+})
+
+async function loadOtherOrders() {
+  otherLoading.value = true
+  try {
+    const r = await getOrders({ scope: 'other', page: otherPage.value, pageSize: otherPageSize.value })
+    otherOrders.value = r.data
+    trendOtherTotal.value = r.total
+  } catch (e: any) {
+    toast.error(e.message || '非已添加账号订单加载失败')
+  } finally {
+    otherLoading.value = false
+  }
+}
+
+function goOtherPage(p: number) {
+  if (p < 1 || p > otherTotalPages.value) return
+  otherPage.value = p
+  loadOtherOrders()
+}
+
+/* ---- 全量订单同步 (v2.2.6, 闲鱼趋势 tab「同步订单」按钮) ---- */
+const otherSyncing = ref(false)
+
+/**
+ * 全量订单同步: 调 /api/orders/sync-all (2.1.7 订单拉取链路独立移植) —
+ * 不判断区分账号拉取全部状态订单入库 (商品名称/买家昵称/卖家身份随单真实落库),
+ * 完成后刷新非已添加账号订单列表与趋势数据。
+ */
+async function syncTrendOrders() {
+  otherSyncing.value = true
+  try {
+    const r = await syncAllOrders()
+    const parts: string[] = []
+    if (r.inserted) parts.push(`新拉取 ${r.inserted} 单`)
+    if (r.updated) parts.push(`更新 ${r.updated} 单`)
+    if (r.skipped_deleted) parts.push(`已删除屏蔽 ${r.skipped_deleted} 单`)
+    const hardError = r.errors?.find((e) => !e.startsWith('已删除屏蔽'))
+    if (hardError) {
+      toast.error(`同步失败: ${hardError}`)
+    } else if (!parts.length) {
+      toast.info(r.errors?.length ? r.errors[0] : '暂无新订单')
+    } else {
+      toast.success(parts.join(', '))
+    }
+  } catch (e: any) {
+    toast.error(e.message || '全量订单同步失败')
+  } finally {
+    otherSyncing.value = false
+    loadOtherOrders()
+    loadTrends()
+  }
+}
 
 // Batch operations
 const selectedIds = ref<string[]>([])
@@ -488,6 +794,8 @@ async function reload() {
       getOrders({
         page: page.value,
         pageSize: pageSize.value,
+        // v2.2.5 我的订单 tab: 只展示已添加账号的订单 (选账号则看该账号, 默认全部已添加账号)
+        scope: 'mine',
         status: filters.status !== 'all' ? filters.status : undefined,
         cookie_id: filters.cookie_id || undefined,
         keyword: filters.keyword.trim() || undefined,
@@ -577,6 +885,11 @@ async function syncAll() {
   } finally {
     syncing.value = false
     reload()
+    // 趋势 tab 已加载过则同步刷新 (拉单后趋势/非已添加账号列表随之更新)
+    if (trendsLoaded) {
+      loadTrends()
+      loadOtherOrders()
+    }
   }
 }
 

@@ -95,6 +95,54 @@
       </template>
     </div>
 
+    <!-- 自动发货仿真测试 (v2.2.4) -->
+    <div class="card p-4 sm:p-6 space-y-4">
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <div class="flex items-center gap-2">
+          <Icon name="play" class="text-brand-600 dark:text-brand-400" />
+          <h3 class="font-semibold text-slate-900 dark:text-white">自动发货仿真测试</h3>
+          <span class="badge bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">模拟 · 不真实发货</span>
+        </div>
+        <span v-if="simRunning" class="badge bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" /> 模拟流程进行中
+        </span>
+      </div>
+      <div class="flex items-end gap-3 flex-wrap">
+        <div class="min-w-[220px] flex-1 sm:max-w-[320px]">
+          <label class="label">发货触发条件</label>
+          <select v-model.number="simRuleId" class="input">
+            <option :value="0" disabled>请选择已配置的触发条件</option>
+            <option v-for="r in rules" :key="r.id" :value="r.id">
+              {{ simRuleLabel(r) }}
+            </option>
+          </select>
+        </div>
+        <div class="min-w-[180px] flex-1 sm:max-w-[260px]">
+          <label class="label">测试账号</label>
+          <select v-model="simAccount" class="input">
+            <option value="" disabled>请选择账号</option>
+            <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.remark || a.id }}</option>
+          </select>
+        </div>
+        <button class="btn-primary" :disabled="!simRuleId || !simAccount || simRunning" @click="startSimulate">
+          <Icon name="play" v-if="!simRunning" />
+          <Icon name="refresh" v-else class="animate-spin" />
+          {{ simRunning ? '模拟中...' : '模拟自动发货' }}
+        </button>
+        <button v-if="simLines.length" class="btn-ghost" @click="clearSimTerminal">清空终端</button>
+      </div>
+      <p class="text-xs text-slate-400 dark:text-slate-500 leading-relaxed">
+        按真实自动发货链路仿真跑通到已发货状态：待发货状态闸门 → 规则 → 卡券内容提取渲染 → 无需邮寄发货状态流转 → 已发货，
+        除不真实调平台发货接口/不真实发送消息/不扣卡券库存/不计规则次数外完全仿真。测试日志与
+        「回复决策日志」列表带棕色[测试]徽章的是同一份日志数据。
+      </p>
+      <div ref="simTermRef" class="rounded-lg bg-slate-900 border border-slate-800 p-3 font-mono text-xs leading-relaxed text-emerald-400 max-h-80 overflow-y-auto">
+        <div v-if="!simLines.length" class="text-slate-500">等待启动模拟 — 选择触发条件与账号后点击「模拟自动发货」…</div>
+        <div v-for="(line, i) in simLines" :key="i" class="whitespace-pre-wrap break-words">{{ line }}</div>
+        <div v-if="simRunning" class="text-slate-500 animate-pulse">▍</div>
+      </div>
+    </div>
+
     <!-- Create/Edit modal -->
     <ModalBase v-model="modalOpen" :title="editing ? '编辑规则' : '新增规则'" size="md">
       <div class="space-y-4">
@@ -213,12 +261,14 @@
 </template>
 
 <script setup lang="ts">
-import { getDeliveryRules, createDeliveryRule, updateDeliveryRule, deleteDeliveryRule } from '~/api/delivery'
+import { getDeliveryRules, createDeliveryRule, updateDeliveryRule, deleteDeliveryRule, simulateDeliveryRule } from '~/api/delivery'
 import type { DeliveryRule } from '~/api/delivery'
 import { getCards } from '~/api/cards'
 import type { CardLite } from '~/api/cards'
 import { getItems } from '~/api/items'
 import type { Item } from '~/api/items'
+import { getAccounts, type AccountLite } from '~/api/accounts'
+import { getReplyLogs, type ReplyLog } from '~/api/reply-logs'
 
 definePageMeta({ layout: 'default' })
 
@@ -249,6 +299,98 @@ const modalOpen = ref(false)
 const editing = ref(false)
 const deleteTarget = ref<DeliveryRule | null>(null)
 
+/* ---------------- 自动发货仿真测试 (v2.2.4) ---------------- */
+const accounts = ref<AccountLite[]>([])
+const simRuleId = ref(0)
+const simAccount = ref('')
+const simRunning = ref(false)
+const simLines = ref<string[]>([])
+const simLastId = ref(0)
+const simEndTimer = ref<ReturnType<typeof setTimeout> | null>(null)
+const simTermRef = ref<HTMLElement | null>(null)
+let simTimer: ReturnType<typeof setInterval> | null = null
+
+function simRuleLabel(r: DeliveryRule): string {
+  if (r.trigger_type === 'payment') {
+    return `# ${r.id} · 付款自动发货 · ${r.item_title || r.item_id}`
+  }
+  return `# ${r.id} · 关键词「${r.keyword}」`
+}
+
+function simLogLine(l: ReplyLog): string {
+  const t = (l.created_at || '').replace('T', ' ').slice(5, 19)
+  const status = l.process_status === 'success' ? '✓' : '✗'
+  const reason = l.decision_reason || l.reply_strategy || '-'
+  const text = (l.error_message || l.reply_text || '').replace(/\s+/g, ' ').slice(0, 180)
+  return `[${t}] ${status} ${reason} | ${l.source_message || '-'} | ${text}`
+}
+
+function stopSimPolling() {
+  if (simTimer) clearInterval(simTimer)
+  simTimer = null
+}
+
+function clearSimTerminal() {
+  simLines.value = []
+  simLastId.value = 0
+}
+
+function appendSimLine(line: string) {
+  simLines.value.push(line)
+  if (simLines.value.length > 300) simLines.value.splice(0, simLines.value.length - 300)
+  nextTick(() => {
+    const el = simTermRef.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+/** 终端判定流程结束: 出现发货终态决策日志 (成功/失败/已发货跳过) 后, 再拉一轮确认无增量即收尾 */
+function markSimMaybeDone(reason: string) {
+  if (!simRunning.value) return
+  if (simEndTimer.value) clearTimeout(simEndTimer.value)
+  simEndTimer.value = setTimeout(() => {
+    simRunning.value = false
+    appendSimLine(`[结束] 模拟流程完成 (${reason}) — 完整链路日志可在「回复决策日志」查看 (棕色[测试]徽章)`)
+    if (simTimer) clearInterval(simTimer)
+    simTimer = null
+  }, 2500)
+}
+
+async function startSimulate() {
+  if (!simRuleId.value || !simAccount.value) return
+  clearSimTerminal()
+  simRunning.value = true
+  appendSimLine(`[启动] 规则 #${simRuleId.value} · 账号 ${simAccount.value} — 模拟买家付款, 触发「[我已付款，等待你发货]」真实链路…`)
+  try {
+    await simulateDeliveryRule({ rule_id: simRuleId.value, account: simAccount.value })
+    stopSimPolling()
+    simTimer = setInterval(async () => {
+      try {
+        const res = await getReplyLogs({ test: true, since_id: simLastId.value, limit: 50 })
+        const fresh = res.logs.slice().reverse() // id 升序展示
+        for (const l of fresh) {
+          appendSimLine(simLogLine(l))
+          if (l.id > simLastId.value) simLastId.value = l.id
+          if (['auto_delivered', 'delivery_failed', 'already_shipped'].includes(l.decision_reason)) {
+            markSimMaybeDone(l.decision_reason === 'auto_delivered' ? '已发货状态达成' : l.decision_reason === 'already_shipped' ? '已发货跳过' : '发货链路终止')
+          }
+        }
+      } catch {
+        /* 轮询失败静默, 下一轮重试 */
+      }
+    }, 1200)
+  } catch (e: any) {
+    simRunning.value = false
+    appendSimLine(`[错误] ${e?.message || '启动模拟失败'}`)
+    toast.error(e?.message || '启动模拟失败')
+  }
+}
+
+onBeforeUnmount(() => {
+  stopSimPolling()
+  if (simEndTimer.value) clearTimeout(simEndTimer.value)
+})
+
 const form = ref<any>({
   id: null,
   trigger_type: 'keyword',
@@ -265,14 +407,18 @@ const form = ref<any>({
 async function reload() {
   loading.value = true
   try {
-    const [rulesData, cardsData, itemsData] = await Promise.all([
+    const [rulesData, cardsData, itemsData, accountsData] = await Promise.all([
       getDeliveryRules(),
       getCards(),
       getItems(),
+      getAccounts().catch(() => [] as AccountLite[]),
     ])
     rules.value = rulesData
     cards.value = cardsData
     items.value = itemsData
+    accounts.value = accountsData
+    if (!simAccount.value && accountsData.length) simAccount.value = accountsData[0].id
+    if (!simRuleId.value && rulesData.length) simRuleId.value = rulesData[0].id
   } catch (e: any) {
     toast.error(e.message || '加载失败')
   } finally {

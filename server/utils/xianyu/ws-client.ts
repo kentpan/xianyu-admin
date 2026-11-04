@@ -514,9 +514,7 @@ export class XianyuAccountClient {
    * web 会话保活一次: 携带会话 cookie GET 闲鱼主站 (与用户手动「验证 cookie」同一动作,
    * 服务端滑动续期 web 登录会话)。守卫与 cookie 保活同源: 防重入/人工验证持有期/风控
    * 冷却/消息冷却; 失败静默 (网络异常不影响监听主链路); 不改状态机 (登录态判定仍由
-   * token 链路负责)。主站下发的 Set-Cookie 不回写 (v2.1.18 事故根治): 那是主站网页
-   * 上下文的反爬/追踪令牌, 与 mtop/发货链不同上下文, 合并只会污染签名身份并引发
-   * 代理侧无意义热替换; 会话 cookie 的新鲜度由 token 链路 (同上下文) 独家维护。
+   * token 链路负责)。主站下发的 Set-Cookie 合并回写 (过期删除感知)。
    */
   private async webSessionKeepalive(): Promise<void> {
     if (this.stopped || this.cookieRefreshing) return
@@ -536,8 +534,16 @@ export class XianyuAccountClient {
         },
         signal: AbortSignal.timeout(20_000),
       })
-      // 只续期不回写: 滑动续期在服务端收到请求时已完成; 主站网页上下文的 Set-Cookie
-      // 与 mtop/发货链不同上下文, 合并回写会污染签名身份 (v2.1.18 事故根治点)
+      const setCookies: string[] = (res.headers as any).getSetCookie?.() || []
+      if (setCookies.length) {
+        const merged = transCookies(this.cookieStr)
+        applySetCookies(merged, setCookies)
+        const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
+        if (mergedStr !== this.cookieStr) {
+          this.cookieStr = mergedStr
+          this.events.onCookieRotated(this.cookieId, mergedStr)
+        }
+      }
       // 重定向到 passport = 会话已失效 (仅留痕; 登录态判定与状态机仍由 token 链路负责)
       const location = res.headers.get('location') || ''
       if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {

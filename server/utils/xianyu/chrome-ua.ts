@@ -13,7 +13,7 @@
  *   userAgentData ↔ 求解浏览器四方一致。
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -26,7 +26,36 @@ export interface ChromeUAInfo {
   secChUa: string
   secChUaPlatform: string
   version: string
-  source: 'detected' | 'fallback'
+  source: 'detected' | 'fallback' | 'cached'
+}
+
+/**
+ * UA 版本跨进程持久化 (v2.2.4 账号保活加固): 探测结果缓存到本地文件, 进程重启不漂移。
+ * 部署机 Chromium 升级/容器重建导致的 UA 版本跳变 = 闲鱼视角的“设备环境变化”,
+ * 会触发「登录环境异常 → 重新登录 + 人脸核验」。同一账号的 UA 稳定是风控底线:
+ * 优先用上一次的版本 (与挑战签发/滑块求解浏览器一致优先级高于版本新鲜度),
+ * 仅上次为回退值时才重新探测真实浏览器。文件读写失败 (CF Workers/只读 FS) 静默降级为原行为。
+ */
+const UA_CACHE_FILE = process.env.XY_UA_CACHE || path.join(os.homedir(), '.xy-ua-cache.json')
+
+function loadCachedUAVersion(): { version: string; detected: boolean } {
+  try {
+    if (!existsSync(UA_CACHE_FILE)) return { version: '', detected: false }
+    const raw = JSON.parse(readFileSync(UA_CACHE_FILE, 'utf8'))
+    const v = String(raw?.version || '')
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(v)) return { version: '', detected: false }
+    return { version: v, detected: raw?.source === 'detected' }
+  } catch {
+    return { version: '', detected: false }
+  }
+}
+
+function saveCachedUAVersion(version: string, detected: boolean): void {
+  try {
+    writeFileSync(UA_CACHE_FILE, JSON.stringify({ version, source: detected ? 'detected' : 'fallback', platform: process.platform, at: new Date().toISOString() }))
+  } catch {
+    // 只读 FS/无家目录 (云端部署): 静默, 进程内缓存照常生效
+  }
 }
 
 const g = globalThis as any
@@ -64,27 +93,36 @@ function platformParts(): { uaPlatform: string; chPlatform: string; osTag: strin
   }
 }
 
-/** 解析真实 Chromium UA (带进程级缓存, 首次 --version 探测 ~200ms)。 */
+/** 解析真实 Chromium UA (进程级缓存 + 文件持久化, 首次 --version 探测 ~200ms)。 */
 export function resolveChromeUA(): ChromeUAInfo {
   if (g.__xyChromeUAInfo) return g.__xyChromeUAInfo
   const p = platformParts()
   let version = ''
   let source: ChromeUAInfo['source'] = 'fallback'
-  try {
-    const bin = findChromiumBinary()
-    if (bin) {
-      const out = execFileSync(bin, ['--version'], { timeout: 5000, encoding: 'utf8' })
-      const m = String(out).match(/(\d+\.\d+\.\d+\.\d+)/)
-      if (m) {
-        version = m[1]
-        source = 'detected'
+  // 文件缓存优先: 上次探测到真实浏览器版本时直接复用 (跨重启稳定, 不随部署机 Chromium 升级漂移)
+  const cached = loadCachedUAVersion()
+  if (cached.detected && cached.version) {
+    version = cached.version
+    source = 'cached'
+  } else {
+    try {
+      const bin = findChromiumBinary()
+      if (bin) {
+        const out = execFileSync(bin, ['--version'], { timeout: 5000, encoding: 'utf8' })
+        const m = String(out).match(/(\d+\.\d+\.\d+\.\d+)/)
+        if (m) {
+          version = m[1]
+          source = 'detected'
+        }
       }
+    } catch {
+      // 探测失败 → 静态回退
     }
-  } catch {
-    // 探测失败 → 静态回退
-  }
-  if (!version) {
-    version = FALLBACK_UA.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '133.0.0.0'
+    if (!version) {
+      version = FALLBACK_UA.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '133.0.0.0'
+    }
+    // 探测成功或首次回退都落盘 (下次启动不再漂移)
+    saveCachedUAVersion(version, source === 'detected')
   }
   const major = version.split('.')[0]
   const info: ChromeUAInfo = {

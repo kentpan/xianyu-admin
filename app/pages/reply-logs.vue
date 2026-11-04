@@ -70,6 +70,7 @@
                   <p class="text-slate-500 dark:text-slate-400 truncate">{{ log.source_message || '-' }}</p>
                 </td>
                 <td>
+                  <span v-if="log.is_test" class="badge bg-amber-800 text-amber-50 dark:bg-amber-800 dark:text-amber-50 mr-1" title="仿真测试日志 (自动发货页模拟发货产生)">[测试]</span>
                   <span class="badge" :class="strategyMeta(log).cls">{{ strategyMeta(log).label }}</span>
                 </td>
                 <td class="max-w-[140px] truncate text-slate-500 dark:text-slate-400">{{ log.matched_keyword || '-' }}</td>

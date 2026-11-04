@@ -454,6 +454,32 @@ export function extractOrderId(message: any): string {
 }
 
 /**
+ * 卡片更新消息的展示标题归一: 平台的卡片更新语义是「旧卡片标题 + 新卡片内容」, 付款后
+ * 更新链会出现「买家已拍下，待付款 [已付款，待发货]」这类自相矛盾的展示 (reminderTitle
+ * 描述的是上一张卡片的状态)。以更新后的内容 (reminderContent) 反推规范标题, 内容不可
+ * 识别时回退原 reminderTitle。
+ */
+const CARD_UPDATE_TITLE_RULES: [RegExp, string][] = [
+  [/\[我已付款，等待你发货\]/, '等待你发货'],
+  [/\[已付款，待发货\]/, '等待你发货'],
+  [/\[记得及时发货\]/, '买家提醒发货'],
+  [/\[(?:我|买家)已拍下，待付款\]/, '买家已拍下，待付款'],
+  [/\[买家确认收货，交易成功\]/, '交易成功'],
+  [/\[你已确认收货，交易成功\]/, '交易成功'],
+  [/\[我发起了退款申请\]/, '买家发起退款'],
+  [/\[退款成功，钱款已原路退返\]/, '退款成功'],
+  [/\[你关闭了订单，钱款已原路退返\]/, '订单已关闭'],
+]
+
+export function normalizeCardUpdateTitle(content: string, fallbackTitle: string): string {
+  const text = String(content || '')
+  for (const [pattern, title] of CARD_UPDATE_TITLE_RULES) {
+    if (pattern.test(text)) return title
+  }
+  return String(fallbackTitle || '系统')
+}
+
+/**
  * 解析交易卡片 (message['1']['6']['3']['5'] JSON) 的标题与金额。
  * 标题: dxCard.item.main.exContent.title (butler 同路径)
  * 金额: exContent.price / priceText / amount 字段, 兜底从卡片全文提取 ¥xx.xx / xx.xx元
@@ -576,12 +602,15 @@ export function parseSyncItem(data: string, myId: string): ParsedMessage {
   if (typeof m1Raw === 'string' && m4 && typeof m4 === 'object' && m4.reminderContent != null) {
     const chatIdRaw = String(message['2'] ?? '')
     const cuItemId = extractItemIdFromMeta(m4)
+    const cuContent = String(m4.reminderContent ?? '')
     return {
       kind: 'chat',
       chatId: chatIdRaw.split('@')[0] || chatIdRaw,
       senderUserId: String(m4.senderUserId ?? ''),
-      senderNick: String(m4.reminderTitle ?? '系统'),
-      content: String(m4.reminderContent ?? ''),
+      // 卡片更新消息: reminderTitle 是上一张卡片的旧状态标题 (平台卡片更新语义), 以更新后
+      // 的内容反推规范标题, 消灭「买家已拍下，待付款 [已付款，待发货]」自相矛盾展示
+      senderNick: normalizeCardUpdateTitle(cuContent, String(m4.reminderTitle ?? '系统')),
+      content: cuContent,
       itemId: cuItemId,
       createTime: Number(message['5'] ?? 0),
       sessionType: '1',

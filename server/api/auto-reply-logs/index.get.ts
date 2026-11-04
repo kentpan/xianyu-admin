@@ -2,7 +2,9 @@
  * GET /api/auto-reply-logs — 回复决策日志列表 (监听引擎写入)。
  *
  * 查询参数: cookie_id 可选, keyword 可选(模糊匹配来源消息/命中关键词/回复内容),
- *          limit 默认 100, offset 默认 0
+ *          limit 默认 100, offset 默认 0,
+ *          test=1 只看仿真测试日志 (is_test=1, v2.2.4), since_id=N 只取 id>N 的增量
+ *          (自动发货页模拟终端实时拉取同一份日志数据用)
  */
 export default defineEventHandler(
   withApi(async (event) => {
@@ -13,6 +15,8 @@ export default defineEventHandler(
     const cookieId = (q.cookie_id || '').toString().trim()
     const keyword = (q.keyword || '').toString().trim()
     const strategy = (q.strategy || '').toString().trim()
+    const testOnly = (q.test || '').toString() === '1'
+    const sinceId = Math.max(parseInt(q.since_id as string, 10) || 0, 0)
     const limit = Math.min(Math.max(parseInt(q.limit as string, 10) || 100, 1), 500)
     const offset = Math.max(parseInt(q.offset as string, 10) || 0, 0)
 
@@ -21,6 +25,13 @@ export default defineEventHandler(
     if (cookieId) {
       conds.push('cookie_id = ?')
       params.push(cookieId)
+    }
+    if (testOnly) {
+      conds.push('COALESCE(is_test, 0) = 1')
+    }
+    if (sinceId > 0) {
+      conds.push('id > ?')
+      params.push(sinceId)
     }
     if (keyword) {
       conds.push('(source_message LIKE ? OR matched_keyword LIKE ? OR reply_text LIKE ? OR sender_user_name LIKE ?)')

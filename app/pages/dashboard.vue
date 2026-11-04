@@ -74,7 +74,7 @@
         </div>
       </div>
       <div v-if="trend.days.length" class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div>
+        <div ref="trendChartWrapRef">
           <p class="text-xs text-slate-400 mb-1 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-brand-500" /> 订单量</p>
           <LineChart :data="trend.days.map(d => d.count)" :labels="trend.days.map(d => d.label)" color="#f59e0b" unit="单" />
         </div>
@@ -101,8 +101,8 @@
           </div>
         </div>
         <div v-if="statusBars.length" class="grid grid-cols-1 md:grid-cols-5 gap-6 items-center">
-          <div class="md:col-span-2 flex justify-center">
-            <DonutChart :data="donutData" :size="180" :stroke-width="22" center-label="订单" />
+          <div ref="donutChartWrapRef" class="md:col-span-2 flex justify-center">
+            <DonutChart :data="donutData" :size="180" :stroke-width="22" center-label="订单" :show-legend="false" />
           </div>
           <div class="md:col-span-3 space-y-2.5">
             <div v-for="s in statusBars" :key="s.key" class="flex items-center gap-3">
@@ -280,6 +280,10 @@ import type { DashboardStats, TrendDay, ActivityItem, OnlineAccount } from '~/ap
 
 definePageMeta({ layout: 'default' })
 
+// 图表导出定位 (v2.2.5 chart.js canvas 容器引用)
+const trendChartWrapRef = ref<HTMLElement | null>(null)
+const donutChartWrapRef = ref<HTMLElement | null>(null)
+
 const loading = ref(false)
 
 const stats = ref<DashboardStats>({
@@ -322,15 +326,15 @@ async function loadHealth() {
   }
 }
 
-// Chart export
-const { exportSvgToPng } = useChartExport()
+// Chart export (v2.2.5: 图表已迁移到 chart.js canvas, 导出走 canvas 白底合成)
+const { exportCanvasToPng } = useChartExport()
 async function exportTrendChart() {
-  const svgs = document.querySelectorAll('.card svg')
-  if (svgs.length) {
+  const canvas = trendChartWrapRef.value?.querySelector('canvas')
+  if (canvas) {
     try {
-      await exportSvgToPng(svgs[0] as HTMLElement, `order_trend_${Date.now()}.png`)
-    } catch {
-      // silent
+      await exportCanvasToPng(canvas as HTMLCanvasElement, `order_trend_${Date.now()}.png`)
+    } catch (e: any) {
+      console.error('[dashboard] 趋势图导出失败:', e?.message || e)
     }
   }
 }
@@ -350,14 +354,14 @@ function openReport() {
   window.open(getDashboardReportUrl(), '_blank')
 }
 
-// Donut chart export
+// Donut chart export (chart.js canvas)
 async function exportDonutChart() {
-  const svgs = document.querySelectorAll('.card svg')
-  if (svgs.length > 1) {
+  const canvas = donutChartWrapRef.value?.querySelector('canvas')
+  if (canvas) {
     try {
-      await exportSvgToPng(svgs[1] as HTMLElement, `order_status_${Date.now()}.png`)
-    } catch {
-      // silent
+      await exportCanvasToPng(canvas as HTMLCanvasElement, `order_status_${Date.now()}.png`)
+    } catch (e: any) {
+      console.error('[dashboard] 环形图导出失败:', e?.message || e)
     }
   }
 }

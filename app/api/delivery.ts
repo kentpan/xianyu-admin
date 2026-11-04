@@ -55,3 +55,10 @@ export function toggleDeliveryRuleEnabled(id: number, enabled: boolean) {
 export function deleteDeliveryRule(id: number) {
   return useApi().del(`/api/delivery/${id}`)
 }
+
+/** 自动发货仿真全链路测试 (v2.2.4): 模拟买家付款触发选定规则, 按真实链路跑到已发货
+ *  (除不真实发货/发送/扣库存外完全仿真); 后台执行, 测试决策日志轮询
+ *  /api/auto-reply-logs?test=1&since_id= 实时展示 (与回复决策日志列表同一份数据) */
+export function simulateDeliveryRule(body: { rule_id: number; account: string }) {
+  return useApi().post<{ started: boolean; rule_id: number; account: string }>('/api/delivery/simulate', body)
+}

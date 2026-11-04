@@ -28,6 +28,13 @@ const ITEM_SYNC_MIN_INTERVAL_S = 60
 const MAINTENANCE_TICK_MS = 5 * 60_000
 /** 远程代理心跳失联阈值: 超此时间无 last_seen_at 更新即视为未在服务本后台 (内置接管)。 */
 const REMOTE_STALE_MS = 5 * 60_000
+/**
+ * 远程代理失联接管确认窗口 (v2.2.4 账号保活加固): probe 结果有 30s 缓存,
+ * 瞬时网络抖动/边缘波动 <90s 一律不接管 — 误接管会与代理形成两条闲鱼长连接
+ * (双设备指纹双出口 IP), 平台风控直接判「环境异常, 重新登录 + 人脸核验」。
+ * 持续失联 ≥90s (跨越 ≥3 个探测缓存周期) 才认定代理真实死亡。
+ */
+const REMOTE_DOWN_CONFIRM_MS = 90_000
 
 interface EngineRuntime {
   pollTimer: NodeJS.Timeout | null
@@ -43,6 +50,8 @@ interface EngineRuntime {
   itemSyncRunning: boolean
   polishRunning: boolean
   orderSyncRunning: boolean
+  /** 远程代理首次失联时刻 (0=健康): 接管确认窗口计时 */
+  remoteDownSince: number
 }
 
 const g = globalThis as any
@@ -60,6 +69,7 @@ if (!g.__xianyuEngineRuntime) {
     itemSyncRunning: false,
     polishRunning: false,
     orderSyncRunning: false,
+    remoteDownSince: 0,
   } as EngineRuntime
 }
 const runtime = g.__xianyuEngineRuntime as EngineRuntime
@@ -136,6 +146,7 @@ async function pollOnce(): Promise<void> {
       // 静默停摆却无人知晓」(v2.1.15 线上实证: 代理进程死后 standby, 商品同步/风控日志全停)。
       const probe = await probeActiveRemote(db)
       if (probe.serving) {
+        runtime.remoteDownSince = 0
         if (!runtime.standby) {
           // 交回: 停全部内置客户端转待命 (代理已在服务, 双活会重复回复)
           for (const client of runtime.clients.values()) await client.stop()
@@ -155,17 +166,37 @@ async function pollOnce(): Promise<void> {
         }
         return
       }
+      // 失联确认窗口 (v2.2.4): probe 有 30s 结果缓存, 瞬时网络抖动/边缘波动 <90s 一律不接管 —
+      // 误接管会与代理形成两条闲鱼长连接 (双设备指纹双出口 IP), 平台风控直接判
+      // 「环境异常, 重新登录 + 人脸核验」。持续失联 ≥90s 才认定代理真实死亡接管。
+      if (!runtime.remoteDownSince) runtime.remoteDownSince = Date.now()
+      if (Date.now() - runtime.remoteDownSince < REMOTE_DOWN_CONFIRM_MS) return
       // 失联/未在服务 → 内置引擎接管 (engines.is_active 不动, 代理恢复后自动交回)
       if (runtime.standby) {
-        const msg = `活跃引擎为远程代理但${probe.reason}, 内置引擎自动接管 (代理恢复后自动交回)`
+        const msg = `活跃引擎为远程代理但${probe.reason} (持续失联超过 ${Math.round(REMOTE_DOWN_CONFIRM_MS / 1000)}s), 内置引擎自动接管 (代理恢复后自动交回)`
         console.log(`[xianyu-engine] ${msg}`)
         await db
           .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'engine', ?)", [msg])
           .catch(() => {})
+        // 接管必须让用户可感知: 接管期间内置引擎用库内 Cookie 新建闲鱼连接,
+        // 若代理实际活着会形成双连接 → 平台风控要求重新登录/人脸核验 (通知一旦出现,
+        // 用户应立即检查代理网络, 而不是先去重新扫码)
+        dispatchNotify({
+          type: 'risk',
+          cookieId: '',
+          title: '内置引擎接管监听 · 远程代理失联',
+          fields: {
+            原因: probe.reason.slice(0, 200),
+            风险: '接管期间若代理恢复在跑会形成双连接, 可能触发平台风控 (重新登录/人脸核验)',
+            处理: '代理真实恢复后内置引擎自动交回; 若代理实际在线请先检查代理网络与登记地址',
+          },
+          link: '/listener',
+        })
       }
       runtime.standby = false
     } else {
       runtime.standby = false
+      runtime.remoteDownSince = 0
     }
 
     // 待监听账号 = 启用的 cookies
@@ -683,8 +714,10 @@ async function orderSyncTick(): Promise<void> {
 }
 
 async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>): Promise<void> {
-  // 第一步: 每账号拉取闲鱼卖家待发货订单列表 (NOT_SHIP) upsert 入库 —
-  // 交易卡片丢失/解析失败时, "已付款待发货" 订单在此自愈落库 (自动发货兜底数据源)
+  // 第一步: 每账号拉取闲鱼卖家全部状态订单列表 (ALL) upsert 入库 (v2.2.5: 由仅拉待发货
+  // NOT_SHIP 改为全部状态, 闲鱼趋势/订单管理需要全状态数据) —
+  // 待发货订单仍包含其中, 交易卡片丢失/解析失败时 "已付款待发货" 订单照旧在此自愈落库,
+  // 自动发货兜底数据源不受影响 (超集拉取, 链路语义不变)
   let accountRows: { id: string; value: string }[] = []
   try {
     accountRows = await db.all<{ id: string; value: string }>(
@@ -695,7 +728,7 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
   }
   for (const acct of accountRows) {
     try {
-      const pg = await fetchSellerOrders(String(acct.value), 1, 'NOT_SHIP')
+      const pg = await fetchSellerOrders(String(acct.value), 1, 'ALL')
       if (pg.finalCookieStr && pg.finalCookieStr !== String(acct.value)) {
         await persistCookieRotation(db, String(acct.id), String(acct.value), pg.finalCookieStr)
         runtime.cookieCache.set(String(acct.id), pg.finalCookieStr)
@@ -704,7 +737,7 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
       if (pg.retMsg) {
         await db
           .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'order_sync', ?)", [
-            `账号 ${acct.id} 待发货订单列表拉取失败: ${pg.retMsg.slice(0, 120)}`,
+            `账号 ${acct.id} 全状态订单列表拉取失败: ${pg.retMsg.slice(0, 120)}`,
           ])
           .catch(() => {})
         continue
@@ -712,7 +745,7 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
       if (pg.items.length) {
         const r = await upsertSoldOrders(db, String(acct.id), pg.items)
         if (r.inserted > 0) {
-          console.log(`[xianyu-engine] 账号 ${acct.id} 待发货订单列表同步: 新入库 ${r.inserted} 单`)
+          console.log(`[xianyu-engine] 账号 ${acct.id} 全状态订单列表同步: 新入库 ${r.inserted} 单`)
         }
       }
     } catch {
@@ -724,7 +757,7 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
   // 详情精修能力已全链路移除 (按用户需求): 定时同步只做纯列表拉取入库, 不再逐单调
   // order.detail 精修 (批量逐单实查动辄数百次请求, 是超时/风控元凶)。单个订单需要
   // 详情精修时在订单页点单条「详情精修」按钮走 /api/orders/:id/refresh。
-  const summary = `订单定时同步完成: 待发货列表已按账号拉取入库 (纯列表同步, 无逐单精修)`
+  const summary = `订单定时同步完成: 全状态订单列表已按账号拉取入库 (纯列表同步, 无逐单精修)`
   console.log(`[xianyu-engine] ${summary}`)
   await db
     .run(

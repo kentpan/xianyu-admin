@@ -904,3 +904,239 @@ export async function fetchSellerOrders(
     finalCookieStr: r.cookieStr,
   }
 }
+
+/* --------------------- 全量订单同步 (v2.2.6): 完整真实解析 ---------------------
+ * 背景: 2.1.7 的 parseSoldOrderItem 只解析订单号/状态/金额等基础字段, 商品名称从未
+ * 解析 (SellerOrderItem 无 item_title 字段), 买家昵称丢失 — 订单页商品列只能拿
+ * item_id 去 item_info 表 JOIN 兑底, 非已添加账号的订单没有 item_info 记录,
+ * 商品列永远显示裸 ID。本节按同一接口响应做完整字段真实解析, 供全量订单同步
+ * (/api/orders/sync-all, 闲鱼趋势 tab) 与独立代理 fetch_orders_full 任务共用。
+ * 与既有 parseSoldOrderItem 完全独立 (互不影响), 已证实可用的字段路径
+ * (commonData/buyerInfoVO/priceVO) 保持同源, 新增字段用多候选+受限深扫提取。 */
+
+/** 卖家订单列表单条完整解析结果 (v2.2.6 全量同步口径)。 */
+export interface SellerOrderItemFull extends SellerOrderItem {
+  /** 商品名称 (响应真实携带才写入; 空串 = 响应未携带, 绝不伪造)。 */
+  item_title: string
+  /** 买家昵称 (响应真实携带才写入; 空串 = 响应未携带)。 */
+  buyer_nick: string
+  /** 商品真实单价 (响应真实携带才写入; 空串 = 响应未携带; amount 仍为 totalPrice 总额)。 */
+  item_price: string
+}
+
+/** 卖家订单列表完整解析单页结果。 */
+export interface SellerOrdersFullPage {
+  items: SellerOrderItemFull[]
+  nextPage: boolean
+  totalCount: number
+  retMsg: string
+  finalCookieStr: string
+}
+
+/** 深扫禁入容器: 按钮区/操作区/底部栏等 UI 控件自带的 title 文案 (「发货」「修改价格」) 绝不是商品名。 */
+const TITLE_SCAN_EXCLUDE_KEYS = new Set([
+  'rightVO', 'btnList', 'buttonList', 'btn', 'buttons', 'bottomBarVO', 'toolBarVO',
+  'operationVO', 'topBarVO', 'actionList', 'menuList', 'tagBarVO', 'cardBtnVO', 'linkBtnVO',
+])
+
+/**
+ * 在订单 item 对象内受限深扫指定正则键名的首个非空字符串值。
+ * 仅扫描纯数据容器, UI 控件容器 (按钮/操作区) 一律跳过 — 防止把「发货」等按钮
+ * 文案当商品名。返回值原样取自响应 (真实解析), 扫不到返回空串。
+ */
+function deepScanString(
+  root: any,
+  keyPattern: RegExp,
+  exclude: Set<string>,
+  maxDepth = 4,
+): string {
+  const walk = (node: any, depth: number): string => {
+    if (!node || typeof node !== 'object' || depth > maxDepth) return ''
+    if (Array.isArray(node)) {
+      for (const el of node) {
+        const hit = walk(el, depth + 1)
+        if (hit) return hit
+      }
+      return ''
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (exclude.has(String(k))) continue
+      if (keyPattern.test(String(k)) && typeof v === 'string' && v.trim()) return String(v).trim()
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (exclude.has(String(k))) continue
+      if (v && typeof v === 'object') {
+        const hit = walk(v, depth + 1)
+        if (hit) return hit
+      }
+    }
+    return ''
+  }
+  return walk(root, 0)
+}
+
+/**
+ * 商品名称真实解析: 响应各版本字段位置不统一 (itemVO/fullActivityVO/commonData/顶层),
+ * 按已知候选位置优先 → 受限深扫兜底, 值全部原样取自响应; 全部落空返回空串 (不伪造)。
+ * 候选排除 chatEdgeTitle 等会话/卡片场景文案 (深扫正则不匹配含 chat/card 的键名)。
+ */
+function pickItemTitle(item: any, common: any): string {
+  const candidates = [
+    item?.itemVO?.title,
+    item?.item?.title,
+    item?.itemInfoVO?.title,
+    item?.fullActivityVO?.itemTitle,
+    item?.fullActivityVO?.title,
+    item?.itemFullActivityVO?.title,
+    common?.title,
+    common?.itemTitle,
+    item?.titleInfo?.title,
+    item?.title,
+  ]
+  for (const c of candidates) {
+    const s = String(c ?? '').trim()
+    if (s) return s
+  }
+  // 深扫兜底: 键名含 title 但排除会话/卡片/操作类命名 (chatTitle/cardTitle/btnTitle...)
+  return deepScanString(
+    item,
+    /^(title|itemTitle|item_title|soldItemTitle)$/i,
+    new Set([...TITLE_SCAN_EXCLUDE_KEYS, 'titleInfo']),
+    4,
+  )
+}
+
+/**
+ * 买家昵称真实解析: buyerInfoVO 内多候选 (userNick/nick/nickname/buyerNick),
+ * 落空再在 buyerInfoVO 范围内受限深扫 (范围收窄, 绝不扫到卖家字段)。空串 = 未携带。
+ */
+function pickBuyerNick(buyer: any): string {
+  const candidates = [buyer?.userNick, buyer?.nick, buyer?.nickname, buyer?.buyerNick, buyer?.nickName]
+  for (const c of candidates) {
+    const s = String(c ?? '').trim()
+    if (s) return s
+  }
+  return deepScanString(buyer, /^(userNick|nick|nickname|buyerNick|nickName)$/i, new Set(), 3)
+}
+
+/** 单价深扫禁入容器: 与商品名深扫同源 (按钮/操作区文案绝不可能是价格)。 */
+const PRICE_SCAN_EXCLUDE_KEYS = new Set([...TITLE_SCAN_EXCLUDE_KEYS])
+
+/** 价格形状校验: 纯数字/小数 (响应真实价格值全部为此形状), 文案/带单位文本一律拒收。 */
+function isPriceShape(v: unknown): boolean {
+  return /^\d+(?:\.\d+)?$/.test(String(v ?? '').trim())
+}
+
+/**
+ * 商品真实单价解析 (v2.2.6 全量同步): amount 是 priceVO.totalPrice 总额, 单价在
+ * 响应各版本字段位置不统一 (priceVO.itemPrice/price/buyPrice、commonData.itemPrice
+ * 等), 按已知候选位置优先 → 受限深扫兜底; 值全部原样取自响应且必须通过价格形状
+ * 校验 (数字/小数), 全部落空返回空串 (不伪造 — 单价列显示交由前端兜底展示总额)。
+ */
+function pickItemPrice(item: any, common: any): string {
+  const priceVo = item?.priceVO || {}
+  const candidates = [
+    priceVo.itemPrice,
+    priceVo.item_price,
+    priceVo.unitPrice,
+    priceVo.buyPrice,
+    priceVo.salePrice,
+    priceVo.price,
+    common?.itemPrice,
+    common?.item_price,
+    common?.unitPrice,
+    common?.buyPrice,
+  ]
+  for (const c of candidates) {
+    const s = String(c ?? '').trim()
+    if (s && isPriceShape(s)) return s
+  }
+  // 深扫兜底: 精确键名锚定 (绝不匹配 totalPrice/postFee/discountFee 等非单价字段)
+  const hit = deepScanString(item, /^(itemPrice|item_price|unitPrice|buyPrice|salePrice)$/i, PRICE_SCAN_EXCLUDE_KEYS, 4)
+  return hit && isPriceShape(hit) ? hit : ''
+}
+
+/**
+ * 解析卖家订单列表单条 item → 完整字段 (v2.2.6 全量同步)。
+ * 基础字段提取路径与 parseSoldOrderItem 同源 (已证实可用), 新增商品名称/买家昵称/
+ * 商品真实单价真实解析 (时间字段: 下单/付款/发货/收货/取消, 响应携带才写入)。
+ */
+export function parseSoldOrderItemFull(item: any): SellerOrderItemFull | null {
+  const common = item?.commonData || {}
+  const orderId = String(common.orderId || '')
+  if (!orderId) return null
+  const buyer = item?.buyerInfoVO || {}
+  const priceVo = item?.priceVO || {}
+  const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
+  const rawStatus = String(common.orderStatus || '')
+  const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
+  const sellerId = String(
+    common.sellerId || common.seller_id || sellerVO.userId || sellerVO.sellerId || sellerVO.userNumberId || item?.sellerId || '',
+  ).trim()
+  return {
+    order_id: orderId,
+    order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
+    item_id: String(common.itemId || ''),
+    item_title: pickItemTitle(item, common),
+    buyer_id: String(buyer.buyerId || ''),
+    buyer_nick: pickBuyerNick(buyer),
+    item_price: pickItemPrice(item, common),
+    seller_id: sellerId,
+    receiver_name: String(buyer.name || ''),
+    receiver_phone: String(buyer.phone || ''),
+    receiver_address: String(buyer.address || ''),
+    amount: String(priceVo.totalPrice ?? ''),
+    quantity: String(priceVo.buyNum ?? '1'),
+    is_bargain: btnList.some((b: any) => b?.tradeAction === 'SKIP_PIN'),
+    created_at_text: String(common.createTime || ''),
+    paid_at_text: pickTimeText([common, item], ['paytime', 'paidtime', 'pay_time', 'paid_time']),
+    shipped_at_text: pickTimeText([common, item], ['shiptime', 'shippedtime', 'consigntime', 'delivertime', 'deliverytime', 'sendtime']),
+    finished_at_text: pickTimeText([common, item], ['successtime', 'finishtime', 'confirmtime', 'dealsuccesstime', 'confirmreceivetime', 'receivedtime']),
+    cancelled_at_text: pickTimeText([common, item], ['closetime', 'canceltime', 'closedtime']),
+  }
+}
+
+/**
+ * 拉取闲鱼卖家已售订单列表单页 (完整解析版, v2.2.6 全量订单同步)。
+ * 接口与 fetchSellerOrders 完全同源 (mtop.taobao.idle.trade.merchant.sold.get,
+ * 卖家端 Origin/Referer + valueType=string), 仅解析层换 parseSoldOrderItemFull —
+ * 商品名称/买家昵称/卖家身份随单返回, 供「不判断区分账号」的全量同步入库。
+ *
+ * @param queryCode "ALL"=全部订单, "NOT_SHIP"=待发货订单
+ */
+export async function fetchSellerOrdersFull(
+  cookieStr: string,
+  page: number,
+  queryCode: 'ALL' | 'NOT_SHIP' = 'ALL',
+  opts: { transport?: MtopTransport } = {},
+): Promise<SellerOrdersFullPage> {
+  const empty: SellerOrdersFullPage = { items: [], nextPage: false, totalCount: 0, retMsg: '', finalCookieStr: cookieStr }
+  if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
+  const r = await mtopCall<any>(
+    'mtop.taobao.idle.trade.merchant.sold.get',
+    { pageNumber: page, rowsPerPage: 30, orderIds: '', queryCode, orderSearchParam: '{}' },
+    cookieStr,
+    {
+      headers: {
+        Origin: 'https://seller.goofish.com',
+        Referer: 'https://seller.goofish.com/',
+      },
+      extraParams: { valueType: 'string', spm_cnt: 'a21107h.42826273.0.0' },
+      transport: opts.transport,
+    },
+  )
+  const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
+  if (!retStr.includes('SUCCESS')) {
+    return { ...empty, retMsg: mtopFailMessage(retStr || '卖家订单列表查询失败'), finalCookieStr: r.cookieStr }
+  }
+  const module = r.data?.module || {}
+  const rawItems = Array.isArray(module.items) ? module.items : []
+  const items = rawItems.map(parseSoldOrderItemFull).filter((x: SellerOrderItemFull | null): x is SellerOrderItemFull => !!x)
+  return {
+    items,
+    nextPage: String(module.nextPage ?? 'false') === 'true',
+    totalCount: parseInt(String(module.totalCount ?? '0'), 10) || 0,
+    retMsg: '',
+    finalCookieStr: r.cookieStr,
+  }
+}

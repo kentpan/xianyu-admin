@@ -3,7 +3,8 @@
  *
  * 供两条链路共用:
  *   1. 一键同步 (/api/orders/refresh): 每账号拉全部状态订单 (ALL) 入库
- *   2. 引擎定时订单同步 (engine-manager orderSyncTick): 每账号拉待发货订单 (NOT_SHIP) 入库
+ *   2. 引擎定时订单同步 (engine-manager orderSyncTick + 代理触发 /api/engine/orders-sync):
+ *      v2.2.5 起每账号同样拉全部状态订单 (ALL) 入库 (待发货自愈落库仍包含其中)
  *
  * 三道防线 (订单数据可信性):
  *   ① 账号隔离: 逐单复核响应中的卖家身份字段 (seller_id) 与账号 uid, 不符的订单
@@ -13,7 +14,7 @@
  *   ③ 时间真源: created_at 用闲鱼返回的真实下单时间, 且每次同步回填修复
  *      (历史上曾只写首次插入值, 同批同步的订单时间全部显示为同一秒且永不自愈)
  */
-import type { SellerOrderItem } from './mtop'
+import type { SellerOrderItem, SellerOrderItemFull } from './mtop'
 import { cookieIdUid } from './mtop'
 import { getDb } from '../db'
 
@@ -179,4 +180,125 @@ export async function rememberDeletedOrder(
       [String(orderId), String(cookieId || ''), String(reason || 'user_delete')],
     )
     .catch(() => {})
+}
+
+/* ------------------- 全量订单同步 (v2.2.6): 不判断区分账号全量入库 -------------------
+ * 与既有 upsertSoldOrders 的本质区别 (按需求保留 2.1.7 的全量语义):
+ *   - 不做账号隔离复核 (响应中卖家身份与账号 uid 是否相符不判断) — 拉到的全部订单
+ *     原样入库, cookie_id 归属拉取所用账号; 卖家身份 (seller_id) 随单落库备查。
+ *   - 商品名称 (item_title) / 买家昵称 (buyer_nick) / 商品真实单价 (item_price) 随单真实落库
+ *     (orders 表 v2.2.6 新列; 状态时间 created/paid/shipped/finished/cancelled 同步写入)。
+ *   - 仍尊重 deleted_orders 屏蔽表 (用户手动删除的订单不复活, 与「删都删不掉」既有承诺一致)。
+ * 仅供全量订单同步 (/api/orders/sync-all, 闲鱼趋势 tab) 使用, 既有同步链路零改动。 */
+
+/**
+ * 单条完整订单 upsert 进 orders 表 (幂等, 无账号隔离)。
+ * 覆盖语义与 upsertSoldOrder 对齐: 上游非空字段更新本地; 本地发货标记 (system_shipped) /
+ * 会话关联 (chat_id) / 发货记录 (consign_*) 永不覆盖; is_bargain 只增不减 (MAX);
+ * created_at 用闲鱼真实下单时间写入并回填; item_title/buyer_nick/item_price/seller_id
+ * 非空才覆盖 (响应未携带绝不抹掉本地已有值)。
+ */
+export async function upsertSoldOrderFull(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  o: SellerOrderItemFull,
+): Promise<'inserted' | 'updated' | 'deleted'> {
+  if (!o?.order_id) return 'updated'
+  if (await isDeletedOrder(db, String(o.order_id))) return 'deleted'
+
+  const createdAt = normalizeCreatedAt(o.created_at_text)
+  const statusTimes: Array<[string, string]> = [
+    ['paid_at', normalizeCreatedAt(String(o.paid_at_text || ''))],
+    ['shipped_at', normalizeCreatedAt(String(o.shipped_at_text || ''))],
+    ['finished_at', normalizeCreatedAt(String(o.finished_at_text || ''))],
+    ['cancelled_at', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
+  ]
+  const before = await db
+    .get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
+    .catch(() => null)
+
+  const timeCols = statusTimes.filter(([, v]) => v).map(([col]) => `, ${col}`)
+  const timePlaceholders = statusTimes.filter(([, v]) => v).map(() => ', ?').join('')
+  const cols = `order_id, item_id, item_title, buyer_id, buyer_nick, seller_id, item_price, order_status, cookie_id,
+                amount, quantity, is_bargain, receiver_name, receiver_phone, receiver_address,
+                version, system_shipped${createdAt ? ', created_at' : ''}${timeCols}`
+  const vals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0${createdAt ? ', ?' : ''}${timePlaceholders}`
+  const base = [
+    o.order_id,
+    o.item_id || '',
+    o.item_title || '',
+    o.buyer_id || '',
+    o.buyer_nick || '',
+    o.seller_id || '',
+    o.item_price || '',
+    o.order_status || 'unknown',
+    cookieId,
+    o.amount || '',
+    String(o.quantity || '1'),
+    o.is_bargain ? 1 : 0,
+    o.receiver_name || '',
+    o.receiver_phone || '',
+    o.receiver_address || '',
+  ]
+  if (createdAt) base.push(createdAt)
+  for (const [, v] of statusTimes) {
+    if (v) base.push(v)
+  }
+
+  const timeUpdateSets = statusTimes
+    .filter(([, v]) => v)
+    .map(([col]) => `, ${col} = excluded.${col}`)
+    .join('')
+
+  await db
+    .run(
+      `INSERT INTO orders (${cols})
+       VALUES (${vals})
+       ON CONFLICT(order_id) DO UPDATE SET
+         order_status = CASE WHEN excluded.order_status != 'unknown' THEN excluded.order_status ELSE orders.order_status END,
+         item_id = CASE WHEN excluded.item_id != '' THEN excluded.item_id ELSE orders.item_id END,
+         item_title = CASE WHEN excluded.item_title != '' THEN excluded.item_title ELSE orders.item_title END,
+         buyer_id = CASE WHEN excluded.buyer_id != '' THEN excluded.buyer_id ELSE orders.buyer_id END,
+         buyer_nick = CASE WHEN excluded.buyer_nick != '' THEN excluded.buyer_nick ELSE orders.buyer_nick END,
+         seller_id = CASE WHEN excluded.seller_id != '' THEN excluded.seller_id ELSE orders.seller_id END,
+         item_price = CASE WHEN excluded.item_price != '' THEN excluded.item_price ELSE orders.item_price END,
+         amount = CASE WHEN excluded.amount != '' AND excluded.amount != '0' THEN excluded.amount ELSE orders.amount END,
+         quantity = excluded.quantity,
+         is_bargain = MAX(COALESCE(orders.is_bargain, 0), excluded.is_bargain),
+         receiver_name = CASE WHEN excluded.receiver_name != '' THEN excluded.receiver_name ELSE orders.receiver_name END,
+         receiver_phone = CASE WHEN excluded.receiver_phone != '' THEN excluded.receiver_phone ELSE orders.receiver_phone END,
+         receiver_address = CASE WHEN excluded.receiver_address != '' THEN excluded.receiver_address ELSE orders.receiver_address END
+         ${createdAt ? ', created_at = excluded.created_at' : ''}${timeUpdateSets},
+         updated_at = CURRENT_TIMESTAMP`,
+      base,
+    )
+    .catch(() => {})
+  return before ? 'updated' : 'inserted'
+}
+
+export interface SoldOrderFullSyncResult {
+  inserted: number
+  updated: number
+  total: number
+  /** 删除屏蔽数: 命中 deleted_orders 屏蔽表的订单 (未入库, 不复活用户删除的订单)。 */
+  skippedDeleted: number
+}
+
+/** 批量全量 upsert (无账号隔离, 商品名称/买家昵称随单落库)。 */
+export async function upsertSoldOrdersFull(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  items: SellerOrderItemFull[],
+): Promise<SoldOrderFullSyncResult> {
+  let inserted = 0
+  let updated = 0
+  let skippedDeleted = 0
+  for (const o of items) {
+    if (!o?.order_id) continue
+    const r = await upsertSoldOrderFull(db, cookieId, o)
+    if (r === 'inserted') inserted++
+    else if (r === 'updated') updated++
+    else skippedDeleted++
+  }
+  return { inserted, updated, total: items.length, skippedDeleted }
 }
