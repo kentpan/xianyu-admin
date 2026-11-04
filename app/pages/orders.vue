@@ -20,7 +20,7 @@
       </template>
     </PageHeader>
 
-    <!-- Tab 切换 (v2.2.5): 我的订单 = 已添加账号订单 (筛选+列表) / 闲鱼趋势 = 全账号7天趋势 + 非已添加账号订单 -->
+    <!-- Tab 切换 (v2.2.5): 我的订单 = 已添加账号订单 (筛选+列表) / 闲鱼趋势 = 全账号7天趋势 + 全量订单列表 -->
     <div class="flex items-center gap-1 border-b border-slate-200 dark:border-slate-700" role="tablist" aria-label="订单视图切换">
       <button
         role="tab"
@@ -272,12 +272,12 @@
         </template>
       </div>
 
-      <!-- 非已添加账号订单分页列表 -->
+      <!-- 全量订单分页列表 (v2.2.7): 全量同步拉取的所有状态订单 + 非已添加账号历史订单 -->
       <div class="card overflow-hidden">
         <div class="px-5 py-4 border-b border-slate-100 dark:border-slate-700 flex items-center justify-between">
           <div>
-            <h3 class="font-semibold text-slate-900 dark:text-white">非已添加账号的订单</h3>
-            <p class="text-xs text-slate-400 mt-0.5">历史同步或已删除账号的订单 (cookie_id 不在当前账号列表中), 共 {{ trendOtherTotal }} 条</p>
+            <h3 class="font-semibold text-slate-900 dark:text-white">全量订单</h3>
+            <p class="text-xs text-slate-400 mt-0.5">同步拉取的所有状态订单 (待付款/待发货/已发货/已完成/已取消/退款) 及非已添加账号的历史订单, 共 {{ trendOtherTotal }} 条</p>
           </div>
           <button class="btn-secondary !py-1.5 !px-3" :disabled="otherSyncing" @click="syncTrendOrders">
             <Icon name="refresh" :class="otherSyncing ? 'animate-spin' : ''" /> 同步订单
@@ -317,12 +317,19 @@
                     <p v-if="o.item_price && o.item_price !== o.amount" class="text-xs text-slate-400">单价 ¥{{ o.item_price }}</p>
                   </td>
                   <td><OrderStatusBadge :status="o.order_status" /></td>
-                  <td class="text-slate-500 dark:text-slate-400">{{ formatTime(o.created_at) }}</td>
+                  <td class="text-slate-500 dark:text-slate-400">
+                    <p>{{ formatTime(o.created_at) }}</p>
+                    <!-- 状态时间 (v2.2.7 全量解析): 付款/发货/收货/取消 (接口真实携带才展示, 绝不伪造) -->
+                    <p v-if="o.paid_at" class="text-xs text-slate-400">付款 {{ formatTime(o.paid_at) }}</p>
+                    <p v-if="o.shipped_at" class="text-xs text-slate-400">发货 {{ formatTime(o.shipped_at) }}</p>
+                    <p v-if="o.finished_at" class="text-xs text-slate-400">收货 {{ formatTime(o.finished_at) }}</p>
+                    <p v-if="o.cancelled_at" class="text-xs text-slate-400">取消 {{ formatTime(o.cancelled_at) }}</p>
+                  </td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <EmptyState v-if="!otherOrders.length" message="暂无非已添加账号的订单 (历史同步/已删除账号的订单会显示在这里)" icon="orders" />
+          <EmptyState v-if="!otherOrders.length" message="暂无全量订单 — 点击右上角「同步订单」拉取闲鱼真实订单列表 (所有状态)" icon="orders" />
         </template>
         <div v-if="trendOtherTotal > otherPageSize" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-slate-700">
           <p class="text-xs text-slate-500">共 {{ trendOtherTotal }} 条，第 {{ otherPage }} / {{ otherTotalPages }} 页</p>
@@ -562,13 +569,13 @@ const pageSize = ref(20)
 
 /* ==================== Tab 切换与闲鱼趋势 (v2.2.5) ==================== */
 
-/** activeTab: mine = 我的订单 (已添加账号, 筛选+列表) / trend = 闲鱼趋势 (全账号趋势+非已添加账号订单) */
+/** activeTab: mine = 我的订单 (已添加账号, 筛选+列表) / trend = 闲鱼趋势 (全账号趋势+全量订单列表) */
 const activeTab = ref<'mine' | 'trend'>('mine')
 
 function switchTab(tab: 'mine' | 'trend') {
   if (activeTab.value === tab) return
   activeTab.value = tab
-  // 切入趋势 tab 时拉取趋势数据 + 非已添加账号订单分页列表 (每次切入都刷新, 保证徽标/列表/图表是最新的)
+  // 切入趋势 tab 时拉取趋势数据 + 全量订单分页列表 (每次切入都刷新, 保证徽标/列表/图表是最新的)
   if (tab === 'trend') {
     trendsLoaded = true
     loadTrends()
@@ -603,7 +610,7 @@ async function loadTrends() {
   }
 }
 
-/* ---- 非已添加账号订单分页列表 (scope=other) ---- */
+/* ---- 全量订单分页列表 (v2.2.7, scope=full): 全量同步拉取的所有状态订单 ∪ 非已添加账号历史订单 ---- */
 const otherOrders = ref<Order[]>([])
 const otherLoading = ref(false)
 const otherPage = ref(1)
@@ -630,11 +637,12 @@ const otherPageItems = computed<(number | string)[]>(() => {
 async function loadOtherOrders() {
   otherLoading.value = true
   try {
-    const r = await getOrders({ scope: 'other', page: otherPage.value, pageSize: otherPageSize.value })
+    // (v2.2.7) scope=full: 全量订单口径 (同步拉取的所有状态订单 + 非已添加账号历史订单)
+    const r = await getOrders({ scope: 'full', page: otherPage.value, pageSize: otherPageSize.value })
     otherOrders.value = r.data
     trendOtherTotal.value = r.total
   } catch (e: any) {
-    toast.error(e.message || '非已添加账号订单加载失败')
+    toast.error(e.message || '全量订单加载失败')
   } finally {
     otherLoading.value = false
   }
@@ -650,9 +658,11 @@ function goOtherPage(p: number) {
 const otherSyncing = ref(false)
 
 /**
- * 全量订单同步: 调 /api/orders/sync-all (2.1.7 订单拉取链路独立移植) —
- * 不判断区分账号拉取全部状态订单入库 (商品名称/买家昵称/卖家身份随单真实落库),
- * 完成后刷新非已添加账号订单列表与趋势数据。
+ * 全量订单同步 (v2.2.7): 调 /api/orders/sync-all —
+ * 真实调用闲鱼卖家已售订单列表接口 (mtop.taobao.idle.trade.merchant.sold.get, queryCode=ALL,
+ * 与 2.1.7 同源) 拉取所有状态订单列表入库 (纯列表同步, 无逐单详情精修; 详情精修在订单列表
+ * 上单独请求), 商品名称/买家/卖家/商品单价/下单·付款·发货·收货·取消时间随单真实落库。
+ * 计数与错误全部如实上报 (绝不虚报), 完成后刷新全量订单列表与趋势数据。
  */
 async function syncTrendOrders() {
   otherSyncing.value = true
@@ -664,7 +674,7 @@ async function syncTrendOrders() {
     if (r.skipped_deleted) parts.push(`已删除屏蔽 ${r.skipped_deleted} 单`)
     const hardError = r.errors?.find((e) => !e.startsWith('已删除屏蔽'))
     if (hardError) {
-      toast.error(`同步失败: ${hardError}`)
+      toast.error(`同步异常: ${hardError}`)
     } else if (!parts.length) {
       toast.info(r.errors?.length ? r.errors[0] : '暂无新订单')
     } else {

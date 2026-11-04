@@ -47,8 +47,8 @@ export interface OrderQuery {
   dateTo?: string
   amountMin?: string
   amountMax?: string
-  /** v2.2.5 归属筛选: mine=已添加账号 / other=非已添加账号 / 默认 all 不过滤 */
-  scope?: 'mine' | 'other' | 'all'
+  /** 归属筛选: mine=已添加账号 / other=非已添加账号(兼容口径) / full=v2.2.7 全量订单(闲鱼趋势tab) / 默认 all 不过滤 */
+  scope?: 'mine' | 'other' | 'full' | 'all'
 }
 
 export interface BatchOrdersResult {

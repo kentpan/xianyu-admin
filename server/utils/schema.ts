@@ -163,7 +163,8 @@ const SCHEMA: string[] = [
     paid_at TIMESTAMP,
     shipped_at TIMESTAMP,
     finished_at TIMESTAMP,
-    cancelled_at TIMESTAMP
+    cancelled_at TIMESTAMP,
+    sync_source VARCHAR(16) DEFAULT ''
   )`,
   `CREATE TABLE IF NOT EXISTS delivery_rules (
     id __AUTO__,
@@ -955,6 +956,10 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE orders ADD COLUMN buyer_nick VARCHAR(128) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN seller_id VARCHAR(64) DEFAULT ''`,
   `ALTER TABLE orders ADD COLUMN item_price VARCHAR(32) DEFAULT ''`,
+  // 全量订单同步 (v2.2.7): 订单来源标记 — full_sync = 全量订单同步链路 (POST /api/orders/sync-all,
+  // 闲鱼趋势 tab 数据源) 真实拉取入库; 空串 = 其余既有链路 (引擎事件/一键同步/手动录入)。
+  // 纯新增列, 既有链路零读写零影响; 老库 ALTER 幂等。
+  `ALTER TABLE orders ADD COLUMN sync_source VARCHAR(16) DEFAULT ''`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [

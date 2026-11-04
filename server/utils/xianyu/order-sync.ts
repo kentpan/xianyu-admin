@@ -26,6 +26,8 @@ export interface SoldOrderSyncResult {
   blocked: number
   /** 删除屏蔽数: 命中 deleted_orders 屏蔽表的订单 (未入库)。 */
   skippedDeleted: number
+  /** (v2.2.7) 单条落库失败明细 (SQL 错误原文, 截断) — 绝不静默吞错, 计数只统计真实成功。 */
+  errors: string[]
 }
 
 /**
@@ -77,9 +79,7 @@ export async function upsertSoldOrder(
     ['finished_at', 'finished_at_text', normalizeCreatedAt(String(o.finished_at_text || ''))],
     ['cancelled_at', 'cancelled_at_text', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
   ]
-  const before = await db
-    .get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
-    .catch(() => null)
+  const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
   // 动态拼 created_at: 解析成功才写/回填, 失败时插入走列默认值、更新保留本地
   const timeCols = statusTimes.filter(([, , v]) => v).map(([col]) => `, ${col}`)
@@ -129,7 +129,9 @@ export async function upsertSoldOrder(
          updated_at = CURRENT_TIMESTAMP`,
       base,
     )
-    .catch(() => {})
+  // (v2.2.7) 不再静默吞错 (旧版此处挂 .catch 吞掉一切 SQL 错误): 失败向上抛, 由批量层
+  // 逐单捕获计入 errors 显性上报 — 此前吞错导致锁竞争失败被计入 updated/inserted, 同步
+  // 计数虚报 (图 1: "更新 118 单" 实际 0 单落库), 订单状态/字段永不更新且无任何报错。
   return before ? 'updated' : 'inserted'
 }
 
@@ -149,6 +151,7 @@ export async function upsertSoldOrders(
   let updated = 0
   let blocked = 0
   let skippedDeleted = 0
+  const errors: string[] = []
   for (const o of items) {
     if (!o?.order_id) continue
     // 账号隔离复核: 响应自带卖家身份且与账号 uid 不符 = 他人店铺订单, 绝不入库
@@ -157,13 +160,19 @@ export async function upsertSoldOrders(
       blocked++
       continue
     }
-    const r = await upsertSoldOrder(db, cookieId, o)
-    if (r === 'inserted') inserted++
-    else if (r === 'updated') updated++
-    else if (r === 'deleted') skippedDeleted++
-    else blocked++
+    // (v2.2.7) 逐单捕获写库错误计入 errors 显性上报, 计数只统计真实落库;
+    // 流程不中断 (与既有语义一致), 但绝不再把失败虚报成成功
+    try {
+      const r = await upsertSoldOrder(db, cookieId, o)
+      if (r === 'inserted') inserted++
+      else if (r === 'updated') updated++
+      else if (r === 'deleted') skippedDeleted++
+      else blocked++
+    } catch (e: any) {
+      errors.push(`订单 ${String(o.order_id).slice(0, 24)} 落库失败: ${String(e?.message || e).slice(0, 120)}`)
+    }
   }
-  return { inserted, updated, total: items.length, blocked, skippedDeleted }
+  return { inserted, updated, total: items.length, blocked, skippedDeleted, errors }
 }
 
 /** 记录用户删除的订单号 (同步屏蔽): 删除后任何同步链路都不再拉回。 */
@@ -213,9 +222,7 @@ export async function upsertSoldOrderFull(
     ['finished_at', normalizeCreatedAt(String(o.finished_at_text || ''))],
     ['cancelled_at', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
   ]
-  const before = await db
-    .get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
-    .catch(() => null)
+  const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
   const timeCols = statusTimes.filter(([, v]) => v).map(([col]) => `, ${col}`)
   const timePlaceholders = statusTimes.filter(([, v]) => v).map(() => ', ?').join('')
@@ -267,12 +274,14 @@ export async function upsertSoldOrderFull(
          is_bargain = MAX(COALESCE(orders.is_bargain, 0), excluded.is_bargain),
          receiver_name = CASE WHEN excluded.receiver_name != '' THEN excluded.receiver_name ELSE orders.receiver_name END,
          receiver_phone = CASE WHEN excluded.receiver_phone != '' THEN excluded.receiver_phone ELSE orders.receiver_phone END,
-         receiver_address = CASE WHEN excluded.receiver_address != '' THEN excluded.receiver_address ELSE orders.receiver_address END
+         receiver_address = CASE WHEN excluded.receiver_address != '' THEN excluded.receiver_address ELSE orders.receiver_address END,
+         sync_source = 'full_sync'
          ${createdAt ? ', created_at = excluded.created_at' : ''}${timeUpdateSets},
          updated_at = CURRENT_TIMESTAMP`,
       base,
     )
-    .catch(() => {})
+  // (v2.2.7) 不再静默吞错 (旧版此处挂 .catch 吞掉一切 SQL 错误): 失败向上抛由批量层计入
+  // errors 显性上报; 全量同步链路专属列 sync_source='full_sync' 随单打标 (趋势 tab 全量列表依据)
   return before ? 'updated' : 'inserted'
 }
 
@@ -282,9 +291,11 @@ export interface SoldOrderFullSyncResult {
   total: number
   /** 删除屏蔽数: 命中 deleted_orders 屏蔽表的订单 (未入库, 不复活用户删除的订单)。 */
   skippedDeleted: number
+  /** (v2.2.7) 单条落库失败明细 — 绝不静默吞错, 计数只统计真实成功。 */
+  errors: string[]
 }
 
-/** 批量全量 upsert (无账号隔离, 商品名称/买家昵称随单落库)。 */
+/** 批量全量 upsert (无账号隔离, 商品名称/买家昵称随单落库, sync_source='full_sync' 打标)。 */
 export async function upsertSoldOrdersFull(
   db: Awaited<ReturnType<typeof getDb>>,
   cookieId: string,
@@ -293,12 +304,18 @@ export async function upsertSoldOrdersFull(
   let inserted = 0
   let updated = 0
   let skippedDeleted = 0
+  const errors: string[] = []
   for (const o of items) {
     if (!o?.order_id) continue
-    const r = await upsertSoldOrderFull(db, cookieId, o)
-    if (r === 'inserted') inserted++
-    else if (r === 'updated') updated++
-    else skippedDeleted++
+    // (v2.2.7) 逐单捕获写库错误计入 errors 显性上报, 计数只统计真实落库
+    try {
+      const r = await upsertSoldOrderFull(db, cookieId, o)
+      if (r === 'inserted') inserted++
+      else if (r === 'updated') updated++
+      else skippedDeleted++
+    } catch (e: any) {
+      errors.push(`订单 ${String(o.order_id).slice(0, 24)} 落库失败: ${String(e?.message || e).slice(0, 120)}`)
+    }
   }
-  return { inserted, updated, total: items.length, skippedDeleted }
+  return { inserted, updated, total: items.length, skippedDeleted, errors }
 }

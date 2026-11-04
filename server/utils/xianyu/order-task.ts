@@ -45,6 +45,26 @@ export async function isProxyEngineMode(db: Awaited<ReturnType<typeof getDb>>): 
   }
 }
 
+/**
+ * (v2.2.7) 全量订单同步专用分流判断: 代理必须「启用且活跃」才走任务通道。
+ *
+ * 为什么与 isProxyEngineMode 不同: 后台停用 (enabled=0) 的代理心跳可能仍短暂置
+ * is_active=1, 但 /api/engine/tasks 领取端点对停用引擎一律 403 拒绝 — 任务永远无人
+ * 领取, 逐页等待全部超时 (图 1 现场实锤: "任务通道整体时间预算耗尽")。
+ * 本判断只供全量订单同步分流使用; 既有 isProxyEngineMode (自动发货付款拉单兑底/
+ * 引擎监听/一键同步) 保持原语义零改动, 自动发货链路不受任何影响。
+ */
+export async function isProxySyncChannelReady(db: Awaited<ReturnType<typeof getDb>>): Promise<boolean> {
+  try {
+    const row = await db.get<{ slug: string }>(
+      "SELECT slug FROM engines WHERE is_active = 1 AND enabled = 1 AND slug != 'builtin' LIMIT 1",
+    )
+    return !!row
+  } catch {
+    return false
+  }
+}
+
 /** 过期清理: 写入/领取超 120s 仍 pending/running 判 expired (代理中断或无代理在线)。 */
 async function sweepStaleTasks(db: Awaited<ReturnType<typeof getDb>>): Promise<void> {
   await db

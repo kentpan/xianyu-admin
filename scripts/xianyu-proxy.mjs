@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.2.6; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.2.7; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -151,8 +151,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.2.6 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.2.6'
+// XY_PKG_VERSION 读取, 缺省 2.2.7 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.2.7'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0

@@ -110,6 +110,12 @@ async function createAdapter(event?: H3Event): Promise<DatabaseAdapter> {
   }
   const conn = new DatabaseSync(dbPath)
   conn.exec('PRAGMA journal_mode = WAL')
+  // (v2.2.7) 写锁竞争等待而非立即失败 — 根因修复: 同进程多链路并发写库 (引擎定时同步/
+  // 任务回报/手动同步) 在 WAL 模式下瞬时撞锁会抛 "database is locked", 此前被上游
+  // .catch 静默吞掉导致订单同步计数虚报 (拉到 120 单实际 0 单落库)。busy_timeout 让
+  // 短暂锁竞争 (毫秒级) 排队等待, 只有真正持锁超 5s 才报错 — 所有写库链路统一受益,
+  // 自动发货落库只会更稳, 无行为语义变化。
+  conn.exec('PRAGMA busy_timeout = 5000')
   return new SQLiteAdapter(conn)
 }
 

@@ -537,7 +537,7 @@ CREATE TABLE orders (
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, delivery_claim_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP, item_title VARCHAR(512) DEFAULT '', buyer_nick VARCHAR(128) DEFAULT '', seller_id VARCHAR(64) DEFAULT '', item_price VARCHAR(32) DEFAULT '');
+  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, delivery_claim_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP, item_title VARCHAR(512) DEFAULT '', buyer_nick VARCHAR(128) DEFAULT '', seller_id VARCHAR(64) DEFAULT '', item_price VARCHAR(32) DEFAULT '', sync_source VARCHAR(16) DEFAULT '');
 CREATE TABLE qr_login_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key VARCHAR(64) NOT NULL UNIQUE,

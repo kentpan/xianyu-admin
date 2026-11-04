@@ -3,7 +3,10 @@
  * v2.2.5 scope 归属筛选 (默认 all, 向后兼容既有调用方):
  *   - mine  = 仅「已添加账号」的订单 (cookie_id 在 cookies 表中) — 订单管理「我的订单」tab
  *   - other = 仅「非已添加账号」的订单 (cookie_id 为空或不在 cookies 表中, 含已删除账号的历史订单)
- *             — 订单管理「闲鱼趋势」tab 的分页列表
+ *             — 既有兼容口径 (v2.2.6 前闲鱼趋势 tab 曾用它, v2.2.7 改用 full)
+ *   - full  = (v2.2.7) 全量订单 — 全量订单同步链路真实拉取入库的订单 (sync_source='full_sync',
+ *             所有状态) + 非已添加账号的历史订单 (cookie_id 不在 cookies 表) —
+ *             订单管理「闲鱼趋势」tab 的分页列表 (11-01 全量批次及后续同步数据都在这里)
  *   - all   = 不过滤 (默认, 既有行为不变)
  */
 export default defineEventHandler(
@@ -31,6 +34,13 @@ export default defineEventHandler(
       where.push("o.cookie_id IS NOT NULL AND o.cookie_id != '' AND o.cookie_id IN (SELECT id FROM cookies)")
     } else if (scope === 'other') {
       where.push("(o.cookie_id IS NULL OR o.cookie_id = '' OR o.cookie_id NOT IN (SELECT id FROM cookies))")
+    } else if (scope === 'full') {
+      // (v2.2.7) 全量订单口径: 全量同步拉到的订单 ∪ 非已添加账号历史订单。
+      // sync_source 列由 initSchema 启动迁移保证存在 (老库 ALTER 幂等), 列缺失属部署
+      // 异常 — 显性报错, 绝不静默回退其它口径掩盖问题。
+      where.push(
+        "(o.sync_source = 'full_sync' OR o.cookie_id IS NULL OR o.cookie_id = '' OR o.cookie_id NOT IN (SELECT id FROM cookies))",
+      )
     }
     if (status && status !== 'all') {
       where.push('o.order_status = ?')

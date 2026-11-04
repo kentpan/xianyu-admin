@@ -16,7 +16,7 @@
 import { fetchSellerOrdersFull } from '../../utils/xianyu/mtop'
 import { persistCookieRotation } from '../../utils/xianyu/cookie-store'
 import { upsertSoldOrdersFull } from '../../utils/xianyu/order-sync'
-import { fetchOrdersFullViaProxy, isProxyEngineMode } from '../../utils/xianyu/order-task'
+import { fetchOrdersFullViaProxy, isProxySyncChannelReady } from '../../utils/xianyu/order-task'
 import { isGatewayMode } from '../../utils/xianyu/gateway'
 
 export default defineEventHandler(
@@ -41,8 +41,9 @@ export default defineEventHandler(
     const deadline = Date.now() + SYNC_BUDGET_MS
     const remainMs = () => deadline - Date.now()
 
-    // 分流: 独立代理模式 → http_fetch 纯透传 (后台签名+解析, 代理零解析); 否则服务端直连 (网关自动优先)
-    const proxyMode = await isProxyEngineMode(db)
+    // 分流 (v2.2.7): 独立代理模式 → http_fetch 纯透传 (仅「启用且活跃」的代理, 停用代理的
+    // 任务领取一律 403, 走它只会逐页超时); 否则服务端直连拉取 (网关已登记时自动优先透传)
+    const proxyMode = await isProxySyncChannelReady(db)
     const gwMode = await isGatewayMode(db)
 
     for (const acct of accounts) {
@@ -64,6 +65,8 @@ export default defineEventHandler(
           inserted += ur.inserted
           updated += ur.updated
           skippedDeleted += ur.skippedDeleted
+          // (v2.2.7) 落库失败明细显性透出 — 绝不静默吞错/虚报计数
+          for (const msg of ur.errors) errors.push(`${acct.id}: ${msg}`)
         }
         continue
       }
@@ -89,6 +92,8 @@ export default defineEventHandler(
           inserted += r.inserted
           updated += r.updated
           skippedDeleted += r.skippedDeleted
+          // (v2.2.7) 落库失败明细显性透出 — 绝不静默吞错/虚报计数
+          for (const msg of r.errors) errors.push(`${acct.id}: ${msg}`)
         }
         if (!pg.nextPage || !pg.items.length) break
         page++

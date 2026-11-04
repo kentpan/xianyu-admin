@@ -140,23 +140,32 @@ export default defineEventHandler(
       }
     }
 
-    /* ---- 非已添加账号订单总数 (趋势 tab 分页列表) ----
-     * 口径与 GET /api/orders?scope=other 完全一致: cookie_id 为空 或 不在 cookies 表中的订单 */
+    /* ---- 全量订单总数 (趋势 tab 分页列表) ----
+     * (v2.2.7) 口径与 GET /api/orders?scope=full 完全一致:
+     *   全量订单同步链路拉取入库的订单 (sync_source='full_sync', 所有状态)
+     *   ∪ 非已添加账号的历史订单 (cookie_id 为空或不在 cookies 表, 含已删除账号) */
     let otherTotal = 0
     try {
       const t = await db.get<{ c: number }>(
         `SELECT COUNT(*) as c FROM orders
-         WHERE cookie_id IS NULL OR cookie_id = ''
+         WHERE sync_source = 'full_sync'
+            OR cookie_id IS NULL OR cookie_id = ''
             OR cookie_id NOT IN (SELECT id FROM cookies)`,
       )
       otherTotal = Number(t?.c) || 0
     } catch {
-      const [allCnt, mineCnt] = await Promise.all([
-        db.all<{ c: number }>('SELECT COUNT(*) as c FROM orders'),
-        db.all<{ c: number }>("SELECT COUNT(*) as c FROM orders WHERE cookie_id IS NOT NULL AND cookie_id != ''"),
+      // 方言不兼容 (mysql/memory 等) → 全表扫描 JS 聚合, 口径与 SQL 分支完全一致
+      // (sync_source 列缺失属部署异常: 此处 SELECT 仍会抛错 → 接口显性报错, 不静默给 0)
+      const [all, cookieRows] = await Promise.all([
+        db.all<{ cookie_id: string; sync_source: string }>('SELECT cookie_id, sync_source FROM orders'),
+        db.all<{ id: string }>('SELECT id FROM cookies'),
       ])
-      otherTotal = (Number(allCnt[0]?.c) || 0) - (Number(mineCnt[0]?.c) || 0)
-      if (otherTotal < 0) otherTotal = 0
+      const known = new Set(cookieRows.map((c) => String(c.id)))
+      otherTotal = all.filter((r) => {
+        if (String(r.sync_source || '') === 'full_sync') return true
+        const cid = String(r.cookie_id || '')
+        return !cid || !known.has(cid)
+      }).length
     }
 
     return ok({
