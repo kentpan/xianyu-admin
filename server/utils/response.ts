@@ -65,8 +65,10 @@ export function withApi<T = any>(
       return ok(data)
     } catch (e: any) {
       // 服务端留痕 (Cloudflare wrangler tail / node 日志可直接看到真实原因)
+      // 状态取值顺序: ApiError.code (业务状态) → h3 e.statusCode → 500; ApiError 只设 code,
+      // 此前只读 statusCode 导致 ApiError(502) 在日志里失真成 500
       try {
-        console.error(`[api] ${event?.path || '-'} → ${e?.statusCode || 500}:`, e?.message || e)
+        console.error(`[api] ${event?.path || '-'} → ${e?.code || e?.statusCode || 500}:`, e?.message || e)
       } catch {}
       if (e instanceof ApiError) {
         setResponseStatus(event, e.code)

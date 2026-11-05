@@ -148,15 +148,29 @@ export default defineEventHandler(
       try {
         // 动作执行结果回报: 代理按 log_id 回写发送结果, 决策日志的发送状态由此闭环。
         // (v2.1.19) 代理侧发送失败原因一眼清: Cookie 失效/风控/网络/超时统一翻译人话后落 error_message
+        // (v2.2.8) 「已发送却显示未知错误」根治: 旧代码 ok=true 且 error='' 时仍调
+        // mtopFailMessage('') → 恒返回「未知错误」写进 error_message, 所有发送成功的
+        // 决策日志全被误标; 且成功回执会整列覆盖, 凭证模式初始写入的「发货方式」备注
+        // 也被冲掉。现在: ①成功且无错误原文 → 不触碰 error_message (保留发货方式备注);
+        // ②成功但代理附带了错误文本 (警告形态) → 翻译后如实落库; ③失败 → 人话 (原始错误码)
+        // 翻译落库, 原始错误信息括号保留绝不吞; ④失败但代理未回报原因 → 如实标注
+        // 「代理未回报错误原因」, 绝不编造「未知错误」。
         if (ev.type === 'action_result') {
           const logId = Number(ev.log_id || 0)
           if (logId > 0) {
+            const rawErr = String(ev.error ?? '').trim()
+            const errNote = rawErr
+              ? mtopFailMessage(rawErr).slice(0, 300)
+              : ev.ok
+                ? ''
+                : '代理回执发送失败但未回报错误原因 (action_result ok=false 且 error 为空, 请检查代理日志)'
             await db
-              .run('UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?', [
-                ev.ok ? 'success' : 'failed',
-                mtopFailMessage(String(ev.error || '')).slice(0, 300),
-                logId,
-              ])
+              .run(
+                ev.ok && !rawErr
+                  ? 'UPDATE auto_reply_logs SET send_status = ? WHERE id = ?'
+                  : 'UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?',
+                ev.ok && !rawErr ? ['success', logId] : [ev.ok ? 'success' : 'failed', errNote, logId],
+              )
               .catch(() => {})
             // 发送成功 → 出站消息落库 (代理链路与内置引擎 executeActions 同语义, 消息页可见回复内容)
             if (ev.ok) {
