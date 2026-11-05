@@ -20,6 +20,7 @@ import { dispatchNotify } from '../notify'
 import { publishChatEvent, publishSystemEvent, publishRiskEvent } from './publisher'
 import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from './im-store'
 import { persistCookieRotation } from './cookie-store'
+import { getFailoverOwner, setFailoverOwner, FAILOVER_BUILTIN, FAILOVER_REMOTE } from './failover'
 
 const POLL_INTERVAL_MS = 5_000
 const HEARTBEAT_INTERVAL_MS = 10_000
@@ -29,12 +30,25 @@ const MAINTENANCE_TICK_MS = 5 * 60_000
 /** 远程代理心跳失联阈值: 超此时间无 last_seen_at 更新即视为未在服务本后台 (内置接管)。 */
 const REMOTE_STALE_MS = 5 * 60_000
 /**
- * 远程代理失联接管确认窗口 (v2.2.4 账号保活加固): probe 结果有 30s 缓存,
+ * 远程代理失联接管确认窗口: probe 结果有 30s 缓存,
  * 瞬时网络抖动/边缘波动 <90s 一律不接管 — 误接管会与代理形成两条闲鱼长连接
  * (双设备指纹双出口 IP), 平台风控直接判「环境异常, 重新登录 + 人脸核验」。
  * 持续失联 ≥90s (跨越 ≥3 个探测缓存周期) 才认定代理真实死亡。
  */
 const REMOTE_DOWN_CONFIRM_MS = 90_000
+/**
+ * 接管排水窗 (v2.3.2 双连接根治): 接管时先经 engine_failover 吊销代理授权
+ * (config.active=false), 存活代理会在其下一轮配置轮询 (≤30s) 收到并退避全部连接;
+ * 内置引擎再等一个排水窗 (45s > 最大轮询周期 30s, 覆盖代理在途请求) 才建连接 —
+ * 与代理的在途连接时间错开, 结构性杜绝双连接, 而不是靠运气。
+ */
+const REMOTE_DRAIN_MS = 45_000
+/**
+ * 交回稳定窗 (v2.3.2): 心跳恢复新鲜后须持续稳定 ≥90s 才把所有权交回代理 —
+ * 防代理反复闪断导致所有权来回翻转 (每次翻转都是一次重连 = 一次风控信号)。
+ * 交回顺序: 先停内置连接 → 再归还授权 (config.active=true) → 代理 ≤30s 自行拉起。
+ */
+const REMOTE_HANDBACK_STABLE_MS = 90_000
 
 interface EngineRuntime {
   pollTimer: NodeJS.Timeout | null
@@ -52,6 +66,10 @@ interface EngineRuntime {
   orderSyncRunning: boolean
   /** 远程代理首次失联时刻 (0=健康): 接管确认窗口计时 */
   remoteDownSince: number
+  /** 心跳恢复新鲜的起始时刻 (0=非新鲜): 交回稳定窗计时 */
+  remoteFreshSince: number
+  /** 接管排水截止时刻 (0=无): 吊销代理授权后等代理退避, 到点才建内置连接 */
+  takeoverDrainUntil: number
 }
 
 const g = globalThis as any
@@ -70,6 +88,8 @@ if (!g.__xianyuEngineRuntime) {
     polishRunning: false,
     orderSyncRunning: false,
     remoteDownSince: 0,
+    remoteFreshSince: 0,
+    takeoverDrainUntil: 0,
   } as EngineRuntime
 }
 const runtime = g.__xianyuEngineRuntime as EngineRuntime
@@ -141,24 +161,29 @@ async function pollOnce(): Promise<void> {
     const builtinActive = active?.slug === 'builtin'
 
     if (!builtinActive) {
-      // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存): 失联/未在服务时内置引擎
-      // 自动接管, 代理恢复后自动交回 — 消灭「远程引擎失联 → 监听/商品同步/风控全链路
-      // 静默停摆却无人知晓」(v2.1.15 线上实证: 代理进程死后 standby, 商品同步/风控日志全停)。
+      // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存) + 心跳新鲜度 (可靠通道):
+      // 失联确认后内置引擎自动接管, 代理恢复后自动交回 — 消灭「远程引擎失联 → 监听/商品
+      // 同步/风控全链路静默停摆却无人知晓」(v2.1.15 线上实证)。
       const probe = await probeActiveRemote(db)
       if (probe.serving) {
+        // 代理存活 (心跳新鲜): 所有权必须归代理。若内置引擎还持有连接 (上一轮接管残留/
+        // 升级瞬间的双连接状态), 按稳定窗交回 — 先停内置连接再归还授权, 顺序不可反,
+        // 否则代理拉起时内置还没停干净, 又是双连接。
         runtime.remoteDownSince = 0
-        if (!runtime.standby) {
-          // 交回: 停全部内置客户端转待命 (代理已在服务, 双活会重复回复)
+        if (!runtime.remoteFreshSince) runtime.remoteFreshSince = Date.now()
+        if (!runtime.standby && Date.now() - runtime.remoteFreshSince >= REMOTE_HANDBACK_STABLE_MS) {
           for (const client of runtime.clients.values()) await client.stop()
           runtime.clients.clear()
           runtime.cookieCache.clear()
           runtime.standby = true
+          runtime.takeoverDrainUntil = 0
+          await setFailoverOwner(db, FAILOVER_REMOTE)
           await db
             .run(
               "UPDATE engines SET last_status = 'standby', updated_at = CURRENT_TIMESTAMP WHERE slug = 'builtin'",
             )
             .catch(() => {})
-          const msg = '远程代理已恢复在服务, 内置引擎交回服务权 (转待命)'
+          const msg = '远程代理心跳持续稳定, 内置引擎交回服务权 (先停内置连接 → 归还授权, 代理 ≤30s 自行拉起)'
           console.log(`[xianyu-engine] ${msg}`)
           await db
             .run("INSERT INTO system_logs (level, module, message) VALUES ('INFO', 'engine', ?)", [msg])
@@ -166,37 +191,49 @@ async function pollOnce(): Promise<void> {
         }
         return
       }
-      // 失联确认窗口 (v2.2.4): probe 有 30s 结果缓存, 瞬时网络抖动/边缘波动 <90s 一律不接管 —
+      runtime.remoteFreshSince = 0
+      // 失联确认窗口: 心跳陈旧/代理确认空转 <90s 一律不接管 —
       // 误接管会与代理形成两条闲鱼长连接 (双设备指纹双出口 IP), 平台风控直接判
-      // 「环境异常, 重新登录 + 人脸核验」。持续失联 ≥90s 才认定代理真实死亡接管。
+      // 「环境异常, 重新登录 + 人脸核验」。持续失联 ≥90s 才认定代理无力服务。
       if (!runtime.remoteDownSince) runtime.remoteDownSince = Date.now()
       if (Date.now() - runtime.remoteDownSince < REMOTE_DOWN_CONFIRM_MS) return
-      // 失联/未在服务 → 内置引擎接管 (engines.is_active 不动, 代理恢复后自动交回)
+      // 接管 (v2.3.2 源头修复): 立即经 engine_failover 吊销代理授权 — config 接口对代理
+      // 返回 active=false, 存活的代理 (哪怕 /health 直连不通, 只要它还能轮询本后台) 会在
+      // 下一轮轮询 (≤30s) 收到吊销并退避全部连接。内置引擎再等一个排水窗 (45s > 代理
+      // 最大轮询周期) 才建连接 — 与代理在途连接时间错开, 结构性无重叠。
       if (runtime.standby) {
-        const msg = `活跃引擎为远程代理但${probe.reason} (持续失联超过 ${Math.round(REMOTE_DOWN_CONFIRM_MS / 1000)}s), 内置引擎自动接管 (代理恢复后自动交回)`
+        const msg = `活跃引擎为远程代理但${probe.reason} (持续失联超过 ${Math.round(REMOTE_DOWN_CONFIRM_MS / 1000)}s), 内置引擎自动接管 (已吊销代理授权 + 45s 排水, 代理恢复后自动交回)`
         console.log(`[xianyu-engine] ${msg}`)
         await db
           .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'engine', ?)", [msg])
           .catch(() => {})
-        // 接管必须让用户可感知: 接管期间内置引擎用库内 Cookie 新建闲鱼连接,
-        // 若代理实际活着会形成双连接 → 平台风控要求重新登录/人脸核验 (通知一旦出现,
-        // 用户应立即检查代理网络, 而不是先去重新扫码)
+        // 接管必须让用户可感知: 授权已吊销, 代理存活时将自动退避; 若代理连本后台都
+        // 无法到达 (收不到吊销), 其侧连接由代理自身 90s 授权失联释放兜住 (v2.3.2 配套)
         dispatchNotify({
           type: 'risk',
           cookieId: '',
           title: '内置引擎接管监听 · 远程代理失联',
           fields: {
             原因: probe.reason.slice(0, 200),
-            风险: '接管期间若代理恢复在跑会形成双连接, 可能触发平台风控 (重新登录/人脸核验)',
-            处理: '代理真实恢复后内置引擎自动交回; 若代理实际在线请先检查代理网络与登记地址',
+            机制: '已吊销代理授权 (config.active=false), 存活代理 ≤30s 自动退避; 内置引擎 45s 排水后才建连接, 不会双连接',
+            处理: '代理真实恢复后心跳转新鲜, 内置引擎 90s 稳定期满自动交回',
           },
           link: '/listener',
         })
+        await setFailoverOwner(db, FAILOVER_BUILTIN)
+        runtime.takeoverDrainUntil = Date.now() + REMOTE_DRAIN_MS
       }
       runtime.standby = false
+      // 排水窗内不建连接 (账号对齐跳过创建, 仅保留停用对齐)
+      if (Date.now() < runtime.takeoverDrainUntil) return
     } else {
       runtime.standby = false
       runtime.remoteDownSince = 0
+      runtime.remoteFreshSince = 0
+      runtime.takeoverDrainUntil = 0
+      // 内置引擎是活跃引擎: 所有权归内置 (config 对代理返回 active=false, 与 is_active=0 双保险)
+      const owner = await getFailoverOwner(db).catch(() => FAILOVER_REMOTE)
+      if (owner !== FAILOVER_BUILTIN) await setFailoverOwner(db, FAILOVER_BUILTIN)
     }
 
     // 待监听账号 = 启用的 cookies
@@ -381,9 +418,19 @@ async function markActionResult(action: EngineAction, sent: boolean, error: stri
 /* ---------------------------------- 引擎健康探测 ---------------------------------- */
 
 /**
- * 探测当前活跃的远程代理是否真实在服务 (登记地址 /health 实测)。
- * 返回 serving=false 时 reason 说明原因。未登记地址/探测异常保守视为在服务
- * (不误杀 — 原待命语义), 此时后台任务链路照常由网关/直连承担。
+ * 探测当前活跃的远程代理是否真实在服务。
+ *
+ * v2.3.2 信任裁决修正 (双连接根治): 代理 → 本后台的配置轮询/事件心跳走同一出口链路
+ * (经 Cloudflare, ≤30s/次), 是唯一可靠的存活证据; 而本后台 → 代理登记地址的 /health
+ * 是另一条直连链路 (NAT/防火墙/端口未放行都会永久不通), 两条链路可达性毫无因果关系。
+ * 旧逻辑让 /health 失败覆盖新鲜心跳 → 代理明明活着并持有连接, 内置引擎却接管 →
+ * 双连接 → 风控 → 「重新登录 + 人脸核验」循环 (线上实证)。
+ *
+ * 新裁决:
+ *   - 心跳新鲜 → 代理存活。/health 仅用于识别「进程活着但没挂任何账号」(engine_active=
+ *     false, 如令牌不匹配/未激活), 该状态接管才安全; /health 不可达一律按在服务处理
+ *     (绝不因探测链路故障去和活代理抢连接)。
+ *   - 心跳陈旧/从未上报 → serving=false (走 90s 确认接管)。
  */
 async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise<{ serving: boolean; reason: string }> {
   try {
@@ -394,25 +441,28 @@ async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise
        LIMIT 1`,
     )
     if (!row) return { serving: true, reason: '' }
-    // 心跳新鲜度先行: 远程代理真实在服务本后台时, 配置轮询 (≤30s/次) 会持续刷新 last_seen_at。
-    // 进程活着但心跳陈旧 = 代理连的是别的后台 / 上报中断 — 此时本后台监听实际已死,
-    // 不能被 /health 的 engine_active 陈旧真值骗过 (v2.1.16 实测: last_seen 停在 6h 前)。
     if (row.last_seen_at) {
       const raw = String(row.last_seen_at)
       const seenMs = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z')
-      if (Number.isFinite(seenMs)) {
-        const staleMin = Math.round((Date.now() - seenMs) / 60_000)
-        if (Date.now() - seenMs > REMOTE_STALE_MS) {
-          return { serving: false, reason: `心跳陈旧 (${staleMin} 分钟无上报, 代理可能在服务其他后台或上报中断)` }
+      if (Number.isFinite(seenMs) && Date.now() - seenMs <= REMOTE_STALE_MS) {
+        // 心跳新鲜 → 代理存活。/health 只做「是否挂着账号」的细化判定:
+        const r = await probeRemoteEngine(String(row.host), Number(row.port))
+        if (r.ok && !r.engine_active) {
+          return { serving: false, reason: '代理进程存活但未在服务 (engine_active=false, 常见为接入令牌不匹配或代理未激活)' }
         }
+        // /health 可达且在服务, 或 /health 不可达 (探测链路故障 ≠ 代理死亡) → 都按在服务
+        return { serving: true, reason: '' }
       }
     }
-    const r = await probeRemoteEngine(String(row.host), Number(row.port))
-    if (!r.ok) return { serving: false, reason: `登记地址健康探测失败 (${r.error || '不可达'})` }
-    if (!r.engine_active) {
-      return { serving: false, reason: '代理进程存活但未在服务 (engine_active=false, 常见为接入令牌不匹配或代理未激活)' }
+    const staleMin = row.last_seen_at
+      ? Math.round((Date.now() - Date.parse(String(row.last_seen_at).includes('T') ? String(row.last_seen_at) : String(row.last_seen_at).replace(' ', 'T') + 'Z')) / 60_000)
+      : NaN
+    return {
+      serving: false,
+      reason: row.last_seen_at
+        ? `心跳陈旧 (${Number.isFinite(staleMin) ? staleMin : '?'} 分钟无上报, 代理可能在服务其他后台或上报中断)`
+        : '代理从未上报心跳 (登记后从未连通本后台)',
     }
-    return { serving: true, reason: '' }
   } catch {
     return { serving: true, reason: '' }
   }

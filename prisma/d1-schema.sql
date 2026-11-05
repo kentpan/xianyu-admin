@@ -154,16 +154,21 @@ CREATE TABLE auto_reply_logs (
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             , is_test INTEGER DEFAULT 0);
 CREATE TABLE card_code_logs (
-    id __AUTO__,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id INTEGER DEFAULT 0,
     card_name VARCHAR(128) DEFAULT '',
-    code VARCHAR(64) DEFAULT '',
+    code VARCHAR(64) DEFAULT '' UNIQUE,
     cookie_id VARCHAR(64) DEFAULT '',
     item_id VARCHAR(64) DEFAULT '',
     order_id VARCHAR(64) DEFAULT '',
     buyer_id VARCHAR(64) DEFAULT '',
+    status VARCHAR(16) DEFAULT 'unused',
+    used_at TIMESTAMP,
+    used_ip VARCHAR(64) DEFAULT '',
+    used_by_key_id INTEGER DEFAULT 0,
+    source VARCHAR(16) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  , status VARCHAR(16) DEFAULT 'unused', used_at TIMESTAMP, used_ip VARCHAR(64) DEFAULT '', used_by_key_id INTEGER DEFAULT 0, source VARCHAR(16) DEFAULT '');
+  );
 CREATE TABLE card_consume_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code_id INTEGER DEFAULT 0,
@@ -326,6 +331,11 @@ CREATE TABLE engine_event_dedup (
     actions_json TEXT DEFAULT '[]',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , pending INTEGER DEFAULT 0);
+CREATE TABLE engine_failover (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner VARCHAR(16) NOT NULL DEFAULT 'remote',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 CREATE TABLE engine_subscribers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
@@ -409,7 +419,7 @@ CREATE TABLE im_messages (
     amount VARCHAR(32) DEFAULT '',
     status_text VARCHAR(64) DEFAULT '',
     msg_time TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_ai INTEGER DEFAULT 0,
     UNIQUE(cookie_id, message_key)
   );
 CREATE TABLE in_app_notifications (
@@ -435,7 +445,7 @@ CREATE TABLE item_ai_settings (
     max_bargain_rounds INTEGER DEFAULT 3,
     custom_prompts TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ai_config_id INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ai_config_id INTEGER DEFAULT 0, use_item_kb INTEGER DEFAULT 0, share_item_kb INTEGER DEFAULT 0, use_account_style INTEGER DEFAULT 0,
     UNIQUE(cookie_id, item_id)
   );
 CREATE TABLE item_info (
@@ -461,6 +471,53 @@ CREATE TABLE item_replay (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , delay_seconds INTEGER DEFAULT 10);
+CREATE TABLE kb_answers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  content TEXT NOT NULL,
+  content_hash VARCHAR(64) NOT NULL UNIQUE,
+  source_message_id VARCHAR(64) DEFAULT '',
+  source_chat_id VARCHAR(64) DEFAULT '',
+  source_cookie_id VARCHAR(64) DEFAULT '',
+  item_id VARCHAR(64) DEFAULT '',
+  is_ai_generated INTEGER DEFAULT 0,
+  freq INTEGER DEFAULT 1,
+  sort INTEGER DEFAULT 0,
+  ai_hit_count INTEGER DEFAULT 0,
+  ai_last_used_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE kb_group_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  item_type VARCHAR(8) NOT NULL,
+  item_id INTEGER NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(group_id, item_type, item_id)
+);
+CREATE TABLE kb_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name VARCHAR(128) NOT NULL,
+  sort INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE kb_questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  content TEXT NOT NULL,
+  content_hash VARCHAR(64) NOT NULL UNIQUE,
+  source_message_id VARCHAR(64) DEFAULT '',
+  source_chat_id VARCHAR(64) DEFAULT '',
+  source_cookie_id VARCHAR(64) DEFAULT '',
+  item_id VARCHAR(64) DEFAULT '',
+  buyer_id VARCHAR(64) DEFAULT '',
+  freq INTEGER DEFAULT 1,
+  sort INTEGER DEFAULT 0,
+  ai_hit_count INTEGER DEFAULT 0,
+  ai_last_used_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
@@ -604,6 +661,20 @@ CREATE TABLE system_settings (
     description TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+CREATE TABLE trend_hot_items (
+    item_id VARCHAR(64) PRIMARY KEY,
+    title VARCHAR(512) DEFAULT '',
+    price VARCHAR(32) DEFAULT '',
+    seller_id VARCHAR(64) DEFAULT '',
+    seller_nick VARCHAR(128) DEFAULT '',
+    area VARCHAR(128) DEFAULT '',
+    pic_url TEXT DEFAULT '',
+    want_count INTEGER DEFAULT 0,
+    keyword VARCHAR(128) DEFAULT '',
+    seen_count INTEGER DEFAULT 1,
+    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  , item_type VARCHAR(16) DEFAULT '');
 CREATE TABLE user_roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,

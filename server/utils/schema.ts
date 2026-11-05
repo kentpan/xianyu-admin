@@ -597,6 +597,15 @@ const SCHEMA: string[] = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+  // 监听所有权仲裁表 (v2.3.2 双连接根治): 同一账号同一时刻只允许一个进程持有闲鱼长连接
+  // (独立代理 或 内置引擎), owner 是唯一真源 — 内置引擎接管时置 builtin, /api/engine/config
+  // 据此对代理返回 active=false 吊销其授权 (代理 ≤30s 内退避), 结构性消灭双连接
+  // (双设备指纹双出口 IP → 平台风控判「环境异常, 重新登录 + 人脸核验」)。
+  `CREATE TABLE IF NOT EXISTS engine_failover (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner VARCHAR(16) NOT NULL DEFAULT 'remote',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
   // 事件发布订阅者: 引擎监听到的原始事件 (聊天/系统/风控) 转发给下游项目,
   // 鉴权为标准 Authorization: Bearer <token>, 转发不碰业务逻辑 (大脑决策不受影响)
   `CREATE TABLE IF NOT EXISTS engine_subscribers (
@@ -796,6 +805,9 @@ const MIGRATIONS: string[] = [
   )`,
   `INSERT OR IGNORE INTO engines (id, slug, name, type, is_active, remark)
    VALUES (1, 'builtin', '内置监听引擎', 'builtin', 1, '与后台同进程, 共享数据库')`,
+  // 监听所有权仲裁行 (v2.3.2): 默认 remote = 远程代理在服务时的初始所有权;
+  // 内置引擎接管/激活时由 engine-manager 原子翻转为 builtin
+  `INSERT OR IGNORE INTO engine_failover (id, owner) VALUES (1, 'remote')`,
   // 引擎接入令牌: 统一 Authorization: Bearer <token> 鉴权, 每个引擎独立令牌
   `ALTER TABLE engines ADD COLUMN token VARCHAR(64) DEFAULT ''`,
   // 风控: 设备指纹持久化 (重连/换机不换设备 ID, 避免风控)
