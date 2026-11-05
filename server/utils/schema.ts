@@ -1053,6 +1053,11 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE orders ADD COLUMN sync_source VARCHAR(16) DEFAULT ''`,
   // 全平台热门商品趋势 (v2.3.0): 商品类型列 — 虚拟/实体分类 (老库 ALTER 幂等)
   `ALTER TABLE trend_hot_items ADD COLUMN item_type VARCHAR(16) DEFAULT ''`,
+  // (v2.3.4 修复) 成功日志脏数据修复: 2.3.1~2.3.3 代理回报链路发送成功时把空错误串经
+  // mtopFailMessage('') 兑底成「未知错误」写进 error_message, 盖住了发货内容 (线上实证)。
+  // 服务端已修复 (events.post.ts 成功回报清空 error_message), 此处一次性清历史脏行 —
+  // 条件精确匹配 (成功 + 文案逐字等于「未知错误」), 幂等可重入, 只动被 bug 污染的行。
+  `UPDATE auto_reply_logs SET error_message = NULL WHERE send_status = 'success' AND error_message = '未知错误'`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [
