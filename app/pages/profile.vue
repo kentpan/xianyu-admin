@@ -19,7 +19,7 @@
             <div class="flex items-center gap-2 mt-1.5">
               <span v-if="profile?.user.is_admin" class="badge bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300">管理员</span>
               <span class="badge bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">已激活</span>
-              <span class="text-xs text-slate-400">注册于 {{ formatTime(profile?.user.created_at) }}</span>
+              <span class="text-xs text-slate-400">注册于 {{ formatDay(profile?.user.created_at) }}</span>
             </div>
           </div>
         </div>
@@ -211,13 +211,6 @@ async function savePrefs() {
   } finally {
     savingPrefs.value = false
   }
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleDateString('zh-CN')
 }
 
 onMounted(loadProfile)

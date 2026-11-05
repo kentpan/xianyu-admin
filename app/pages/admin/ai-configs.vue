@@ -393,13 +393,6 @@ async function runTest() {
   }
 }
 
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(t.replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
 onMounted(reload)
 if (import.meta.client) window.addEventListener('app:refresh', reload)
 onBeforeUnmount(() => import.meta.client && window.removeEventListener('app:refresh', reload))

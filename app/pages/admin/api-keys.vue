@@ -97,7 +97,7 @@
                     {{ Number(k.enabled) ? '启用中' : '已停用' }}
                   </button>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400 whitespace-nowrap">{{ formatTime(k.last_used_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400 whitespace-nowrap">{{ formatTimeFull(k.last_used_at) }}</td>
                 <td>
                   <div class="flex items-center justify-end gap-1">
                     <button class="btn-ghost !px-2 !py-1" title="统计报表" @click="openStats(k)">
@@ -300,7 +300,7 @@ Content-Type: application/json
               </thead>
               <tbody>
                 <tr v-for="l in logs" :key="l.id">
-                  <td class="whitespace-nowrap text-slate-500">{{ formatTime(l.created_at) }}</td>
+                  <td class="whitespace-nowrap text-slate-500">{{ formatTimeFull(l.created_at) }}</td>
                   <td>
                     <span class="badge" :class="Number(l.success) ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300'">
                       {{ Number(l.success) ? '成功' : `失败 ${l.status_code}` }}
@@ -621,13 +621,6 @@ async function loadLogs() {
   } finally {
     logsLoading.value = false
   }
-}
-
-function formatTime(t?: string | null) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

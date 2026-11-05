@@ -174,3 +174,75 @@ export interface OrderTrends {
 export function getOrderTrends() {
   return useApi().get<OrderTrends>('/api/orders/trends')
 }
+
+/* ==================== 存量订单核验修复 (v2.3.0) ==================== */
+
+export interface RepairOrdersResult {
+  checked: number
+  time_fixed: number
+  seller_fixed: number
+  nick_fixed: number
+  removed: number
+  skipped_risk: number
+  errors: string[]
+}
+
+/**
+ * 存量订单核验修复: 逐单调闲鱼订单详情接口对账 —
+ * 回填真实下单时间 (修复旧版"同批订单时间全部同一秒"的时间堆积存量)、
+ * 卖家身份/买家昵称, 清理订单号精度丢失的截断脏单 (详情必查不到, 零误伤)。
+ */
+export function repairOrders(body: { limit?: number } = {}) {
+  return useApi().post<RepairOrdersResult>('/api/orders/repair', body)
+}
+
+/* ==================== 全平台热门商品趋势 (v2.3.0) ==================== */
+
+export interface HotTrendItem {
+  item_id: string
+  title: string
+  price: string
+  seller_id: string
+  seller_nick: string
+  area: string
+  pic_url: string
+  want_count: number
+  keyword: string
+  /** 商品类型 (v2.3.0): virtual=虚拟商品 / physical=实体商品 (标题特征词分类) */
+  item_type?: string
+  seen_count: number
+  first_seen_at: string
+  last_seen_at: string
+}
+
+export interface HotTrendsResult {
+  items: HotTrendItem[]
+  stats: { total: number; sellers: number; min_price: number | null; max_price: number | null }
+  keywords: { keyword: string; c: number }[]
+}
+
+/** 全平台热门商品榜单 (trend_hot_items 聚合快照) — item_type: virtual/physical/空=全部 */
+export function getHotTrends(query: { keyword?: string; item_type?: string; limit?: number; sort?: string } = {}) {
+  const qs = new URLSearchParams(
+    Object.entries(query)
+      .filter(([, v]) => v !== undefined && v !== '' && v !== null)
+      .reduce<Record<string, string>>((acc, [k, v]) => {
+        acc[k] = String(v)
+        return acc
+      }, {}),
+  ).toString()
+  return useApi().get<HotTrendsResult>(`/api/orders/hot-trends?${qs}`)
+}
+
+export interface SyncHotTrendsResult {
+  synced: number
+  new_items: number
+  updated_items: number
+  pages: number
+  errors: string[]
+}
+
+/** 全平台商品搜索同步: 关键词搜索闲鱼站内在售商品并聚合进热门榜 */
+export function syncHotTrends(body: { keyword: string; pages?: number; cookie_id?: string }) {
+  return useApi().post<SyncHotTrendsResult>('/api/orders/hot-trends/sync', body)
+}

@@ -56,7 +56,7 @@
             </thead>
             <tbody>
               <tr v-for="log in logs" :key="log.id">
-                <td class="text-slate-500 dark:text-slate-400 whitespace-nowrap">{{ formatTime(log.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400 whitespace-nowrap">{{ formatTimeFull(log.created_at) }}</td>
                 <td class="font-medium text-slate-800 dark:text-slate-100">{{ log.username || '—' }}</td>
                 <td><span class="badge" :class="actionClass(log.action)">{{ log.action }}</span></td>
                 <td class="text-slate-600 dark:text-slate-300">{{ log.module || '—' }}</td>
@@ -132,13 +132,6 @@ function actionClass(action: string) {
   if (a.includes('login') || a.includes('logout') || a.includes('登录') || a.includes('退出')) return 'bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
   if (a.includes('import') || a.includes('export') || a.includes('导入') || a.includes('导出')) return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
   return 'bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300'
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 onMounted(reload)

@@ -319,10 +319,10 @@ async function executeActions(actions: EngineAction[]): Promise<void> {
     try {
       if (action.type === 'send_text') {
         await client.sendText(action.chat_id, action.to_user_id, action.text, action.delay_ms)
-        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.text, 'text')
+        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.text, 'text', !!(action as any).is_ai)
       } else {
         await client.sendImage(action.chat_id, action.to_user_id, action.image_url, action.width, action.height, action.delay_ms)
-        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.image_url, 'image')
+        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.image_url, 'image', !!(action as any).is_ai)
       }
       await markActionResult(action, true, '')
     } catch (e: any) {
@@ -364,27 +364,17 @@ export function getAccountClient(cookieId: string): XianyuAccountClient | null {
   return runtime.clients.get(cookieId) || null
 }
 
-/** 内置引擎发送结果回写: 按决策日志 id 精确更新, 不再猜“该账号最新一条”。
- *  (v2.2.8) 成功且无错误原文时不再整列覆盖 error_message — 凭证模式发货日志初始
- *  写入的「发货方式: 无需邮寄发货凭证」备注是回复内容列的展示主体, 旧代码成功回执
- *  写 null 会把它冲掉; 仅失败 (或成功但附带警告文本) 时才写错误列, 原始错误信息
- *  由调用方 slice 后原样入库, 绝不吞。 */
+/** 内置引擎发送结果回写: 按决策日志 id 精确更新, 不再猜“该账号最新一条”。 */
 async function markActionResult(action: EngineAction, sent: boolean, error: string): Promise<void> {
   const logId = Number((action as { log_id?: number }).log_id || 0)
   if (!logId) return
   const db = await getDb().catch(() => null)
   if (!db) return
-  const errText = String(error || '').trim()
-  if (sent && !errText) {
-    await db.run('UPDATE auto_reply_logs SET send_status = ? WHERE id = ?', ['success', logId]).catch(() => {})
-    return
-  }
   await db
-    .run('UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?', [
-      sent ? 'success' : 'failed',
-      sent ? errText.slice(0, 300) : errText ? errText.slice(0, 300) : '发送失败但未捕获到错误原因 (内置引擎 executeActions 异常为空)',
-      logId,
-    ])
+    .run(
+      'UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?',
+      [sent ? 'success' : 'failed', sent ? null : error, logId],
+    )
     .catch(() => {})
 }
 

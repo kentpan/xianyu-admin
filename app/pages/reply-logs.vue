@@ -63,7 +63,7 @@
             </thead>
             <tbody>
               <tr v-for="log in logs" :key="log.id">
-                <td class="whitespace-nowrap text-slate-500 dark:text-slate-400">{{ formatTime(log.created_at) }}</td>
+                <td class="whitespace-nowrap text-slate-500 dark:text-slate-400">{{ formatTimeFull(log.created_at) }}</td>
                 <td class="text-slate-500 dark:text-slate-400">{{ log.cookie_id }}</td>
                 <td class="max-w-[260px]">
                   <p class="font-medium text-slate-900 dark:text-white truncate">{{ log.sender_user_name || log.sender_user_id || '-' }}</p>
@@ -157,8 +157,7 @@ function strategyMeta(log: ReplyLog) {
       case 'not_own_item': return { label: '非本店铺会话', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'self_message': return { label: '本人消息', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'already_shipped': return { label: '已发货跳过', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-      case 'system_notice': return { label: '系统通知', cls: 'bg-sky-50 text-sky-600 dark:bg-sky-900/30 dark:text-sky-400' }
-      case 'reply_once_sent': return { label: '仅一次已回', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
+      case 'system_notice': return { label: '系统通知', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'skip_reply_filter': return { label: '过滤规则', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
       case 'delivery_failed': return { label: '发货失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
       case 'payment_received': return { label: '用户已付款', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
@@ -178,11 +177,8 @@ function strategyMeta(log: ReplyLog) {
 // (v2.1.14) 回复内容列: payment_received (用户已付款待发货) 用琥珀色正向语义, 其余维持原判定。
 // (v2.1.19) 付款留痕行把失败原因一并展示 (reply_text 已前置「订单号定位失败原因」;
 // error_message 携带卡片原文摘要/未含订单号说明, 与原因一起一眼清, 不再只看一句提示语)
-// (v2.2.8) auto_delivered 发货行: 发货内容 (reply_text) 与「发货方式」备注 (error_message)
-// 同列双行展示, 备注用 teal 正向语义不再误显为红色错误 (成功回执不再写错误列后,
-// 该列承载的是发货方式说明, 非失败信息)
 function contentText(log: ReplyLog): string {
-  if (log.decision_reason === 'payment_received' || log.decision_reason === 'auto_delivered') {
+  if (log.decision_reason === 'payment_received') {
     return [log.reply_text, log.error_message].filter(Boolean).join('\n') || '-'
   }
   return log.error_message || log.reply_text || '-'
@@ -190,7 +186,6 @@ function contentText(log: ReplyLog): string {
 
 function contentMeta(log: ReplyLog): string {
   if (log.decision_reason === 'payment_received') return 'text-amber-600 dark:text-amber-400'
-  if (log.decision_reason === 'auto_delivered') return 'text-teal-600 dark:text-teal-400'
   return log.error_message ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'
 }
 
@@ -201,17 +196,6 @@ function sendMeta(sendStatus: string) {
     case 'sent': return { label: '已下发', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
     case 'failed': return { label: '发送失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
     default: return { label: '未发送', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-  }
-}
-
-function formatTime(t: string) {
-  if (!t) return '-'
-  try {
-    const d = t.includes('T') || t.includes('Z') ? new Date(t) : new Date(t.replace(' ', 'T') + 'Z')
-    if (Number.isNaN(d.getTime())) return t
-    return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  } catch {
-    return t
   }
 }
 

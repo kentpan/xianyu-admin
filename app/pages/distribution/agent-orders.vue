@@ -111,7 +111,7 @@
                     {{ statusMeta(o.status).label }}
                   </span>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(o.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(o.created_at) }}</td>
               </tr>
             </tbody>
           </table>
@@ -203,7 +203,7 @@
           </div>
           <div class="grid grid-cols-3 gap-2 py-2 border-b border-slate-100 dark:border-slate-700">
             <span class="text-slate-400">创建时间</span>
-            <span class="col-span-2">{{ formatTime(detail.created_at) }}</span>
+            <span class="col-span-2">{{ formatTimeFull(detail.created_at) }}</span>
           </div>
           <div v-if="detail.settle_remark" class="grid grid-cols-3 gap-2 py-2">
             <span class="text-slate-400">结算备注</span>
@@ -293,13 +293,6 @@ async function openDetail(o: AgentOrder) {
   } catch (e: any) {
     // Keep the cached row data; detail fetch is best-effort
   }
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

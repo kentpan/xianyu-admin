@@ -443,12 +443,6 @@ async function reload() {
   }
 }
 
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(t)
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
 function logDotClass(level: string) {
   return {
     INFO: 'bg-sky-400', WARN: 'bg-amber-400', ERROR: 'bg-red-500', DEBUG: 'bg-slate-400',

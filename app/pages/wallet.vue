@@ -150,7 +150,7 @@
                     {{ settlementStatusMeta(s.status).label }}
                   </span>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(s.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(s.created_at) }}</td>
                 <td class="max-w-[240px]">
                   <p class="truncate text-xs text-slate-500 dark:text-slate-400" :title="s.reject_reason || s.remark || ''">
                     {{ s.reject_reason || s.remark || '—' }}
@@ -198,7 +198,7 @@
                 <td class="max-w-[300px]">
                   <p class="truncate text-slate-700 dark:text-slate-200" :title="f.description">{{ f.description || '—' }}</p>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(f.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(f.created_at) }}</td>
               </tr>
             </tbody>
           </table>
@@ -412,13 +412,6 @@ async function copyText(text: string, msg: string) {
 
 function onQrError(e: Event) {
   ;(e.target as HTMLImageElement).style.display = 'none'
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

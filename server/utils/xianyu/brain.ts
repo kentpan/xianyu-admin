@@ -39,7 +39,7 @@ import { isGatewayMode } from './gateway'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
-  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number }
+  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number; is_ai?: boolean }
   | {
       type: 'send_image'
       account: string
@@ -50,6 +50,7 @@ export type EngineAction =
       height: number
       delay_ms: number
       log_id?: number
+      is_ai?: boolean
     }
 
 interface BrainOptions {
@@ -172,7 +173,9 @@ async function emitReplyActions(
     reply_text: fields.reply_text,
     send_status: 'pending',
   })
-  return actions.map((a) => ({ ...a, log_id: logId }))
+  // AI 标志 (v2.3.0): reply_strategy=ai 的 action 随单打 is_ai 标记, 发送落库时写入
+  // im_messages.is_ai —— 仅管理后台消息页展示 AI 徽标, 对买家完全透明
+  return actions.map((a) => ({ ...a, log_id: logId, is_ai: fields.reply_strategy === 'ai' ? true : a.is_ai }))
 }
 
 /**
@@ -394,19 +397,10 @@ export async function handleChatEvent(
 
   // 交易完成卡片 (先于暂停/旧消息过滤): 交易成功 = 资金已锁定, 只回写订单终态;
   // 发货唯一入口是付款卡片 (deliverOnPaymentCard), 交易成功卡片不产生第二个发货入口。
-  // (v2.2.8) 卡片不带订单号时不再静默 — 用户需要确认收货状态「是否获取到」的日志证据,
-  // 留痕 system_notice (买家/消息列展示卡片原文, 回复内容列说明未回写原因)。
+  // 卡片不带订单号时无可回写 → 静默 (留日志只会产生「订单 未知」噪音行)。
   if (isTradeCompleteContent(msg.content)) {
     const doneOrderId = extractOrderId(msg.raw)
-    if (!doneOrderId) {
-      await addLog(db, cookieId, msg, opts, {
-        process_status: 'skipped',
-        decision_reason: 'system_notice',
-        reply_strategy: 'none',
-        reply_text: '交易成功通知 (确认收货): 卡片未携带订单号, 无法回写订单终态 (订单状态以「订单管理」同步为准)',
-      })
-      return []
-    }
+    if (!doneOrderId) return []
     await db
       .run(
         "UPDATE orders SET order_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?",
@@ -447,18 +441,7 @@ export async function handleChatEvent(
   }
 
   // 人工接入暂停检查 (落库状态, APP/后台消息页人工回复均触发; 仅作用于回复链, 付款触发已在上方提前处理)
-  // (v2.2.8) 暂停期消息不再静默丢弃 — 拍下未付款/确认收货/评价提醒等状态消息在人工
-  // 对话窗口期曾被无日志吞掉 (用户误以为「状态没获取到或被屏蔽抛弃」), 现在留痕
-  // manual_reply_pause: 买家/消息列可见原消息, 策略列标注暂停跳过, 排查「为什么没回」证据完整。
-  if (await chatPaused(db, cookieId, msg.chatId)) {
-    await addLog(db, cookieId, msg, opts, {
-      process_status: 'skipped',
-      decision_reason: 'manual_reply_pause',
-      reply_strategy: 'none',
-      reply_text: '人工回复暂停期内收到消息, 未自动回复 (暂停到期自动恢复正常回复)',
-    })
-    return []
-  }
+  if (await chatPaused(db, cookieId, msg.chatId)) return []
 
   // 旧消息过滤: 断线重连 sync 重推的历史消息不进回复链 (否则旧会话突然收到一条自动回复)
   if (msg.createTime > 0 && Date.now() - msg.createTime > STALE_MESSAGE_MS) {
@@ -540,8 +523,12 @@ export async function handleChatEvent(
   }
 
   // 2) AI 回复 (意图识别 + 议价控制 + 商品上下文)
+  // 最小回复延迟 (v2.3.0 定版): AI 回复自身不设独立延迟, 取「自动回复」与「指定商品回复」
+  // 中已配置的延迟作为最小回复延迟时间 (两者取大; 无配置则 0 不等)
+  const aiMinDelay = await resolveAiMinDelay(db, cookieId, msg.itemId)
   const aiReply = await getAiReply(db, cookieId, msg)
   if (aiReply) {
+    if (!(await delayedReplyWait(db, cookieId, msg, opts, aiMinDelay, 'ai'))) return []
     return emitReplyActions(db, cookieId, msg, opts, [textAction(cookieId, msg, applyVars(aiReply, vars), 0)], {
       reply_strategy: 'ai',
       reply_text: aiReply,
@@ -581,16 +568,7 @@ export async function handleChatEvent(
         cookieId,
         msg.chatId,
       ])
-      if (seen) {
-        // (v2.2.8) 仅一次默认回复已发过不再静默: 留痕可追溯 (此前无日志, 排查「为什么没回」缺证据)
-        await addLog(db, cookieId, msg, opts, {
-          process_status: 'skipped',
-          decision_reason: 'reply_once_sent',
-          reply_strategy: 'default',
-          reply_text: '默认回复 (仅一次) 此前已发送过, 本次跳过',
-        })
-        return []
-      }
+      if (seen) return []
       await db.run('INSERT OR IGNORE INTO default_reply_records (cookie_id, chat_id) VALUES (?, ?)', [
         cookieId,
         msg.chatId,
@@ -632,19 +610,15 @@ export async function handleSystemEvent(
   if (!cookieId) return []
 
   // 订单状态回写 (交易卡片事件统一落 orders, 与后台订单页/统计共用)
-  // (v2.2.8) 状态映射补全: 等待买家收货 → shipped (平台确认已发货, 本地状态滞后时
-  // 防止已发货订单再进补发链), 退款成功 → refunded — 均为幂等状态回写, 不新增行不改金额。
   let orderId = msg.orderId
-  const statusMap: Record<string, string> = {
-    等待买家付款: 'pending_payment',
-    等待卖家发货: 'pending_ship',
-    等待买家收货: 'shipped',
-    交易关闭: 'closed',
-    交易成功: 'completed',
-    退款成功: 'refunded',
-  }
-  const mapped = orderId ? statusMap[msg.redReminder] || 'unknown' : 'unknown'
   if (orderId) {
+    const statusMap: Record<string, string> = {
+      等待买家付款: 'pending_payment',
+      等待卖家发货: 'pending_ship',
+      交易关闭: 'closed',
+      交易成功: 'completed',
+    }
+    const mapped = statusMap[msg.redReminder] || 'unknown'
     const exists = await db.get('SELECT order_id, cookie_id, item_id, buyer_id FROM orders WHERE order_id = ?', [orderId])
     if (!exists) {
       await db.run(
@@ -669,19 +643,10 @@ export async function handleSystemEvent(
     }
   }
 
-  // 交易成功系统卡片: 交易已终结, 只回写订单终态并留痕。
-  // (v2.2.8) 无订单号的交易成功卡片不再静默 — 留痕 system_notice 说明未回写原因,
-  // 此前静默让用户以为「确认收货状态没获取到」。不做补发 — 发货唯一入口 = 聊天付款卡片。
+  // 交易成功系统卡片: 交易已终结, 只回写订单终态并留痕; 卡片无订单号时无可回写 → 静默
+  // (留日志只会产生「订单 未知」噪音行)。此处不做补发 — 发货唯一入口 = 聊天付款卡片。
   if (msg.redReminder === '交易成功') {
-    if (!orderId) {
-      await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-        process_status: 'skipped',
-        decision_reason: 'system_notice',
-        reply_strategy: 'none',
-        reply_text: '交易成功系统卡片: 未携带订单号, 无法回写订单终态 (订单状态以「订单管理」同步为准)',
-      })
-      return []
-    }
+    if (!orderId) return []
     await db
       .run("UPDATE orders SET order_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId])
       .catch(() => {})
@@ -712,39 +677,15 @@ export async function handleSystemEvent(
     }
   }
 
-  // (v2.2.8) 全部系统交易卡片留痕: 等待买家付款 (拍下未付款)/等待买家收货/交易关闭/
-  // 退款成功等此前只回写订单状态不落决策日志 (静默 return), 用户误以为「状态没获取到
-  // 或被屏蔽抛弃」。现在每张卡片都落 system_notice 日志: 订单状态回写结果 (或未携带
-  // 订单号) 一并展示, 交易卡片状态流转全程可见。
-  if (msg.redReminder !== '等待卖家发货') {
-    await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-      process_status: 'skipped',
-      decision_reason: 'system_notice',
-      reply_strategy: 'none',
-      reply_text: orderId
-        ? `系统卡片 [${msg.redReminder}]: 订单 ${orderId} 状态回写${mapped !== 'unknown' ? ` → ${mapped}` : ' (卡片未携带可识别状态, 仅留痕)'}; 无需自动处理`
-        : `系统卡片 [${msg.redReminder}]: 未携带订单号, 仅留痕不处理`,
-    })
-    return []
-  }
+  if (msg.redReminder !== '等待卖家发货') return []
 
   /* ---------------- 系统卡片 [等待卖家发货]: 仅订单状态回写 (v2.2.3) ----------------
    * 实测该交易卡片不含 商品ID/买家/会话 (item_id/buyer_id/chat_id 全空), 无法定位订单 —
    * v2.2.2 及之前的「五级订单号兜底 + 远程拉单匹配」全是无效兜底 (「订单号定位失败」噪音
    * 的根源, 且无商品/买家约束时极易误配他人订单)。自动发货唯一入口 = 聊天付款卡片
    * (deliverOnPaymentCard, 自带商品/买家/会话); 本卡片只把平台状态回写 orders (顶部
-   * statusMap 已按 redReminder 幂等处理), 不触发发货。(v2.2.8) 卡片连订单号都没有时
-   * 也留痕 (仅说明发货触发归属), 不再静默。 */
-  if (!orderId) {
-    // (v2.2.8) 无订单号的等待卖家发货卡片不再静默: 留痕说明发货触发归属 (买家付款卡片)
-    await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
-      process_status: 'skipped',
-      decision_reason: 'system_notice',
-      reply_strategy: 'none',
-      reply_text: '系统卡片 [等待卖家发货]: 未携带订单号, 仅留痕; 自动发货由买家付款卡片统一触发',
-    })
-    return []
-  }
+   * statusMap 已按 redReminder 幂等处理), 不触发发货。卡片连订单号都没有时无事可做 → 静默。 */
+  if (!orderId) return []
   logWarn(`[${cookieId}] 系统卡片 [等待卖家发货]: 订单 ${orderId} 状态回写待发货 (自动发货由买家付款卡片统一触发)`)
   await addLog(db, cookieId, systemMsgLogStub(msg), opts, {
     process_status: 'skipped',
@@ -1078,6 +1019,79 @@ async function matchKeywordReply(
 
 /* ---------------------------------- AI 回复 (语义对齐 butler ai_reply_engine) ---------------------------------- */
 
+/**
+ * AI 最小回复延迟 (v2.3.0 定版): AI 回复自身不设独立延迟时间, 取「自动回复」
+ * (keywords.delay_seconds) 与「指定商品回复」(item_replay.delay_seconds, 绑定当前
+ * 商品) 中已配置的延迟作为最小回复延迟时间 (两者取大, 无配置为 0 不等)。
+ */
+async function resolveAiMinDelay(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId?: string,
+): Promise<number> {
+  const kw = await db
+    .get<{ m: number }>('SELECT COALESCE(MAX(delay_seconds), 0) m FROM keywords WHERE cookie_id = ?', [cookieId])
+    .catch(() => ({ m: 0 }))
+  const ir = itemId
+    ? await db
+        .get<{ m: number }>('SELECT COALESCE(MAX(delay_seconds), 0) m FROM item_replay WHERE cookie_id = ? AND item_id = ?', [
+          cookieId,
+          itemId,
+        ])
+        .catch(() => ({ m: 0 }))
+    : ({ m: 0 } as { m: number })
+  return Math.max(Number(kw?.m || 0), Number(ir?.m || 0))
+}
+
+/** 知识库检索条数上限 (按 sort 优先级取前 N 条拼入 prompt, 防止 prompt 膨胀)。 */
+const KB_CONTEXT_LIMIT = 20
+
+/**
+ * AI 知识库上下文 (v2.3.0): 按排序 (sort 即优先级) 取问话+回答拼入 prompt;
+ * 参与本次生成的条目 ai_hit_count+1 (引用统计 → 置信度 → 优先级 → 自我进化依据)。
+ * 可选商品过滤 (item_id 检索加仅本商品相关条目优先), 知识库本身全局共享 (跨账号)。
+ */
+async function loadKbContext(db: Awaited<ReturnType<typeof getDb>>, itemId?: string): Promise<string> {
+  try {
+    const questions = await db.all<any>(
+      `SELECT id, content, item_id FROM kb_questions ORDER BY sort ASC, id ASC LIMIT ?`,
+      [KB_CONTEXT_LIMIT],
+    )
+    const answers = await db.all<any>(
+      `SELECT id, content, item_id FROM kb_answers ORDER BY sort ASC, id ASC LIMIT ?`,
+      [KB_CONTEXT_LIMIT],
+    )
+    if (!questions.length && !answers.length) return ''
+    // 商品绑定优先: 与当前商品相关的条目排在前面 (双序: sort 优先级 + 商品相关性加成)
+    const rank = (rows: any[]) => {
+      if (!itemId) return rows
+      return [...rows.filter((r) => String(r.item_id || '') === String(itemId)), ...rows.filter((r) => String(r.item_id || '') !== String(itemId))]
+    }
+    const qStr = rank(questions)
+      .slice(0, 12)
+      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
+      .join('\n')
+    const aStr = rank(answers)
+      .slice(0, 12)
+      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
+      .join('\n')
+    // 引用计数: 参与本次生成的全部条目 (频率→置信度依据)
+    const hits = [...rank(questions).slice(0, 12), ...rank(answers).slice(0, 12)]
+    for (const r of hits.slice(0, 24)) {
+      const isAnswer = rank(answers).slice(0, 12).includes(r)
+      await db
+        .run(
+          `UPDATE ${isAnswer ? 'kb_answers' : 'kb_questions'} SET ai_hit_count = ai_hit_count + 1, ai_last_used_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [r.id],
+        )
+        .catch(() => {})
+    }
+    return qStr || aStr ? `\n\n知识库参考 (卖家沉淀的问答, 优先按此风格与内容回复)：\n${qStr ? `常见问话：\n${qStr}\n` : ''}${aStr ? `标准回答：\n${aStr}` : ''}` : ''
+  } catch {
+    return ''
+  }
+}
+
 /** 意图类型: price=议价 / tech=技术售后 / default=通用客服。 */
 type AiIntent = 'price' | 'tech' | 'default'
 
@@ -1212,6 +1226,50 @@ async function getAiReply(
   const itemPrice = itemRow?.item_price || '未知'
   const itemDesc = itemRow?.item_detail || itemRow?.item_description || '暂无商品描述'
 
+  // 商品级三开关 (v2.3.0): 商品消息作知识库 / 同商品跨账号共享 / 账号回复风格
+  const useItemKb = !!itemConf && Number((itemConf as any).use_item_kb) === 1
+  const shareItemKb = !!itemConf && Number((itemConf as any).share_item_kb) === 1
+  const useAccountStyle = !!itemConf && Number((itemConf as any).use_account_style) === 1
+
+  let itemMsgContext = ''
+  if (useItemKb && msg.itemId) {
+    // 开关1: 使用商品消息作为知识库 —— 该商品的历史真实对话样本入上下文
+    // 开关2: 同商品消息跨账号共享 (不限 cookie_id)
+    const scopeSql = shareItemKb ? 'item_id = ?' : 'item_id = ? AND cookie_id = ?'
+    const scopeParams: unknown[] = shareItemKb ? [msg.itemId, cookieId] : [msg.itemId]
+    const rows = await db
+      .all<any>(
+        `SELECT direction, content FROM im_messages WHERE ${scopeSql} AND direction IN ('in','out') AND content_type = 'text'
+         ORDER BY id DESC LIMIT 30`,
+        scopeParams,
+      )
+      .catch(() => [])
+    const lines = rows
+      .reverse()
+      .slice(-20)
+      .map((r: any) => `${r.direction === 'in' ? '买家' : '卖家'}: ${String(r.content).slice(0, 120)}`)
+    if (lines.length) itemMsgContext = `\n\n本商品历史对话样本 (${shareItemKb ? '跨账号共享' : '本账号'})：\n${lines.join('\n')}`
+  }
+
+  let styleContext = ''
+  if (useAccountStyle) {
+    // 开关3: 使用当前账号回复风格 —— 该账号最近发出的消息样本提炼语气
+    const styleRows = await db
+      .all<any>(
+        `SELECT content FROM im_messages WHERE cookie_id = ? AND direction = 'out' AND content_type = 'text'
+         ORDER BY id DESC LIMIT 10`,
+        [cookieId],
+      )
+      .catch(() => [])
+    const samples = styleRows
+      .map((r: any) => String(r.content).slice(0, 100))
+      .filter(Boolean)
+    if (samples.length) styleContext = `\n\n当前账号历史回复风格样本 (语气/用语保持一致)：\n${samples.join('\n')}`
+  }
+
+  // 知识库上下文 (v2.3.0): 排序即优先级, 参与生成的条目计引用次数
+  const kbContext = await loadKbContext(db, msg.itemId)
+
   // 对话历史
   const history: { role: 'user' | 'assistant'; content: string }[] = []
   if (conf.context_enabled) {
@@ -1233,6 +1291,7 @@ async function getAiReply(
 商品标题: ${itemTitle}
 商品价格: ${itemPrice}元
 商品描述: ${itemDesc}
+${itemMsgContext}${styleContext}${kbContext}
 
 对话历史：
 ${historyStr || '（无）'}
