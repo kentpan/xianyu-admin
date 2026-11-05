@@ -73,16 +73,19 @@
             </div>
             <template v-else>
               <div v-for="m in msgs" :key="m.id" class="flex items-center gap-1.5 group" :class="m.direction === 'out' ? 'justify-end' : 'justify-start'">
-                <!-- 知识库 toggle 按钮 (v2.3.1): 买家消息右外侧 / 卖家消息左外侧, 常显不依赖 hover。
-                     + 白色加号棕黄圆 = 未添加, 点击添加到知识库; ✅ 绿圆 = 已添加, 再点一次从知识库移除。 -->
+                <!-- 知识库 toggle 按钮 (v2.3.1): 买家消息右外侧 / 卖家消息左外侧。
+                     ✅ 已添加 = 常显 (不依赖 hover); + 未添加 = hover 消息行才显现 (占位不跳动)。
+                     点击 + 添加到知识库变 ✅, 再点 ✅ 从知识库移除变回 +。 -->
                 <button
                   v-if="m.direction !== 'system'"
                   type="button"
-                  class="shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-white transition-transform active:scale-90"
+                  class="shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-white transition-opacity focus-visible:opacity-100"
                   :class="[
                     m.direction === 'in' ? 'order-last' : 'order-first',
-                    capturedSet.has(String(m.id)) ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-amber-500 hover:bg-amber-600',
-                    capturingId === String(m.id) ? 'animate-pulse pointer-events-none' : '',
+                    capturedSet.has(String(m.id))
+                      ? 'bg-emerald-500 hover:bg-emerald-600 opacity-100'
+                      : 'bg-amber-500 hover:bg-amber-600 opacity-0 group-hover:opacity-100',
+                    capturingId === String(m.id) ? '!opacity-100 animate-pulse pointer-events-none' : '',
                   ]"
                   :title="capturedSet.has(String(m.id)) ? '已添加到知识库, 点击移除' : '添加到知识库'"
                   :aria-label="capturedSet.has(String(m.id)) ? '从知识库移除' : '添加到知识库'"
