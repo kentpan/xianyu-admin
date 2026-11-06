@@ -21,6 +21,23 @@ export default defineEventHandler(
        ORDER BY c.created_at ASC`,
     )
 
+    // (v2.3.4) 引擎账号心跳快照: 代理状态心跳自 v2.3.4 起写单行快照 (system_settings,
+    // 每轮 1 行), cookies 逐账号行仅在状态变化时落库。快照新鲜 → 快照状态/时间优先
+    // (实时精度 = 心跳周期); 快照缺失或陈旧 (旧版代理未上报/快照链路异常) → 回落
+    // cookies.last_check_at 原判定 — 新旧代理与回滚场景完全兼容, 判定语义不变。
+    let hbSnap: Record<string, { t: number; s: string }> | null = null
+    try {
+      const hbRow = await db.get<{ value: string }>(
+        "SELECT value FROM system_settings WHERE key_name = 'engine_account_heartbeat'",
+      )
+      if (hbRow?.value) {
+        const parsed = JSON.parse(String(hbRow.value))
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) hbSnap = parsed
+      }
+    } catch {
+      /* 快照缺失/损坏 → 回落 cookies 判定 */
+    }
+
     const now = Date.now()
     const FRESH_MS = 60_000
     let managed = 0
@@ -32,13 +49,22 @@ export default defineEventHandler(
     // token 风控连败状态 (进程内共享): 连败 ≥2 且持有验证页链接 → 全局弹窗人工滑块
     const verifyMap = new Map(getAllVerifyStates().map((s) => [s.cookieId, s]))
 
+    // 快照时间戳 → SQLite CURRENT_TIMESTAMP 同格式 (YYYY-MM-DD HH:MM:SS, UTC 无 Z,
+    // 前端按 +Z 解析), 保持 last_check_at 输出格式不变
+    const fmtTs = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ')
+
     const accounts = rows.map((r) => {
       const statusText = r.cookie_status_text || ''
       const lastCheck = r.last_check_at
         ? new Date(r.last_check_at + 'Z').getTime() || new Date(r.last_check_at).getTime()
         : 0
-      const heartbeatFresh = !!lastCheck && now - lastCheck < FRESH_MS
-      const state = r.enabled ? (heartbeatFresh ? statusText || 'connecting' : 'engine_offline') : 'disabled'
+      const cookiesFresh = !!lastCheck && now - lastCheck < FRESH_MS
+      const hb = hbSnap ? hbSnap[String(r.id)] : undefined
+      const hbFresh = !!hb && Number.isFinite(hb.t) && now - hb.t < FRESH_MS
+      const heartbeatFresh = hbFresh || cookiesFresh
+      // 快照新鲜 → 快照状态文本优先 (代理上报的实时状态); 否则维持 cookies 状态文本
+      const effStatusText = hbFresh && hb!.s ? hb!.s : statusText
+      const state = r.enabled ? (heartbeatFresh ? effStatusText || 'connecting' : 'engine_offline') : 'disabled'
       const vs = verifyMap.get(r.id)
       const streak = vs?.streak || 0
       const needManualVerify =
@@ -56,8 +82,8 @@ export default defineEventHandler(
         username: r.username || '',
         enabled: !!r.enabled,
         state,
-        status_text: statusText,
-        last_check_at: r.last_check_at || null,
+        status_text: effStatusText,
+        last_check_at: hbFresh ? fmtTs(hb!.t) : r.last_check_at || null,
         token_fail_streak: streak,
         need_manual_verify: needManualVerify,
       }

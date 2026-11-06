@@ -29,6 +29,8 @@ export interface ImMessage {
   amount: string
   status_text: string
   msg_time: string | null
+  /** 1 = 由 AI 自动回复产生 (管理后台消息气泡显示 AI 徽标) */
+  is_ai?: number
 }
 
 export function getConversations(cookieId?: string, keyword?: string) {

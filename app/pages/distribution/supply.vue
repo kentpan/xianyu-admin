@@ -205,7 +205,7 @@
                       <Icon :name="p.collected ? 'star' : 'check'" :class="p.collected ? 'text-amber-500' : 'text-slate-400'" />
                     </button>
                   </td>
-                  <td class="text-xs text-slate-500">{{ formatTime(p.updated_at) }}</td>
+                  <td class="text-xs text-slate-500">{{ formatTimeFull(p.updated_at) }}</td>
                   <td>
                     <div class="flex items-center justify-end gap-1">
                       <button class="btn-primary !px-2 !py-1 !text-xs" title="转为卡券 (闭环: 卡券绑定闲鱼商品 → 自动回复)" @click="openToCard(p)">
@@ -657,13 +657,6 @@ async function submitToCard() {
   } finally {
     toCardSaving.value = false
   }
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

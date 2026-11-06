@@ -9,6 +9,66 @@ import { databaseFilePath } from '../../utils/db-config'
 /** Current isolate boot time — uptime source that works on every runtime. */
 const BOOT_AT = Date.now()
 
+/**
+ * (v2.3.5) DB 统计缓存: 原实现每次调用都对全部表逐个 COUNT(*) — 40+ 张表各一次
+ * 全表扫描, D1 下按各表总行数累计计读配额 (工作台 30s 轮询下是头号读放大源)。
+ * 改为 isolate 内存缓存: sqlite (本地, 便宜) 60s; D1/MySQL 10 分钟。
+ * 运行时长/内存等进程指标不受影响, 仍然实时。
+ */
+let _dbStatsCache: { at: number; driver: string; dbSize: number; tableCount: number; totalRows: number } | null = null
+const DB_STATS_TTL = (driver: string) => (driver === 'sqlite' ? 60_000 : 600_000)
+
+async function collectDbStats(db: any, driver: string): Promise<{ dbSize: number; tableCount: number; totalRows: number }> {
+  if (_dbStatsCache && _dbStatsCache.driver === driver && Date.now() - _dbStatsCache.at < DB_STATS_TTL(driver)) {
+    return { dbSize: _dbStatsCache.dbSize, tableCount: _dbStatsCache.tableCount, totalRows: _dbStatsCache.totalRows }
+  }
+
+  let dbSize = 0
+  let tableCount = 0
+  let totalRows = 0
+
+  if (driver === 'sqlite') {
+    try {
+      const fs = await import('node:fs')
+      const dbPath = databaseFilePath()
+      if (fs.existsSync(dbPath)) {
+        dbSize = fs.statSync(dbPath).size
+      }
+    } catch (e) {
+      console.log('[health] db file stat error:', e)
+    }
+    const tables = await db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").catch((e: any) => {
+      console.log('[health] sqlite tables query error:', e)
+      return []
+    })
+    tableCount = tables.length
+    for (const t of tables) {
+      const r = await db.get<{ c: number }>(`SELECT COUNT(*) as c FROM "${t.name}"`).catch((e: any) => {
+        console.log('[health] table count query error:', e)
+        return null
+      })
+      if (r) totalRows += r.c
+    }
+  } else {
+    // 非 sqlite 驱动（MySQL/D1/memory）：查询真实表数量，失败时保持 0
+    try {
+      if (driver === 'mysql') {
+        const r = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM information_schema.tables WHERE table_schema = DATABASE()')
+        tableCount = r?.c || 0
+      } else {
+        // D1/memory 基于 SQLite 引擎，可用 sqlite_master
+        const tables = await db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        tableCount = tables.length
+      }
+    } catch (e) {
+      console.log('[health] table count query error:', e)
+    }
+  }
+
+  _dbStatsCache = { at: Date.now(), driver, dbSize, tableCount, totalRows }
+  return { dbSize, tableCount, totalRows }
+}
+
 /** Call a Node-only metric, fall back silently when the runtime lacks it. */
 function tryMetric<T>(fn: () => T, fallback: T): T {
   try {
@@ -36,48 +96,9 @@ export default defineEventHandler(
 
     // DB stats — branch on the ADAPTER's real driver (on Cloudflare the sqlite
     // config auto-adapts to D1, state.dbDriver alone would misroute the branch)
+    // (v2.3.5) 带缓存的统一采集器, 消除轮询下的逐表 COUNT 放大
     const driver = db.driver || state.dbDriver
-    let dbSize = 0
-    let tableCount = 0
-    let totalRows = 0
-
-    if (driver === 'sqlite') {
-      try {
-        const fs = await import('node:fs')
-        const dbPath = databaseFilePath()
-        if (fs.existsSync(dbPath)) {
-          dbSize = fs.statSync(dbPath).size
-        }
-      } catch (e) {
-        console.log('[health] db file stat error:', e)
-      }
-      const tables = await db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").catch((e: any) => {
-        console.log('[health] sqlite tables query error:', e)
-        return []
-      })
-      tableCount = tables.length
-      for (const t of tables) {
-        const r = await db.get<{ c: number }>(`SELECT COUNT(*) as c FROM "${t.name}"`).catch((e: any) => {
-          console.log('[health] table count query error:', e)
-          return null
-        })
-        if (r) totalRows += r.c
-      }
-    } else {
-      // 非 sqlite 驱动（MySQL/D1/memory）：查询真实表数量，失败时保持 0
-      try {
-        if (driver === 'mysql') {
-          const r = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM information_schema.tables WHERE table_schema = DATABASE()')
-          tableCount = r?.c || 0
-        } else {
-          // D1/memory 基于 SQLite 引擎，可用 sqlite_master
-          const tables = await db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-          tableCount = tables.length
-        }
-      } catch (e) {
-        console.log('[health] table count query error:', e)
-      }
-    }
+    const { dbSize, tableCount, totalRows } = await collectDbStats(db, driver)
 
     return ok({
       uptime,

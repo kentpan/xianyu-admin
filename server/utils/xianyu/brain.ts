@@ -39,7 +39,7 @@ import { isGatewayMode } from './gateway'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 
 export type EngineAction =
-  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number }
+  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number; is_ai?: boolean }
   | {
       type: 'send_image'
       account: string
@@ -50,6 +50,7 @@ export type EngineAction =
       height: number
       delay_ms: number
       log_id?: number
+      is_ai?: boolean
     }
 
 interface BrainOptions {
@@ -172,7 +173,9 @@ async function emitReplyActions(
     reply_text: fields.reply_text,
     send_status: 'pending',
   })
-  return actions.map((a) => ({ ...a, log_id: logId }))
+  // AI 标志 (v2.3.0): reply_strategy=ai 的 action 随单打 is_ai 标记, 发送落库时写入
+  // im_messages.is_ai —— 仅管理后台消息页展示 AI 徽标, 对买家完全透明
+  return actions.map((a) => ({ ...a, log_id: logId, is_ai: fields.reply_strategy === 'ai' ? true : a.is_ai }))
 }
 
 /**
@@ -520,8 +523,12 @@ export async function handleChatEvent(
   }
 
   // 2) AI 回复 (意图识别 + 议价控制 + 商品上下文)
+  // 最小回复延迟 (v2.3.0 定版): AI 回复自身不设独立延迟, 取「自动回复」与「指定商品回复」
+  // 中已配置的延迟作为最小回复延迟时间 (两者取大; 无配置则 0 不等)
+  const aiMinDelay = await resolveAiMinDelay(db, cookieId, msg.itemId)
   const aiReply = await getAiReply(db, cookieId, msg)
   if (aiReply) {
+    if (!(await delayedReplyWait(db, cookieId, msg, opts, aiMinDelay, 'ai'))) return []
     return emitReplyActions(db, cookieId, msg, opts, [textAction(cookieId, msg, applyVars(aiReply, vars), 0)], {
       reply_strategy: 'ai',
       reply_text: aiReply,
@@ -1012,6 +1019,79 @@ async function matchKeywordReply(
 
 /* ---------------------------------- AI 回复 (语义对齐 butler ai_reply_engine) ---------------------------------- */
 
+/**
+ * AI 最小回复延迟 (v2.3.0 定版): AI 回复自身不设独立延迟时间, 取「自动回复」
+ * (keywords.delay_seconds) 与「指定商品回复」(item_replay.delay_seconds, 绑定当前
+ * 商品) 中已配置的延迟作为最小回复延迟时间 (两者取大, 无配置为 0 不等)。
+ */
+async function resolveAiMinDelay(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId?: string,
+): Promise<number> {
+  const kw = await db
+    .get<{ m: number }>('SELECT COALESCE(MAX(delay_seconds), 0) m FROM keywords WHERE cookie_id = ?', [cookieId])
+    .catch(() => ({ m: 0 }))
+  const ir = itemId
+    ? await db
+        .get<{ m: number }>('SELECT COALESCE(MAX(delay_seconds), 0) m FROM item_replay WHERE cookie_id = ? AND item_id = ?', [
+          cookieId,
+          itemId,
+        ])
+        .catch(() => ({ m: 0 }))
+    : ({ m: 0 } as { m: number })
+  return Math.max(Number(kw?.m || 0), Number(ir?.m || 0))
+}
+
+/** 知识库检索条数上限 (按 sort 优先级取前 N 条拼入 prompt, 防止 prompt 膨胀)。 */
+const KB_CONTEXT_LIMIT = 20
+
+/**
+ * AI 知识库上下文 (v2.3.0): 按排序 (sort 即优先级) 取问话+回答拼入 prompt;
+ * 参与本次生成的条目 ai_hit_count+1 (引用统计 → 置信度 → 优先级 → 自我进化依据)。
+ * 可选商品过滤 (item_id 检索加仅本商品相关条目优先), 知识库本身全局共享 (跨账号)。
+ */
+async function loadKbContext(db: Awaited<ReturnType<typeof getDb>>, itemId?: string): Promise<string> {
+  try {
+    const questions = await db.all<any>(
+      `SELECT id, content, item_id FROM kb_questions ORDER BY sort ASC, id ASC LIMIT ?`,
+      [KB_CONTEXT_LIMIT],
+    )
+    const answers = await db.all<any>(
+      `SELECT id, content, item_id FROM kb_answers ORDER BY sort ASC, id ASC LIMIT ?`,
+      [KB_CONTEXT_LIMIT],
+    )
+    if (!questions.length && !answers.length) return ''
+    // 商品绑定优先: 与当前商品相关的条目排在前面 (双序: sort 优先级 + 商品相关性加成)
+    const rank = (rows: any[]) => {
+      if (!itemId) return rows
+      return [...rows.filter((r) => String(r.item_id || '') === String(itemId)), ...rows.filter((r) => String(r.item_id || '') !== String(itemId))]
+    }
+    const qStr = rank(questions)
+      .slice(0, 12)
+      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
+      .join('\n')
+    const aStr = rank(answers)
+      .slice(0, 12)
+      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
+      .join('\n')
+    // 引用计数: 参与本次生成的全部条目 (频率→置信度依据)
+    const hits = [...rank(questions).slice(0, 12), ...rank(answers).slice(0, 12)]
+    for (const r of hits.slice(0, 24)) {
+      const isAnswer = rank(answers).slice(0, 12).includes(r)
+      await db
+        .run(
+          `UPDATE ${isAnswer ? 'kb_answers' : 'kb_questions'} SET ai_hit_count = ai_hit_count + 1, ai_last_used_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [r.id],
+        )
+        .catch(() => {})
+    }
+    return qStr || aStr ? `\n\n知识库参考 (卖家沉淀的问答, 优先按此风格与内容回复)：\n${qStr ? `常见问话：\n${qStr}\n` : ''}${aStr ? `标准回答：\n${aStr}` : ''}` : ''
+  } catch {
+    return ''
+  }
+}
+
 /** 意图类型: price=议价 / tech=技术售后 / default=通用客服。 */
 type AiIntent = 'price' | 'tech' | 'default'
 
@@ -1146,6 +1226,50 @@ async function getAiReply(
   const itemPrice = itemRow?.item_price || '未知'
   const itemDesc = itemRow?.item_detail || itemRow?.item_description || '暂无商品描述'
 
+  // 商品级三开关 (v2.3.0): 商品消息作知识库 / 同商品跨账号共享 / 账号回复风格
+  const useItemKb = !!itemConf && Number((itemConf as any).use_item_kb) === 1
+  const shareItemKb = !!itemConf && Number((itemConf as any).share_item_kb) === 1
+  const useAccountStyle = !!itemConf && Number((itemConf as any).use_account_style) === 1
+
+  let itemMsgContext = ''
+  if (useItemKb && msg.itemId) {
+    // 开关1: 使用商品消息作为知识库 —— 该商品的历史真实对话样本入上下文
+    // 开关2: 同商品消息跨账号共享 (不限 cookie_id)
+    const scopeSql = shareItemKb ? 'item_id = ?' : 'item_id = ? AND cookie_id = ?'
+    const scopeParams: unknown[] = shareItemKb ? [msg.itemId, cookieId] : [msg.itemId]
+    const rows = await db
+      .all<any>(
+        `SELECT direction, content FROM im_messages WHERE ${scopeSql} AND direction IN ('in','out') AND content_type = 'text'
+         ORDER BY id DESC LIMIT 30`,
+        scopeParams,
+      )
+      .catch(() => [])
+    const lines = rows
+      .reverse()
+      .slice(-20)
+      .map((r: any) => `${r.direction === 'in' ? '买家' : '卖家'}: ${String(r.content).slice(0, 120)}`)
+    if (lines.length) itemMsgContext = `\n\n本商品历史对话样本 (${shareItemKb ? '跨账号共享' : '本账号'})：\n${lines.join('\n')}`
+  }
+
+  let styleContext = ''
+  if (useAccountStyle) {
+    // 开关3: 使用当前账号回复风格 —— 该账号最近发出的消息样本提炼语气
+    const styleRows = await db
+      .all<any>(
+        `SELECT content FROM im_messages WHERE cookie_id = ? AND direction = 'out' AND content_type = 'text'
+         ORDER BY id DESC LIMIT 10`,
+        [cookieId],
+      )
+      .catch(() => [])
+    const samples = styleRows
+      .map((r: any) => String(r.content).slice(0, 100))
+      .filter(Boolean)
+    if (samples.length) styleContext = `\n\n当前账号历史回复风格样本 (语气/用语保持一致)：\n${samples.join('\n')}`
+  }
+
+  // 知识库上下文 (v2.3.0): 排序即优先级, 参与生成的条目计引用次数
+  const kbContext = await loadKbContext(db, msg.itemId)
+
   // 对话历史
   const history: { role: 'user' | 'assistant'; content: string }[] = []
   if (conf.context_enabled) {
@@ -1167,6 +1291,7 @@ async function getAiReply(
 商品标题: ${itemTitle}
 商品价格: ${itemPrice}元
 商品描述: ${itemDesc}
+${itemMsgContext}${styleContext}${kbContext}
 
 对话历史：
 ${historyStr || '（无）'}

@@ -19,93 +19,51 @@
       <StatCard label="商品数量" :value="stats.totalItems" icon="items" color="slate" />
     </div>
 
-    <!-- D1 数据库用量核心指标 (v2.3.5) -->
+    <!-- D1 读写配额核心指标 (v2.3.5): 免费层每日限额实时可见 -->
     <div class="card p-5">
-      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <div class="flex items-center gap-2">
-          <Icon name="database" class="text-emerald-500" />
-          <h3 class="font-semibold text-slate-900 dark:text-white">数据库用量</h3>
-          <span
-            class="badge"
-            :class="d1.driver === 'd1' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400'"
-          >
-            {{ (d1.driver || 'sqlite').toUpperCase() }}
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div class="flex items-center gap-2 flex-wrap">
+          <h3 class="font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+            <Icon name="database" class="text-emerald-500" /> D1 数据库配额
+          </h3>
+          <span class="badge" :class="d1Metrics?.source === 'exact' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400'">
+            {{ d1Metrics?.source === 'exact' ? 'D1 精确计量' : '本地估算' }}
           </span>
-          <span v-if="d1.metered && d1.today.readPercent >= 85" class="badge bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300">
-            行读告急 {{ d1.today.readPercent }}%
+          <span class="badge bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400">{{ d1Metrics?.day || '—' }} (UTC)</span>
+          <span v-if="d1Metrics" class="badge" :class="meterTextClass(d1Metrics.readStatus) === 'text-emerald-600 dark:text-emerald-400' && meterTextClass(d1Metrics.writeStatus) === 'text-emerald-600 dark:text-emerald-400' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'">
+            读{{ D1_STATUS_LABEL[d1Metrics.readStatus] }} · 写{{ D1_STATUS_LABEL[d1Metrics.writeStatus] }}
           </span>
         </div>
-        <div class="flex items-center gap-2 text-xs text-slate-400">
-          <span>配额重置 <span class="tabular-nums text-slate-600 dark:text-slate-300">{{ countdownLabel }}</span></span>
-          <button class="btn-ghost !px-2 !py-1" title="刷新计量" @click="loadD1Metrics">
-            <Icon name="refresh" :class="d1Loading ? 'animate-spin' : ''" />
-          </button>
+        <div class="text-right">
+          <p class="text-xs text-slate-400">UTC 午夜重置</p>
+          <p class="text-sm font-medium text-slate-800 dark:text-slate-100 tabular-nums">{{ resetCountdown }}后</p>
         </div>
       </div>
-
-      <div v-if="d1.loaded" class="space-y-4">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <!-- 行读 -->
-          <div>
-            <div class="flex items-center justify-between mb-1.5">
-              <span class="text-sm text-slate-500">今日行读</span>
-              <span class="text-sm font-medium tabular-nums" :class="readTextColor">
-                {{ d1.today.rowsRead.toLocaleString() }} / {{ compact(d1.limits.reads) }}
-              </span>
-            </div>
-            <div class="h-2.5 rounded-full bg-slate-100 dark:bg-slate-700 overflow-hidden">
-              <div
-                class="h-full rounded-full transition-all duration-500"
-                :class="readBarColor"
-                :style="{ width: barWidth(d1.today.readPercent) + '%' }"
-              />
-            </div>
-            <p class="text-xs text-slate-400 mt-1">
-              已用 {{ d1.today.readPercent }}% · 免费层 {{ compact(d1.limits.reads) }} 行/天 (UTC 重置)
-            </p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-sm text-slate-500">今日读取行数</span>
+            <span class="text-sm font-medium text-slate-800 dark:text-slate-100 tabular-nums">{{ formatNum(d1Metrics?.rowsRead) }} / {{ formatNum(d1Metrics?.limits?.read) }}</span>
           </div>
-          <!-- 行写 -->
-          <div>
-            <div class="flex items-center justify-between mb-1.5">
-              <span class="text-sm text-slate-500">今日行写</span>
-              <span class="text-sm font-medium tabular-nums" :class="writeTextColor">
-                {{ d1.today.rowsWritten.toLocaleString() }} / {{ compact(d1.limits.writes) }}
-              </span>
-            </div>
-            <div class="h-2.5 rounded-full bg-slate-100 dark:bg-slate-700 overflow-hidden">
-              <div
-                class="h-full rounded-full transition-all duration-500"
-                :class="writeBarColor"
-                :style="{ width: barWidth(d1.today.writePercent) + '%' }"
-              />
-            </div>
-            <p class="text-xs text-slate-400 mt-1">
-              已用 {{ d1.today.writePercent }}% · 免费层 {{ compact(d1.limits.writes) }} 行/天 (UTC 重置)
-            </p>
+          <div class="h-2 rounded-full bg-slate-100 dark:bg-slate-700 overflow-hidden">
+            <div class="h-full rounded-full transition-all duration-500" :class="meterBarClass(d1Metrics?.readPct || 0)" :style="{ width: Math.min(100, d1Metrics?.readPct || 0) + '%' }" />
           </div>
+          <p class="text-xs mt-1 tabular-nums" :class="d1Metrics ? meterTextClass(d1Metrics.readStatus) : 'text-slate-400'">
+            已用 {{ d1Metrics?.readPct ?? 0 }}% · {{ formatNum(d1Metrics?.readQueries) }} 次读查询
+          </p>
         </div>
-
-        <div class="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-400">
-          <span>今日查询 <span class="tabular-nums text-slate-600 dark:text-slate-300">{{ d1.today.queryCount.toLocaleString() }}</span> 次</span>
-          <span>本实例启动以来 读 {{ compact(d1.live.rowsRead) }} / 写 {{ compact(d1.live.rowsWritten) }} · 运行 {{ uptimeLabel }}</span>
-          <span v-if="!d1.metered" class="text-amber-600 dark:text-amber-400">当前驱动非 D1，不产生 D1 配额消耗（行读为近似口径）</span>
-        </div>
-
-        <details v-if="d1.topQueries.length">
-          <summary class="text-xs text-slate-400 cursor-pointer select-none hover:text-slate-600 dark:hover:text-slate-300">
-            高消耗 SQL Top {{ d1.topQueries.length }}（本实例，按行读排序）
-          </summary>
-          <div class="mt-2 space-y-1.5 max-h-40 overflow-y-auto scrollbar-thin">
-            <div v-for="q in d1.topQueries" :key="q.sql" class="flex items-center gap-3 text-xs">
-              <span class="w-20 text-right tabular-nums text-slate-500 shrink-0">{{ compact(q.rowsRead) }} 行读</span>
-              <span class="w-12 text-right tabular-nums text-slate-400 shrink-0">×{{ q.count }}</span>
-              <code class="flex-1 truncate font-mono text-slate-600 dark:text-slate-300" :title="q.sql">{{ q.sql }}</code>
-            </div>
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-sm text-slate-500">今日写入行数</span>
+            <span class="text-sm font-medium text-slate-800 dark:text-slate-100 tabular-nums">{{ formatNum(d1Metrics?.rowsWritten) }} / {{ formatNum(d1Metrics?.limits?.write) }}</span>
           </div>
-        </details>
-      </div>
-      <div v-else class="h-16 flex items-center justify-center text-sm text-slate-400">
-        <Icon name="refresh" class="animate-spin mr-2" /> 加载计量中…
+          <div class="h-2 rounded-full bg-slate-100 dark:bg-slate-700 overflow-hidden">
+            <div class="h-full rounded-full transition-all duration-500" :class="meterBarClass(d1Metrics?.writePct || 0)" :style="{ width: Math.min(100, d1Metrics?.writePct || 0) + '%' }" />
+          </div>
+          <p class="text-xs mt-1 tabular-nums" :class="d1Metrics ? meterTextClass(d1Metrics.writeStatus) : 'text-slate-400'">
+            已用 {{ d1Metrics?.writePct ?? 0 }}% · {{ formatNum(d1Metrics?.writeQueries) }} 次写查询
+          </p>
+        </div>
       </div>
     </div>
 
@@ -366,7 +324,7 @@
 
 <script setup lang="ts">
 import { getDashboardStats, getDashboardTrend, getDashboardHealth, getDashboardOnline, getDashboardComparison, getDashboardActivity, getDashboardD1Metrics, getDashboardReportUrl } from '~/api/dashboard'
-import type { DashboardStats, TrendDay, ActivityItem, OnlineAccount, D1MetricsResponse } from '~/api/dashboard'
+import type { DashboardStats, TrendDay, ActivityItem, OnlineAccount, D1UsageSnapshot } from '~/api/dashboard'
 
 definePageMeta({ layout: 'default' })
 
@@ -402,6 +360,39 @@ async function loadOnlineStatus() {
     // silent
   }
 }
+
+// D1 读写配额核心指标 (v2.3.5): 免费层 500 万行读/10 万行写每天 (UTC 午夜重置)
+const d1Metrics = ref<D1UsageSnapshot | null>(null)
+async function loadD1Metrics() {
+  try {
+    d1Metrics.value = await getDashboardD1Metrics()
+  } catch {
+    // silent
+  }
+}
+
+function formatNum(n?: number): string {
+  return (n ?? 0).toLocaleString('zh-CN')
+}
+
+function meterBarClass(pct: number): string {
+  return pct >= 90 ? 'bg-rose-500' : pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
+}
+
+function meterTextClass(status: string): string {
+  return status === 'exceeded' || status === 'danger' ? 'text-rose-600 dark:text-rose-400'
+    : status === 'warn' ? 'text-amber-600 dark:text-amber-400'
+    : 'text-emerald-600 dark:text-emerald-400'
+}
+
+const D1_STATUS_LABEL: Record<string, string> = { ok: '充足', warn: '偏高', danger: '告急', exceeded: '已超限' }
+
+const resetCountdown = computed(() => {
+  const s = d1Metrics.value?.resetInSeconds || 0
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  return `${h}小时${m}分`
+})
 
 // System health
 const health = ref<any>({
@@ -468,79 +459,6 @@ async function loadActivity() {
   }
 }
 
-// ── D1 数据库用量核心指标 (v2.3.5) ──────────────────────────────────
-const d1Loading = ref(false)
-const d1 = ref<D1MetricsResponse & { loaded?: boolean }>({
-  driver: 'sqlite',
-  metered: false,
-  dateUtc: '',
-  limits: { reads: 5_000_000, writes: 100_000 },
-  today: { rowsRead: 0, rowsWritten: 0, queryCount: 0, readPercent: 0, writePercent: 0 },
-  resetInSec: 0,
-  live: { rowsRead: 0, rowsWritten: 0, queryCount: 0, pendingReads: 0, pendingWrites: 0, uptimeSec: 0 },
-  topQueries: [],
-  history: [],
-  loaded: false,
-})
-
-async function loadD1Metrics() {
-  d1Loading.value = true
-  try {
-    const data = await getDashboardD1Metrics()
-    d1.value = { ...data, loaded: true }
-    resetCountdown.value = data.resetInSec
-  } catch {
-    // silent — 计量失败不影响主功能
-  } finally {
-    d1Loading.value = false
-  }
-}
-
-function compact(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
-  if (n >= 10_000) return `${(n / 10_000).toFixed(1)}万`
-  return n.toLocaleString()
-}
-
-function barWidth(pct: number): number {
-  return Math.min(100, Math.max(pct, pct > 0 ? 1.5 : 0))
-}
-
-function usageBarColor(pct: number): string {
-  if (pct >= 85) return 'bg-rose-500'
-  if (pct >= 60) return 'bg-amber-500'
-  return 'bg-emerald-500'
-}
-
-function usageTextColor(pct: number): string {
-  if (pct >= 85) return 'text-rose-600 dark:text-rose-400'
-  if (pct >= 60) return 'text-amber-600 dark:text-amber-400'
-  return 'text-slate-800 dark:text-slate-100'
-}
-
-const readBarColor = computed(() => usageBarColor(d1.value.today.readPercent))
-const readTextColor = computed(() => usageTextColor(d1.value.today.readPercent))
-const writeBarColor = computed(() => usageBarColor(d1.value.today.writePercent))
-const writeTextColor = computed(() => usageTextColor(d1.value.today.writePercent))
-
-// 重置倒计时: 本地每秒递减 (零网络开销), 60s 轮询时与服务端重新同步
-const resetCountdown = ref(0)
-const countdownLabel = computed(() => {
-  const s = Math.max(0, resetCountdown.value)
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const sec = s % 60
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
-})
-
-const uptimeLabel = computed(() => {
-  const s = d1.value.live.uptimeSec
-  if (!s) return '—'
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  return h > 0 ? `${h}小时${m}分` : `${m}分钟`
-})
-
 function relativeTime(ts: number): string {
   if (!ts) return '—'
   const diff = Date.now() - ts
@@ -599,6 +517,7 @@ async function reload() {
     loadOnlineStatus() // fire & forget
     loadHealth() // fire & forget
     loadComparison() // fire & forget
+    loadD1Metrics() // fire & forget
   } catch (e: any) {
     // silent on dashboard
   } finally {
@@ -606,62 +525,41 @@ async function reload() {
   }
 }
 
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(t)
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
 function logDotClass(level: string) {
   return {
     INFO: 'bg-sky-400', WARN: 'bg-amber-400', ERROR: 'bg-red-500', DEBUG: 'bg-slate-400',
   }[level] || 'bg-slate-400'
 }
 
-// ── 轮询节流 (v2.3.5 D1 额度保卫战) ──────────────────────────────
-// ① 轻轮询 30s → 60s (活动流/在线状态/D1 计量三合一, 单一 timer)
-// ② 页面隐藏时完全暂停 (visibilitychange 感知, 后台标签页零网络请求)
-// ③ 页面重新可见立即补一次, 不等下一个 60s tick
-// ④ 全量刷新 (统计/趋势/健康/对照) 只在挂载/手动刷新/全局刷新事件触发
-let _lightTimer: ReturnType<typeof setInterval> | null = null
-let _countdownTimer: ReturnType<typeof setInterval> | null = null
+// (v2.3.5) 轮询降频 30s → 60s 且页面隐藏时暂停: D1 免费层按扫描行数计读配额,
+// 后台标签页持续轮询是纯浪费; 回到前台立即刷一次保证数据新鲜
+const POLL_MS = 60_000
+let _activityTimer: ReturnType<typeof setInterval> | null = null
 
-function isPageVisible(): boolean {
-  return typeof document === 'undefined' || document.visibilityState === 'visible'
-}
-
-function pollLight() {
-  if (!isPageVisible()) return // 隐藏时零网络请求
+function pollTick() {
+  if (document.hidden) return
   loadActivity()
   loadOnlineStatus()
   loadD1Metrics()
 }
 
 function onVisibilityChange() {
-  if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-    pollLight() // 回到前台立即补一次
-  }
+  if (!document.hidden) reload()
 }
 
 onMounted(() => {
   reload()
-  loadD1Metrics()
   if (import.meta.client) {
     window.addEventListener('app:refresh', reload)
     document.addEventListener('visibilitychange', onVisibilityChange)
-    _lightTimer = setInterval(pollLight, 60_000)
-    // 倒计时本地递减 (纯 UI, 无网络请求), 走零轮询节流
-    _countdownTimer = setInterval(() => {
-      if (resetCountdown.value > 0) resetCountdown.value--
-    }, 1000)
+    _activityTimer = setInterval(pollTick, POLL_MS)
   }
 })
 onBeforeUnmount(() => {
   if (import.meta.client) {
     window.removeEventListener('app:refresh', reload)
     document.removeEventListener('visibilitychange', onVisibilityChange)
-    if (_lightTimer) clearInterval(_lightTimer)
-    if (_countdownTimer) clearInterval(_countdownTimer)
+    if (_activityTimer) clearInterval(_activityTimer)
   }
 })
 </script>

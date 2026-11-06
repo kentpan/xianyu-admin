@@ -105,6 +105,18 @@ export default defineEventHandler(
       errors.push(`已删除屏蔽: 跳过 ${skippedDeleted} 条曾手动删除的订单 (不再拉回)`)
     }
 
+    // (v2.3.0) 存量全量标记回填: v2.2.6 起的存量订单首次插入时未打 full_sync 标
+    // (旧版只在 ON CONFLICT 更新分支打标), 导致趋势 tab 全量口径查不到 —
+    // 每次全量同步后把已添加账号的无标记订单统一纳入全量口径 (幂等, 影响面=零标记单)
+    try {
+      await db.run(
+        `UPDATE orders SET sync_source = 'full_sync'
+         WHERE sync_source = '' AND cookie_id IN (SELECT id FROM cookies)`,
+      )
+    } catch (e: any) {
+      errors.push(`存量全量标记回填失败: ${String(e?.message || e).slice(0, 100)}`)
+    }
+
     return ok(
       {
         inserted,

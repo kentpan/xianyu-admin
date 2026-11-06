@@ -75,7 +75,7 @@
                   </span>
                   <p v-if="s.reject_reason" class="text-xs text-rose-500 mt-0.5 max-w-[180px] truncate" :title="s.reject_reason">{{ s.reject_reason }}</p>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(s.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(s.created_at) }}</td>
                 <td>
                   <div class="flex items-center justify-end gap-1">
                     <button
@@ -264,13 +264,6 @@ async function markPaid(s: AdminSettlementRecord) {
 function onQrError(e: Event) {
   const img = e.target as HTMLImageElement
   img.style.display = 'none'
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(String(t).replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

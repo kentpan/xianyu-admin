@@ -1,223 +1,209 @@
 /**
- * D1 Metrics — 数据库读写行数计量 (v2.3.5「D1 免费额度保卫战」核心)
+ * D1 用量计数器 (v2.3.5) — 把免费层读配额从黑盒变成工作台核心指标。
  *
- * 背景: Cloudflare D1 免费层每日限额 (UTC 午夜重置) — 行读 5,000,000 / 行写
- * 100,000, 超限当天所有查询直接 500 (D1_ERROR: exceeded daily row read limit)。
- * 本模块给统一 DB 适配层装上「电表」, 让用量在 dashboard 上作为核心指标可见:
+ * 数据来源分两级:
+ *  - d1 驱动  : D1 响应 meta.rows_read / meta.rows_written 是引擎回报的真实
+ *               扫描行数 (与 Cloudflare 计费口径一致) → 精确值 (source: 'exact')。
+ *  - 其他驱动 : sqlite/mysql/memory 按返回行数/受影响行数估算 → 参考值
+ *               (source: 'estimate', 本地开发时仪表盘同样有数可看)。
  *
- *   1. 抄表 — 每条 SQL 执行后从 D1 meta.rows_read / meta.rows_written 精确累计
- *      (Cloudflare 官方配额口径即此二值; sqlite 驱动无 meta, 行读记 0 / 行写抄
- *      changes 近似值, 计量行为一致但数字含义按驱动区分)
- *   2. 实时视图 — isolate 内存聚合 (本实例启动以来累计 + 待落账增量) +
- *      高消耗 SQL Top-N 排行 (按行读排序, 容量封顶 40 条, 淘汰最便宜条目)
- *   3. 落账 — 节流 60s 把增量原子 UPSERT 进 d1_metrics 表 (UTC 日期为主键,
- *      一天一行, INSERT..ON CONFLICT 永不读改写): dashboard 计量端点强制
- *      flush 后读表, 写路径 (run/exec) 顺带节流落账 — 跨 isolate 的全局日
- *      累计 = 表内值, 引擎 isolate 不经过 dashboard 也能在写库时落账
+ * 设计红线: 计数器本身不得成为新的读放大源。
+ *  - 计数只发生在 isolate 内存 (纯变量自增, 零额外查询);
+ *  - 落盘节流 60s 且有增量才写 (每天每 isolate 最多 1440 行 UPSERT, 可忽略);
+ *  - 仪表盘读取前强制落盘再读台账 (isolate 回收最多丢最后 60s 增量, 不重复计);
+ *  - 落盘用「增量 UPSERT」: 每个 isolate 只写自己自上次落盘以来的 delta,
+ *    多 isolate 并发各自累加, 天然求和, 重启不重复计。
  *
- * 计量自馈保护: SQL 命中 d1_metrics 表自身的读写一律不计入 (电表不给电表充电)。
- * 落账失败的增量归还待落账池, 下个周期重试, 绝不丢账也不重复计数。
+ * 配额口径: D1 免费层 500 万行读/天 + 10 万行写/天, UTC 午夜重置。
  */
-import type { DatabaseAdapter } from './db'
 
-/** D1 免费层每日行读限额 (官方 limits 文档, UTC 午夜重置) */
+/** 免费层每日限额 (与 Cloudflare 官方文档一致) */
 export const D1_FREE_READ_LIMIT = 5_000_000
-/** D1 免费层每日行写限额 */
 export const D1_FREE_WRITE_LIMIT = 100_000
-/** 落账节流窗口: 每 isolate 至多 60s 一次 UPSERT (≤1440 行写/天/isolate) */
-export const D1_METRICS_FLUSH_MS = 60_000
 
-interface QueryStat {
-  sql: string
-  count: number
+interface DayCounters {
+  day: string
   rowsRead: number
   rowsWritten: number
-  lastAt: number
+  readQueries: number
+  writeQueries: number
+  /** 已落盘的量 (用于计算 delta, 防重复计) */
+  flushedRead: number
+  flushedWritten: number
+  flushedReadQueries: number
+  flushedWriteQueries: number
 }
 
-export interface D1LiveMetrics {
-  rowsRead: number
-  rowsWritten: number
-  queryCount: number
-  bootAt: number
-  lastFlushAt: number
-  pendingReads: number
-  pendingWrites: number
-  pendingQueries: number
-  topQueries: QueryStat[]
-}
-
-export interface D1MetricsDelta {
-  rowsRead: number
-  rowsWritten: number
-  queryCount: number
-}
-
-/** isolate 内存电表 (启动以来累计) */
-const live = {
-  rowsRead: 0,
-  rowsWritten: 0,
-  queryCount: 0,
-  bootAt: Date.now(),
+const state = {
+  cur: null as DayCounters | null,
   lastFlushAt: 0,
-  pendingReads: 0,
-  pendingWrites: 0,
-  pendingQueries: 0,
+  /** 落盘节流窗口 (ms) — 有增量时最多每 60s 写一次台账 */
+  FLUSH_INTERVAL_MS: 60_000,
 }
 
-/** 高消耗 SQL 排行 (按归一化语句聚合) */
-const topMap = new Map<string, QueryStat>()
-const TOP_CAP = 40
-
-let flushing = false
-
-/** 归一化 SQL: 字面量 → ?, 便于按语句形态聚合消耗 */
-function normSql(sql: string): string {
-  return sql
-    .replace(/'[^']*'/g, '?')
-    .replace(/\b\d+\b/g, '?')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160)
-}
-
-/**
- * 抄表入口 (由 DB 适配层每条 SQL 执行后调用)。
- * d1_metrics 表自身的读写跳过 — 落账动作不污染计量。
- */
-export function recordQuery(sql: string, rowsRead: number, rowsWritten: number, count = 1): void {
-  if (!sql || /d1_metrics/i.test(sql)) return
-  const n = Math.max(0, Number(rowsRead) || 0)
-  const w = Math.max(0, Number(rowsWritten) || 0)
-  live.queryCount += count
-  live.rowsRead += n
-  live.rowsWritten += w
-  live.pendingQueries += count
-  live.pendingReads += n
-  live.pendingWrites += w
-
-  const key = normSql(sql)
-  const cur = topMap.get(key)
-  if (cur) {
-    cur.count += count
-    cur.rowsRead += n
-    cur.rowsWritten += w
-    cur.lastAt = Date.now()
-    return
-  }
-  if (topMap.size >= TOP_CAP) {
-    // 榜满: 淘汰累计消耗最低的一条; 新条目比榜上最便宜的还便宜则不入榜
-    let cheapestKey: string | null = null
-    let cheapestCost = Infinity
-    for (const [k, v] of topMap) {
-      const cost = v.rowsRead + v.rowsWritten
-      if (cost < cheapestCost) {
-        cheapestCost = cost
-        cheapestKey = k
-      }
-    }
-    if (cheapestKey && cheapestCost <= n + w) return
-    if (cheapestKey) topMap.delete(cheapestKey)
-  }
-  topMap.set(key, { sql: key, count, rowsRead: n, rowsWritten: w, lastAt: Date.now() })
-}
-
-/** 当前 UTC 日期 (D1 配额按 UTC 午夜重置, 与官方口径对齐) */
-export function utcDateStr(d: Date = new Date()): string {
+/** 当前 UTC 日 (D1 配额按 UTC 午夜重置) */
+export function utcDay(d = new Date()): string {
   return d.toISOString().slice(0, 10)
 }
 
-/** 距下一个 UTC 午夜的秒数 (配额重置倒计时) */
-export function secondsUntilUtcMidnight(now: number = Date.now()): number {
-  const t = new Date(now)
-  const next = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + 1)
-  return Math.max(0, Math.floor((next - now) / 1000))
-}
-
-/** 实时计量快照 (Top SQL 按行读降序) */
-export function getLiveD1Metrics(): D1LiveMetrics {
-  const topQueries = [...topMap.values()].sort((a, b) => b.rowsRead - a.rowsRead)
-  return {
-    rowsRead: live.rowsRead,
-    rowsWritten: live.rowsWritten,
-    queryCount: live.queryCount,
-    bootAt: live.bootAt,
-    lastFlushAt: live.lastFlushAt,
-    pendingReads: live.pendingReads,
-    pendingWrites: live.pendingWrites,
-    pendingQueries: live.pendingQueries,
-    topQueries,
+function counters(): DayCounters {
+  const day = utcDay()
+  if (!state.cur || state.cur.day !== day) {
+    // UTC 日切换: 旧日残余 delta 已在上次 flush 落盘 (最多丢 60s), 直接换新账本
+    state.cur = { day, rowsRead: 0, rowsWritten: 0, readQueries: 0, writeQueries: 0, flushedRead: 0, flushedWritten: 0, flushedReadQueries: 0, flushedWriteQueries: 0 }
   }
+  return state.cur
 }
 
-/** 取走并清零待落账增量 */
-function takeDelta(): D1MetricsDelta {
-  const d: D1MetricsDelta = {
-    rowsRead: live.pendingReads,
-    rowsWritten: live.pendingWrites,
-    queryCount: live.pendingQueries,
-  }
-  live.pendingReads = 0
-  live.pendingWrites = 0
-  live.pendingQueries = 0
-  return d
+/** 记录一次读查询 (rows = 真实扫描行数或估算行数) */
+export function recordDbRead(rows: number): void {
+  const c = counters()
+  c.rowsRead += Math.max(0, rows)
+  c.readQueries += 1
 }
 
-/** 写路径节流判定 (供适配层在 run/exec 后决定是否顺带落账) */
-export function d1MetricsFlushDue(): boolean {
-  return !flushing && live.pendingQueries > 0 && Date.now() - live.lastFlushAt >= D1_METRICS_FLUSH_MS
+/** 记录一次写查询 (rows = 受影响/写入行数) */
+export function recordDbWrite(rows: number): void {
+  const c = counters()
+  c.rowsWritten += Math.max(0, rows)
+  c.writeQueries += 1
+}
+
+/** 距下次允许落盘的等待是否已过 */
+function shouldFlush(): boolean {
+  return Date.now() - state.lastFlushAt >= state.FLUSH_INTERVAL_MS
 }
 
 /**
- * 把待落账增量原子 UPSERT 进 d1_metrics (UTC 日期主键, 一天一行)。
- * force=true 供计量端点在读表前强制落账 (当前 isolate 视图即刻全局可见);
- * 否则受 60s 节流。失败时增量归还待落账池, 绝不丢账。
+ * 落盘当日增量到 d1_usage_daily (增量 UPSERT, 幂等)。
+ * force=true 时忽略节流窗口 (仪表盘读取前调用, 保证数字最新)。
+ * 内部静默容错: 台账表缺失/库未就绪时跳过, 不影响业务调用方。
  */
-export async function flushD1Metrics(db: DatabaseAdapter, force = false): Promise<boolean> {
-  if (flushing) return false
-  if (!force && Date.now() - live.lastFlushAt < D1_METRICS_FLUSH_MS) return false
-  flushing = true
-  const d = takeDelta()
+export async function flushD1Usage(db: { get: Function; run: Function }, force = false): Promise<void> {
+  if (!state.cur) return
+  const dirty = state.cur.rowsRead > state.cur.flushedRead || state.cur.rowsWritten > state.cur.flushedWritten
+    || state.cur.readQueries > state.cur.flushedReadQueries || state.cur.writeQueries > state.cur.flushedWriteQueries
+  if (!dirty || (!force && !shouldFlush())) return
+
+  const c = counters()
+  const dRead = c.rowsRead - c.flushedRead
+  const dWrite = c.rowsWritten - c.flushedWritten
+  const dReadQ = c.readQueries - c.flushedReadQueries
+  const dWriteQ = c.writeQueries - c.flushedWriteQueries
+  if (dRead <= 0 && dWrite <= 0 && dReadQ <= 0 && dWriteQ <= 0) return
+
   try {
-    if (d.queryCount > 0 && db.driver !== 'memory') {
-      // memory 驱动: 演示用, 内存实时视图已足够, 跳过持久化 (UPSERT 语义不适用其模拟层)
-      const date = utcDateStr()
-      const args = [date, d.rowsRead, d.rowsWritten, d.queryCount]
-      if (db.driver === 'mysql') {
-        await db.run(
-          `INSERT INTO d1_metrics (metric_date, rows_read, rows_written, query_count, updated_at)
-           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON DUPLICATE KEY UPDATE
-             rows_read = rows_read + VALUES(rows_read),
-             rows_written = rows_written + VALUES(rows_written),
-             query_count = query_count + VALUES(query_count),
-             updated_at = CURRENT_TIMESTAMP`,
-          args,
-        )
-      } else {
-        // d1 / sqlite (SQLite 方言) — 原子 UPSERT, 永不读改写
-        await db.run(
-          `INSERT INTO d1_metrics (metric_date, rows_read, rows_written, query_count, updated_at)
-           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON CONFLICT(metric_date) DO UPDATE SET
-             rows_read = rows_read + excluded.rows_read,
-             rows_written = rows_written + excluded.rows_written,
-             query_count = query_count + excluded.query_count,
-             updated_at = CURRENT_TIMESTAMP`,
-          args,
-        )
-      }
+    await db.run(
+      `INSERT INTO d1_usage_daily (day, rows_read, rows_written, read_queries, write_queries, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(day) DO UPDATE SET
+         rows_read = rows_read + excluded.rows_read,
+         rows_written = rows_written + excluded.rows_written,
+         read_queries = read_queries + excluded.read_queries,
+         write_queries = write_queries + excluded.write_queries,
+         updated_at = datetime('now')`,
+      [c.day, dRead, dWrite, dReadQ, dWriteQ],
+    )
+    c.flushedRead += dRead
+    c.flushedWritten += dWrite
+    c.flushedReadQueries += dReadQ
+    c.flushedWriteQueries += dWriteQ
+    state.lastFlushAt = Date.now()
+  } catch {
+    // 表还没建/库只读: 静默, 下次重试 (内存计数不受影响)
+  }
+}
+
+export interface D1UsageSnapshot {
+  driver: string
+  source: 'exact' | 'estimate'
+  day: string
+  rowsRead: number
+  rowsWritten: number
+  readQueries: number
+  writeQueries: number
+  limits: { read: number; write: number }
+  readPct: number
+  writePct: number
+  readStatus: 'ok' | 'warn' | 'danger' | 'exceeded'
+  writeStatus: 'ok' | 'warn' | 'danger' | 'exceeded'
+  resetAt: string
+  resetInSeconds: number
+  history: { day: string; rowsRead: number; rowsWritten: number }[]
+}
+
+function levelOf(pct: number): 'ok' | 'warn' | 'danger' | 'exceeded' {
+  if (pct >= 100) return 'exceeded'
+  if (pct >= 90) return 'danger'
+  if (pct >= 70) return 'warn'
+  return 'ok'
+}
+
+/**
+ * 读取 D1 用量快照 (供 /api/dashboard/d1-metrics):
+ * 先强制落盘内存增量, 再读台账 (今天 + 近 7 天历史)。
+ * 台账读取成本: 2 次索引点查 + 1 次小表 range (≤8 行), 可忽略。
+ */
+export async function getD1UsageSnapshot(db: any, driver: string): Promise<D1UsageSnapshot> {
+  await flushD1Usage(db, true).catch(() => {})
+
+  const c = counters()
+  // 内存当日值与台账当日值取 max (台账在多 isolate 下是全量, 内存只有本 isolate)
+  let day = c.day
+  let rowsRead = c.rowsRead
+  let rowsWritten = c.rowsWritten
+  let readQueries = c.readQueries
+  let writeQueries = c.writeQueries
+  try {
+    const row = await db.get<{ day: string; rows_read: number; rows_written: number; read_queries: number; write_queries: number }>(
+      'SELECT day, rows_read, rows_written, read_queries, write_queries FROM d1_usage_daily WHERE day = ?',
+      [day],
+    )
+    if (row) {
+      rowsRead = Math.max(rowsRead, Number(row.rows_read) || 0)
+      rowsWritten = Math.max(rowsWritten, Number(row.rows_written) || 0)
+      readQueries = Math.max(readQueries, Number(row.read_queries) || 0)
+      writeQueries = Math.max(writeQueries, Number(row.write_queries) || 0)
     }
-    live.lastFlushAt = Date.now()
-    return true
-  } catch (e) {
-    // 落账失败: 增量归还待落账池, 下个周期重试
-    live.pendingQueries += d.queryCount
-    live.pendingReads += d.rowsRead
-    live.pendingWrites += d.rowsWritten
-    if (force) throw e
-    return false
-  } finally {
-    flushing = false
+  } catch {
+    // 台账缺失: 退回本 isolate 内存值
+  }
+
+  const history: { day: string; rowsRead: number; rowsWritten: number }[] = []
+  try {
+    const rows = await db.all<{ day: string; rows_read: number; rows_written: number }>(
+      'SELECT day, rows_read, rows_written FROM d1_usage_daily WHERE day >= ? ORDER BY day DESC LIMIT 7',
+      [utcDay(new Date(Date.now() - 6 * 86400000))],
+    )
+    for (const r of rows || []) {
+      history.push({ day: r.day, rowsRead: Number(r.rows_read) || 0, rowsWritten: Number(r.rows_written) || 0 })
+    }
+  } catch {
+    // 无历史也照常返回
+  }
+
+  const readPct = Math.min(999, Math.round((rowsRead / D1_FREE_READ_LIMIT) * 1000) / 10)
+  const writePct = Math.min(999, Math.round((rowsWritten / D1_FREE_WRITE_LIMIT) * 1000) / 10)
+
+  // 下一次 UTC 午夜重置时间
+  const now = new Date()
+  const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0))
+
+  return {
+    driver,
+    source: driver === 'd1' ? 'exact' : 'estimate',
+    day,
+    rowsRead,
+    rowsWritten,
+    readQueries,
+    writeQueries,
+    limits: { read: D1_FREE_READ_LIMIT, write: D1_FREE_WRITE_LIMIT },
+    readPct,
+    writePct,
+    readStatus: levelOf(readPct),
+    writeStatus: levelOf(writePct),
+    resetAt: reset.toISOString(),
+    resetInSeconds: Math.max(0, Math.floor((reset.getTime() - now.getTime()) / 1000)),
+    history,
   }
 }

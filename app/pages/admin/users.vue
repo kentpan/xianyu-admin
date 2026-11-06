@@ -52,7 +52,7 @@
                     {{ u.is_active ? '启用' : '禁用' }}
                   </button>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(u.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(u.created_at) }}</td>
                 <td>
                   <div class="flex items-center justify-end gap-1">
                     <button
@@ -170,13 +170,6 @@ async function doDelete() {
   } finally {
     deleting.value = false
   }
-}
-
-function formatTime(t?: string) {
-  if (!t) return '—'
-  const d = new Date(t.replace(' ', 'T'))
-  if (isNaN(d.getTime())) return t
-  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

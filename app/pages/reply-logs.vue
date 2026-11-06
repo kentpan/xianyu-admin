@@ -63,7 +63,7 @@
             </thead>
             <tbody>
               <tr v-for="log in logs" :key="log.id">
-                <td class="whitespace-nowrap text-slate-500 dark:text-slate-400">{{ formatTime(log.created_at) }}</td>
+                <td class="whitespace-nowrap text-slate-500 dark:text-slate-400">{{ formatTimeFull(log.created_at) }}</td>
                 <td class="text-slate-500 dark:text-slate-400">{{ log.cookie_id }}</td>
                 <td class="max-w-[260px]">
                   <p class="font-medium text-slate-900 dark:text-white truncate">{{ log.sender_user_name || log.sender_user_id || '-' }}</p>
@@ -196,17 +196,6 @@ function sendMeta(sendStatus: string) {
     case 'sent': return { label: '已下发', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' }
     case 'failed': return { label: '发送失败', cls: 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400' }
     default: return { label: '未发送', cls: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' }
-  }
-}
-
-function formatTime(t: string) {
-  if (!t) return '-'
-  try {
-    const d = t.includes('T') || t.includes('Z') ? new Date(t) : new Date(t.replace(' ', 'T') + 'Z')
-    if (Number.isNaN(d.getTime())) return t
-    return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  } catch {
-    return t
   }
 }
 

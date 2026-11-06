@@ -63,39 +63,6 @@ export interface OnlineStatusResponse {
   }
 }
 
-export interface D1TopQuery {
-  sql: string
-  count: number
-  rowsRead: number
-  rowsWritten: number
-  lastAt: number
-}
-
-export interface D1MetricsResponse {
-  driver: string
-  metered: boolean
-  dateUtc: string
-  limits: { reads: number; writes: number }
-  today: {
-    rowsRead: number
-    rowsWritten: number
-    queryCount: number
-    readPercent: number
-    writePercent: number
-  }
-  resetInSec: number
-  live: {
-    rowsRead: number
-    rowsWritten: number
-    queryCount: number
-    pendingReads: number
-    pendingWrites: number
-    uptimeSec: number
-  }
-  topQueries: D1TopQuery[]
-  history: { date: string; rowsRead: number; rowsWritten: number; queryCount: number }[]
-}
-
 export function getDashboardStats() {
   return useApi().get<DashboardStats>('/api/dashboard/stats')
 }
@@ -120,9 +87,27 @@ export function getDashboardActivity() {
   return useApi().get<ActivityResponse>('/api/dashboard/activity')
 }
 
-/** D1 读写用量核心指标 (v2.3.5) */
+/** D1 读写配额核心指标 (v2.3.5) */
+export interface D1UsageSnapshot {
+  driver: string
+  source: 'exact' | 'estimate'
+  day: string
+  rowsRead: number
+  rowsWritten: number
+  readQueries: number
+  writeQueries: number
+  limits: { read: number; write: number }
+  readPct: number
+  writePct: number
+  readStatus: 'ok' | 'warn' | 'danger' | 'exceeded'
+  writeStatus: 'ok' | 'warn' | 'danger' | 'exceeded'
+  resetAt: string
+  resetInSeconds: number
+  history: { day: string; rowsRead: number; rowsWritten: number }[]
+}
+
 export function getDashboardD1Metrics() {
-  return useApi().get<D1MetricsResponse>('/api/dashboard/d1-metrics')
+  return useApi().get<D1UsageSnapshot>('/api/dashboard/d1-metrics')
 }
 
 /**

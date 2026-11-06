@@ -1,20 +1,10 @@
-/** GET /api/dashboard/activity — recent activity feed (orders + logs + risk events + account changes, merged & time-sorted).
- *
- * v2.3.5 D1 额度保卫战: 服务端 45s TTL 缓存 (single-flight) + 前端 60s 可见性感知轮询,
- * 多表 ORDER BY created_at 不再随轮询线性扫表 (created_at 索引亦已补齐)。
- */
+/** GET /api/dashboard/activity — recent activity feed (orders + logs + risk events + account changes, merged & time-sorted). */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
+    const db = await getDb()
     const { limit = 15 } = getQuery(event) as any
     const n = Math.min(Number(limit) || 15, 50)
-    const data = await withTtlCache(`dash:activity:${n}`, 45_000, () => loadActivityFeed(n))
-    return ok(data)
-  }),
-)
-
-async function loadActivityFeed(n: number) {
-  const db = await getDb()
 
     // Gather events from multiple sources in parallel
     const [orders, logs, riskLogs, accounts] = await Promise.all([
@@ -100,7 +90,8 @@ async function loadActivityFeed(n: number) {
       })
     }
 
-  // Sort by time desc, take top N
-  activities.sort((a, b) => b.ts - a.ts)
-  return { activities: activities.slice(0, n), total: activities.length }
-}
+    // Sort by time desc, take top N
+    activities.sort((a, b) => b.ts - a.ts)
+    return ok({ activities: activities.slice(0, n), total: activities.length })
+  }),
+)

@@ -1,22 +1,11 @@
 /**
  * GET /api/dashboard/comparison — data comparison (today vs yesterday, this week vs last week).
  * Returns order counts + revenue for 4 periods: today, yesterday, thisWeek, lastWeek.
- *
- * v2.3.5 D1 额度保卫战: ① 日期过滤由 date(created_at) 函数包裹改为 ISO 字符串
- * 边界直接比较 — 函数包裹列会废弃索引导致全表扫描 (D1 按扫描行数计费),
- * 现在可命中 idx_orders_created 索引范围扫描, 只读时间段内的行;
- * ② 服务端 120s TTL 缓存 (对照数据变化慢, 不需要实时)。
  */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-    const data = await withTtlCache('dash:comparison', 120_000, loadComparison)
-    return ok(data)
-  }),
-)
-
-async function loadComparison() {
-  const db = await getDb()
+    const db = await getDb()
 
     const now = new Date()
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
@@ -38,14 +27,23 @@ async function loadComparison() {
 
     const result: Record<string, { orders: number; revenue: number }> = {}
 
+    // (v2.3.5) 索引友好改写: 原实现对 created_at 列包 date() 函数再比较, 索引失效
+    // → 每次请求 4 次全表扫描 (D1 按 orders 总行数×4 计读配额, 是超限
+    // 元凶之一)。改为 created_at 字符串区间比较 [from 00:00:00, to+1d 00:00:00)，
+    // 走 idx_orders_created 区间扫描; created_at 统一 'YYYY-MM-DD HH:MM:SS' 存储,
+    // 语义与原 date() 闭区间比较完全一致。
+    const upperBound = (to: string): string => {
+      const d = new Date(`${to}T00:00:00.000Z`)
+      d.setUTCDate(d.getUTCDate() + 1)
+      return d.toISOString().slice(0, 10) + ' 00:00:00'
+    }
+
     for (const [key, p] of Object.entries(periods)) {
-      // ISO 字符串边界比较 (created_at 存储格式 'YYYY-MM-DD HH:MM:SS', 字典序即时间序)
-      // → 命中 idx_orders_created 索引, 不再全表扫 date() 函数
       const row = await db.get<{ c: number; rev: number }>(
         `SELECT COUNT(*) as c, COALESCE(SUM(CAST(amount AS REAL)), 0) as rev
          FROM orders
-         WHERE created_at >= ? AND created_at < date(?, '+1 day')`,
-        [`${p.from} 00:00:00`, p.to],
+         WHERE created_at >= ? AND created_at < ?`,
+        [`${p.from} 00:00:00`, upperBound(p.to)],
       ).catch(() => ({ c: 0, rev: 0 }))
       result[key] = { orders: row?.c || 0, revenue: Math.round((row?.rev || 0) * 100) / 100 }
     }
@@ -64,11 +62,12 @@ async function loadComparison() {
       revenuePct: result.lastWeek.revenue > 0 ? Math.round(((result.thisWeek.revenue - result.lastWeek.revenue) / result.lastWeek.revenue) * 100) : (result.thisWeek.revenue > 0 ? 100 : 0),
     }
 
-  return {
-    periods: result,
-    comparison: {
-      todayVsYesterday,
-      weekVsLastWeek,
-    },
-  }
-}
+    return ok({
+      periods: result,
+      comparison: {
+        todayVsYesterday,
+        weekVsLastWeek,
+      },
+    })
+  }),
+)

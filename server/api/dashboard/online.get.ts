@@ -1,18 +1,8 @@
-/** GET /api/dashboard/online — account online status summary (enabled accounts, last activity, cookie freshness).
- *
- * v2.3.5 D1 额度保卫战: 服务端 60s TTL 缓存 (single-flight) — 按账号聚合查询
- * (orders/keywords GROUP BY) 不再随轮询线性放大; 配套新增两表账号维度索引。
- */
+/** GET /api/dashboard/online — account online status summary (enabled accounts, last activity, cookie freshness). */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-    const data = await withTtlCache('dash:online', 60_000, loadOnlineStatus)
-    return ok(data)
-  }),
-)
-
-async function loadOnlineStatus() {
-  const db = await getDb()
+    const db = await getDb()
 
     const accounts = await db.all<{
       id: string; remark: string; enabled: number; auto_confirm: number; created_at: string
@@ -66,8 +56,9 @@ async function loadOnlineStatus() {
     const offline = items.filter((i) => !i.isOnline && i.enabled).length
     const disabled = items.filter((i) => !i.enabled).length
 
-  return {
-    items,
-    summary: { total: items.length, online, offline, disabled },
-  }
-}
+    return ok({
+      items,
+      summary: { total: items.length, online, offline, disabled },
+    })
+  }),
+)

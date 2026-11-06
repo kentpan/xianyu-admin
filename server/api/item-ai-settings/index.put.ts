@@ -28,6 +28,10 @@ export default defineEventHandler(
     const max_discount_amount = clampInt(body.max_discount_amount, 0, 1000000, 100)
     const max_bargain_rounds = clampInt(body.max_bargain_rounds, 0, 100, 3)
     const custom_prompts = (body.custom_prompts ?? '').toString()
+    // 商品级三开关 (v2.3.0): 商品消息作知识库 / 同商品消息跨账号共享 / 当前账号回复风格
+    const use_item_kb = body.use_item_kb ? 1 : 0
+    const share_item_kb = body.share_item_kb ? 1 : 0
+    const use_account_style = body.use_account_style ? 1 : 0
 
     if (ai_enabled && ai_config_id === 0) {
       throw new ApiError(400, '开启该商品 AI 回复前请选择 AI 配置 (可先到「AI配置」页新建)')
@@ -39,17 +43,19 @@ export default defineEventHandler(
         `UPDATE item_ai_settings SET
            ai_enabled = ?, ai_config_id = ?, model_name = '', api_key = '', base_url = '',
            max_discount_percent = ?, max_discount_amount = ?, max_bargain_rounds = ?,
-           custom_prompts = ?, updated_at = CURRENT_TIMESTAMP
+           custom_prompts = ?, use_item_kb = ?, share_item_kb = ?, use_account_style = ?,
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [ai_enabled, ai_config_id, max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts, existing.id],
+        [ai_enabled, ai_config_id, max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts, use_item_kb, share_item_kb, use_account_style, existing.id],
       )
     } else {
       await db.run(
         `INSERT INTO item_ai_settings (
            cookie_id, item_id, ai_enabled, ai_config_id, model_name, api_key, base_url,
-           max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts
-         ) VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?)`,
-        [cookieId, itemId, ai_enabled, ai_config_id, max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts],
+           max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts,
+           use_item_kb, share_item_kb, use_account_style
+         ) VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?, ?, ?, ?)`,
+        [cookieId, itemId, ai_enabled, ai_config_id, max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts, use_item_kb, share_item_kb, use_account_style],
       )
     }
 
