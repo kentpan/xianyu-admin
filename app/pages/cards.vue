@@ -97,7 +97,7 @@
                     {{ c.enabled ? '启用' : '停用' }}
                   </button>
                 </td>
-                <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(c.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400">{{ formatTime(c.created_at) }}</td>
                 <td>
                   <div class="flex items-center justify-end gap-1">
                     <button class="btn-ghost !px-2 !py-1" title="编辑" @click="openEdit(c)">
@@ -175,7 +175,7 @@
             </thead>
             <tbody>
               <tr v-for="l in codeLogs" :key="l.id">
-                <td class="text-slate-500 whitespace-nowrap">{{ formatTimeFull(l.created_at) }}</td>
+                <td class="text-slate-500 whitespace-nowrap">{{ formatTime(l.created_at) }}</td>
                 <td>
                   <span class="font-mono font-semibold tracking-wider text-slate-800 dark:text-white">{{ l.code }}</span>
                   <span v-if="l.source === 'test'" class="badge ml-1 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">测试</span>
@@ -190,7 +190,7 @@
                 <td class="font-mono text-slate-500 max-w-[140px]"><p class="truncate" :title="l.item_id">{{ l.item_id || '—' }}</p></td>
                 <td class="font-mono text-slate-500 max-w-[160px]"><p class="truncate" :title="l.order_id">{{ l.order_id || '—' }}</p></td>
                 <td class="font-mono text-slate-500">{{ l.buyer_id || '—' }}</td>
-                <td class="text-slate-500 whitespace-nowrap">{{ formatTimeFull(l.used_at) }}</td>
+                <td class="text-slate-500 whitespace-nowrap">{{ formatTime(l.used_at) }}</td>
                 <td>
                   <div class="flex items-center justify-end gap-1">
                     <button class="btn-ghost !px-2 !py-1" title="复制卡密" @click="copyCodeLog(l.code)">
@@ -223,7 +223,7 @@
             </thead>
             <tbody>
               <tr v-for="l in consumeLogs" :key="l.id">
-                <td class="text-slate-500 whitespace-nowrap">{{ formatTimeFull(l.created_at) }}</td>
+                <td class="text-slate-500 whitespace-nowrap">{{ formatTime(l.created_at) }}</td>
                 <td>
                   <span class="font-mono font-semibold tracking-wider text-slate-800 dark:text-white">{{ l.code }}</span>
                   <span v-if="l.source === 'test'" class="badge ml-1 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">测试</span>
@@ -973,6 +973,13 @@ async function doDelete() {
   } finally {
     deleting.value = false
   }
+}
+
+function formatTime(t?: string) {
+  if (!t) return '—'
+  const d = new Date(t.replace(' ', 'T'))
+  if (isNaN(d.getTime())) return t
+  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 const codeLogs = ref<CardCodeLogRow[]>([])

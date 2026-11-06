@@ -15,12 +15,6 @@ export interface ItemAiSettings {
   max_discount_amount: number
   max_bargain_rounds: number
   custom_prompts: string | null
-  /** v2.3.0: AI 回复时引用本商品历史真实对话作为上下文 (0/1) */
-  use_item_kb?: number
-  /** v2.3.0: 商品历史对话样本不限当前账号, 多账号聚合 (0/1, 依赖 use_item_kb) */
-  share_item_kb?: number
-  /** v2.3.0: AI 语气/用语与该账号历史回复保持一致 (0/1) */
-  use_account_style?: number
 }
 
 export interface SaveItemAiSettingsPayload {
@@ -32,10 +26,6 @@ export interface SaveItemAiSettingsPayload {
   max_discount_amount: number
   max_bargain_rounds: number
   custom_prompts: string
-  /** v2.3.0 三开关: 布尔或 0/1 均可 (后端兼容) */
-  use_item_kb?: number | boolean
-  share_item_kb?: number | boolean
-  use_account_style?: number | boolean
 }
 
 export function getItemAiSettings(cookieId: string, itemId: string) {

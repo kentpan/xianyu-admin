@@ -159,7 +159,7 @@
                 <span v-else class="badge bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400">转发中</span>
               </td>
               <td class="text-slate-500 dark:text-slate-400">{{ s.total_delivered }} / <span :class="s.total_failed > 0 ? 'text-rose-500' : ''">{{ s.total_failed }}</span></td>
-              <td class="text-slate-500 dark:text-slate-400">{{ formatAgo(s.last_delivery_at) }}</td>
+              <td class="text-slate-500 dark:text-slate-400">{{ formatTime(s.last_delivery_at) }}</td>
               <td class="text-right">
                 <div class="inline-flex items-center gap-1.5 flex-wrap justify-end">
                   <button class="btn-secondary" :disabled="testing === s.id" @click="testPush(s)">{{ testing === s.id ? '发送中...' : '测试' }}</button>
@@ -293,7 +293,7 @@
                   token 连败 {{ a.token_fail_streak }} 次
                 </span>
               </td>
-              <td class="text-slate-500 dark:text-slate-400">{{ formatAgo(a.last_check_at) }}</td>
+              <td class="text-slate-500 dark:text-slate-400">{{ formatTime(a.last_check_at) }}</td>
               <td>
                 <div class="flex items-center justify-end gap-1.5">
                   <button class="btn-secondary !px-2.5 !py-1" :disabled="tokenFetching === a.id" @click="fetchToken(a)">
@@ -676,7 +676,19 @@ function stateMeta(state: ListenerAccount['state']) {
   }
 }
 
-// (v2.3.1) 本地时间包装已删: 相对时间统一用全局 formatAgo (app/utils/datetime.ts, 北京时间)
+function formatTime(t: string | null) {
+  if (!t) return '-'
+  try {
+    const d = t.includes('T') || t.includes('Z') ? new Date(t) : new Date(t.replace(' ', 'T') + 'Z')
+    if (Number.isNaN(d.getTime())) return t
+    const diff = Date.now() - d.getTime()
+    if (diff >= 0 && diff < 60_000) return '刚刚'
+    if (diff >= 0 && diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+    return d.toLocaleString('zh-CN', { hour12: false })
+  } catch {
+    return t
+  }
+}
 
 // ---- 事件发布 / 订阅者 ----
 const subscribers = ref<SubscriberRow[]>([])

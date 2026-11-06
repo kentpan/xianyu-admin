@@ -639,19 +639,12 @@ export interface XianyuOrderDetail {
   /** 实付金额 (priceInfo.amount.value) */
   price: string
   buyer_id: string
-  /** 卖家身份 uid (v2.3.0 存量订单核验回填用; 响应未携带为空串) */
-  seller_id: string
-  /** 真实下单时间原文 (v2.3.0 存量时间堆积回填用; 响应未携带为空串, 绝不伪造) */
-  create_time_text: string
   receiver_name: string
   receiver_phone: string
   receiver_city: string
   receiver_address: string
   can_rate: boolean
 }
-
-/** 订单详情下单时间候选键名 (受限深扫 orderInfoVO 范围, 绝不扫到状态时间)。 */
-const ORDER_DETAIL_CREATETIME_KEYS = /^(createTime|createTimeText|orderCreateTime|orderCreatedTime|createdTime|timeCreate)$/i
 
 /** 闲鱼订单数字状态码 → 统一状态 (与 butler STATUS_CODE_MAP 一致)。 */
 const ORDER_STATUS_CODE_MAP: Record<string, string> = {
@@ -681,8 +674,7 @@ function normalizeOrderStatus(raw: unknown): string {
  * @param opts.transport 可插拔传输通道 (与 fetchSellerOrdersFull 同构): 默认 mtopFetch
  *        (代理透传网关优先 → 本机直连); Cloudflare Pages 等直连不可达运行时, 调用方
  *        注入任务通道 (order-task.taskChannelTransport) 经代理转发, 否则直连必失败。
- * @returns { detail, retMsg, finalCookieStr } — detail 为 null 表示未取到 (风控/无权限), retMsg 携带平台原始错误;
- *          detail.seller_id / detail.create_time_text 为存量订单核验修复数据源 (v2.3.0)
+ * @returns { detail, retMsg, finalCookieStr } — detail 为 null 表示未取到 (风控/无权限), retMsg 携带平台原始错误
  */
 export async function fetchOrderDetail(
   cookieStr: string,
@@ -724,10 +716,6 @@ export async function fetchOrderDetail(
     item_title: '',
     price: '',
     buyer_id: '',
-    seller_id: '',
-    create_time_text: String(
-      d?.utArgs?.createTime || d?.utArgs?.createTimeText || d?.createTime || d?.orderCreateTime || '',
-    ).trim(),
     receiver_name: '',
     receiver_phone: '',
     receiver_city: '',
@@ -742,16 +730,6 @@ export async function fetchOrderDetail(
     const itemInfo = cd.itemInfo || {}
     out.item_title = String(itemInfo.title || '')
     out.item_id = String(itemInfo.itemId || '')
-    // 卖家身份 + 真实下单时间 (v2.3.0 存量订单核验修复数据源): 已知候选 → 受限深扫兑底
-    out.seller_id = String(
-      cd.sellerInfo?.userId || cd.sellerInfo?.sellerId || cd.sellerId || cd.seller_id || out.seller_id || '',
-    ).trim()
-    if (!out.create_time_text) {
-      const tHit =
-        deepScanString(cd, ORDER_DETAIL_CREATETIME_KEYS, new Set(['priceInfo', 'addressInfo', 'itemInfo']), 3) ||
-        deepScanString(comp?.data || {}, ORDER_DETAIL_CREATETIME_KEYS, new Set(['priceInfo', 'addressInfo', 'itemInfo']), 2)
-      out.create_time_text = String(tHit || '').trim()
-    }
     const amount = cd.priceInfo?.amount
     if (amount && amount.value !== undefined && amount.value !== null) {
       // butler 同源: amount.value 直接作为金额使用 (实测响应为元字符串, 不做 /100)
@@ -850,46 +828,6 @@ function pickTimeText(sources: any[], keys: string[]): string {
   return ''
 }
 
-/** 卖家身份深扫禁入容器: 买家相关容器绝不可能是卖家身份来源。 */
-const SELLER_SCAN_EXCLUDE_KEYS = new Set(['buyerInfoVO', 'buyerVO', 'buyer', 'buyerUserVO'])
-
-/**
- * 卖家身份提取 (v2.3.0 增强): 响应各版本卖家字段位置不统一
- * (commonData.sellerId / sellerInfoVO / sellerVO / 顶层), 已知候选落空后在订单
- * item 范围内受限深扫 (sellerId/seller_id/userNumberId 等身份键名锚定, 排除买家
- * 容器)。取到即返回纯数字 uid (供账号隔离复核与趋势卖家维度统计), 取不到返回空串。
- */
-function extractSellerIdFromItem(item: any, common: any): string {
-  const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
-  const candidates = [
-    common?.sellerId,
-    common?.seller_id,
-    sellerVO?.userId,
-    sellerVO?.sellerId,
-    sellerVO?.userNumberId,
-    item?.sellerId,
-    item?.seller_id,
-  ]
-  for (const c of candidates) {
-    const s = String(c ?? '').trim()
-    if (s && /^\d+$/.test(s)) return s
-  }
-  const hit = deepScanString(item, /^(sellerId|seller_id|userNumberId)$/i, SELLER_SCAN_EXCLUDE_KEYS, 4)
-  return hit && /^\d+$/.test(hit) ? hit : ''
-}
-
-/**
- * 买家昵称提取 (v2.3.0 增强): buyerInfoVO 多候选 → buyerInfoVO 范围内深扫 →
- * item 顶层 buyerNick 类键名深扫 (响应各版本昵称字段位置不统一, 绝不静默丢昵称)。
- */
-function extractBuyerNickFromItem(item: any, buyer: any): string {
-  const direct = pickBuyerNick(buyer)
-  if (direct) return direct
-  const inBuyer = deepScanString(buyer, /^(userNick|nick|nickname|buyerNick|nickName|userNickName)$/i, new Set(), 3)
-  if (inBuyer) return inBuyer
-  return deepScanString(item, /^(buyerNick|buyer_nick|buyerUserNick)$/i, new Set(), 3)
-}
-
 /** 解析卖家订单列表单条 item (语义对齐 butler _parse_sold_order_item)。 */
 export function parseSoldOrderItem(item: any): SellerOrderItem | null {
   const common = item?.commonData || {}
@@ -899,13 +837,19 @@ export function parseSoldOrderItem(item: any): SellerOrderItem | null {
   const priceVo = item?.priceVO || {}
   const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
   const rawStatus = String(common.orderStatus || '')
+  // 卖家身份提取 (尽力而为): 响应中任一已知位置携带卖家 uid 都取到,
+  // 供入库前账号隔离复核 (与账号 uid 不符的订单不入库); 取不到则空串放行
+  const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
+  const sellerId = String(
+    common.sellerId || common.seller_id || sellerVO.userId || sellerVO.sellerId || sellerVO.userNumberId || item?.sellerId || '',
+  ).trim()
   return {
     order_id: orderId,
     order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
     item_id: String(common.itemId || ''),
     buyer_id: String(buyer.buyerId || ''),
-    buyer_nick: extractBuyerNickFromItem(item, buyer),
-    seller_id: extractSellerIdFromItem(item, common),
+    buyer_nick: String(buyer.userNick || ''),
+    seller_id: sellerId,
     receiver_name: String(buyer.name || ''),
     receiver_phone: String(buyer.phone || ''),
     receiver_address: String(buyer.address || ''),
@@ -1129,15 +1073,19 @@ export function parseSoldOrderItemFull(item: any): SellerOrderItemFull | null {
   const priceVo = item?.priceVO || {}
   const btnList = Array.isArray(item?.rightVO?.btnList) ? item.rightVO.btnList : []
   const rawStatus = String(common.orderStatus || '')
+  const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
+  const sellerId = String(
+    common.sellerId || common.seller_id || sellerVO.userId || sellerVO.sellerId || sellerVO.userNumberId || item?.sellerId || '',
+  ).trim()
   return {
     order_id: orderId,
     order_status: String(common.inRefund) === 'true' ? 'refunding' : SELLER_ORDER_STATUS_MAP[rawStatus] || 'unknown',
     item_id: String(common.itemId || ''),
     item_title: pickItemTitle(item, common),
     buyer_id: String(buyer.buyerId || ''),
-    buyer_nick: extractBuyerNickFromItem(item, buyer),
+    buyer_nick: pickBuyerNick(buyer),
     item_price: pickItemPrice(item, common),
-    seller_id: extractSellerIdFromItem(item, common),
+    seller_id: sellerId,
     receiver_name: String(buyer.name || ''),
     receiver_phone: String(buyer.phone || ''),
     receiver_address: String(buyer.address || ''),
@@ -1192,170 +1140,6 @@ export async function fetchSellerOrdersFull(
     items,
     nextPage: String(module.nextPage ?? 'false') === 'true',
     totalCount: parseInt(String(module.totalCount ?? '0'), 10) || 0,
-    retMsg: '',
-    finalCookieStr: r.cookieStr,
-  }
-}
-
-/* ------------------- 全平台商品搜索 (v2.3.0, 闲鱼趋势·热门商品数据源) -------------------
- * api = mtop.taobao.idle.pc.search (goofish.com 搜索页同源接口): 账号 Cookie 调用,
- * 按关键词搜索**全平台**在售商品 — 这是"全平台数据"的真实来源 (卖家订单接口
- * merchant.sold.get 是账号维度, 只返回该账号自己的订单, 不存在全平台订单接口)。
- * 搜索结果聚合 (同款在售卖家数/价格带/想要人数) 进 trend_hot_items 表做热门商品趋势。
- * 响应结构多版本: BFS 定位"元素含 itemId+title 的数组"再逐条多候选解析, 落空显性报错。 */
-
-/** 闲鱼站内搜索单条商品标准化结果。 */
-export interface IdleSearchItem {
-  item_id: string
-  title: string
-  price: string
-  /** 想要人数 (响应真实携带才写; 空串 = 未携带)。 */
-  want_count: string
-  seller_id: string
-  seller_nick: string
-  area: string
-  pic_url: string
-}
-
-/** 闲鱼站内搜索单页结果。 */
-export interface IdleSearchPage {
-  items: IdleSearchItem[]
-  nextPage: boolean
-  totalCount: number
-  retMsg: string
-  finalCookieStr: string
-}
-
-/**
- * 在搜索响应内定位商品数组: BFS ≤5 层, 返回首个"元素为对象且可解析出商品 ID+标题"
- * 的非空数组 — 实测容器路径为 data.resultList (元素含 data.item.main), 兼容后续版本变化。
- */
-function locateSearchItems(root: any): any[] {
-  const queue: any[] = [root]
-  let depth = 0
-  while (queue.length && depth <= 5) {
-    const size = queue.length
-    for (let i = 0; i < size; i++) {
-      const node = queue.shift()
-      if (!node || typeof node !== 'object') continue
-      if (Array.isArray(node)) {
-        if (
-          node.length &&
-          node.some((el) => {
-            if (!el || typeof el !== 'object' || Array.isArray(el)) return false
-            const dp = el?.data?.item?.main?.exContent?.detailParams || {}
-            const args = el?.data?.item?.main?.clickParam?.args || {}
-            return String(dp.itemId || args.id || el.itemId || '') && String(dp.title || el.title || '')
-          })
-        ) {
-          return node
-        }
-        for (const el of node) queue.push(el)
-      } else {
-        for (const v of Object.values(node)) queue.push(v)
-      }
-    }
-    depth++
-  }
-  return []
-}
-
-/** 高亮标签剥离 (搜索结果 title 常带 <hl>/<em> 高亮片段)。 */
-function stripHighlight(s: string): string {
-  return String(s || '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .trim()
-}
-
-/**
- * 解析搜索结果单条商品 (v2.3.0, 实测 goofish.com 搜索页同源结构):
- * el.data.item.main.{exContent.detailParams, clickParam.args} 为主路径, 多候选兑底;
- * 字段全部原样取自响应 (title 剥离高亮标签, price/形状校验), 不伪造。
- * 已实测字段位置: itemId/title/userNick(卖家昵称)/soldPrice 在 detailParams,
- * price/wantNum/id/seller_id(加密串) 在 clickParam.args, 地区在 exContent.area。
- */
-function parseSearchItem(el: any): IdleSearchItem | null {
-  if (!el || typeof el !== 'object') return null
-  const main = el?.data?.item?.main || el?.item?.main || el?.main || el
-  const dp = main?.exContent?.detailParams || {}
-  const args = main?.clickParam?.args || {}
-  const itemId = String(dp.itemId || args.id || main?.itemId || el?.itemId || '').trim()
-  if (!itemId || !/^\d+$/.test(itemId)) return null
-  const title = stripHighlight(String(dp.title || main?.title || el?.title || ''))
-  const priceRaw = String(args.price ?? dp.soldPrice ?? main?.price ?? '').trim()
-  const price = /^[\d.]+$/.test(priceRaw) ? priceRaw : ''
-  const wantRaw = String(args.wantNum ?? main?.wantNum ?? '').trim()
-  const want = /^\d+$/.test(wantRaw) ? wantRaw : ''
-  const sellerNick = stripHighlight(String(dp.userNick || main?.userNick || args.sellerNick || ''))
-  const area = stripHighlight(String(main?.exContent?.area || args.area || ''))
-  // 卖家 uid: 搜索响应为加密串 (不可比对该无明文 uid), 仅原样保留备查
-  const sellerId = String(args.seller_id || args.sellerId || main?.sellerId || '').trim()
-  const pic = String(main?.picUrl || dp.picUrl || main?.mainPic || '').trim()
-  return { item_id: itemId, title, price, want_count: want, seller_id: sellerId, seller_nick: sellerNick, area, pic_url: pic }
-}
-
-/**
- * 闲鱼站内搜索单页 (v2.3.0 全平台热门商品趋势): 实测 goofish.com 搜索页同源接口
- * mtop.taobao.idlemtopsearch.pc.search v1.0 (2026-11 从搜索页 JS p_search-index.js
- * 逆向确认 + 真实调用验证), 按关键词搜索全平台在售商品。落空时 retMsg 显性报错。
- *
- * @param keyword   搜索关键词 (如 "TG API" / 商品品类词)
- * @param page      页码 (rowsPerPage 与搜索页一致为 30)
- */
-export async function fetchIdleSearch(
-  cookieStr: string,
-  keyword: string,
-  page: number,
-  opts: { transport?: MtopTransport } = {},
-): Promise<IdleSearchPage> {
-  const empty: IdleSearchPage = { items: [], nextPage: false, totalCount: 0, retMsg: '', finalCookieStr: cookieStr }
-  if (!cookieStr) return { ...empty, retMsg: 'Cookie 为空' }
-  const kw = String(keyword || '').trim()
-  if (!kw) return { ...empty, retMsg: '搜索关键词为空' }
-  const r = await mtopCall<any>(
-    'mtop.taobao.idlemtopsearch.pc.search',
-    {
-      pageNumber: page,
-      keyword: kw,
-      fromFilter: false,
-      rowsPerPage: 30,
-      sortValue: '',
-      sortField: '',
-      customDistance: '',
-      gps: '',
-      propValueStr: {},
-      customGps: '',
-      searchReqFromPage: 'pcSearch',
-    },
-    cookieStr,
-    {
-      headers: {
-        Origin: 'https://www.goofish.com',
-        Referer: 'https://www.goofish.com/search',
-      },
-      extraParams: { spm_cnt: 'a21ybx.search.0.0' },
-      transport: opts.transport,
-    },
-  )
-  const retStr = Array.isArray(r.raw?.ret) ? r.raw.ret.join(' ') : ''
-  if (!retStr.includes('SUCCESS')) {
-    return { ...empty, retMsg: mtopFailMessage(retStr || '闲鱼搜索查询失败'), finalCookieStr: r.cookieStr }
-  }
-  const rawItems = locateSearchItems(r.data)
-  if (!rawItems.length) {
-    return {
-      ...empty,
-      retMsg: '搜索响应未定位到商品列表 (接口结构变更或关键词无结果)',
-      finalCookieStr: r.cookieStr,
-    }
-  }
-  const items = rawItems.map(parseSearchItem).filter((x: IdleSearchItem | null): x is IdleSearchItem => !!x)
-  const numFound = parseInt(String(r.data?.resultInfo?.searchResControlFields?.numFound ?? '0'), 10) || 0
-  return {
-    items,
-    nextPage: items.length >= 15 && numFound > page * 30,
-    totalCount: numFound || items.length,
     retMsg: '',
     finalCookieStr: r.cookieStr,
   }

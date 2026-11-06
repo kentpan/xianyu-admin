@@ -2,18 +2,13 @@
  * GET /api/engine/config — 远程代理拉取监听配置 (轮询, 默认 30s)。
  *
  * 鉴权: 标准 `Authorization: Bearer <token>`。
- * active 授权双门控 (v2.3.2 双连接根治):
- *   1. engines.is_active=1 — 使用中引擎
- *   2. engine_failover.owner='remote' — 所有权未被内置引擎接管
- * 任一不满足即返回 active=false → 代理自动下线全部连接 (多引擎互斥, 防重复回复/风控雪崩)。
- * 内置引擎接管时立即置 owner=builtin 吊销授权 — 存活代理 ≤30s 内收到并退避,
- * 从源头消灭「代理与内置引擎双连接 → 平台风控要求重新登录+人脸核验」。
+ * 只有「使用中」(is_active=1) 且启用的代理能拿到账号; 非活动代理收到 active=false
+ * → 代理自动下线全部连接 (多引擎互斥, 防重复回复/风控雪崩)。
  *
  * 下发内容 = 纯连接所需: 账号 Cookie + 持久化设备指纹 + 轮询间隔。
  * 不下发任何业务规则/卡券/订单 — 业务状态只存在于本后台。
  */
 import { consumeRate } from '../../utils/rate-limit'
-import { getFailoverOwner, FAILOVER_BUILTIN } from '../../utils/xianyu/failover'
 
 export default defineEventHandler(
   withApi(async (event) => {
@@ -26,8 +21,7 @@ export default defineEventHandler(
     }
 
     const db = await getDb()
-    const owner = await getFailoverOwner(db)
-    const active = !!engine.is_active && owner !== FAILOVER_BUILTIN
+    const active = !!engine.is_active
     const pollIp = enginePollIp(event)
 
     if (!active) {

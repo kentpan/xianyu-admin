@@ -18,7 +18,7 @@ export default defineEventHandler(
       params.push(beforeId)
     }
     const rows = await db.all(
-      `SELECT id, direction, sender_user_id, sender_nick, content, content_type, item_id, order_id, amount, status_text, msg_time, is_ai
+      `SELECT id, direction, sender_user_id, sender_nick, content, content_type, item_id, order_id, amount, status_text, msg_time
        FROM im_messages
        WHERE cookie_id = ? AND chat_id = ?${beforeSql}
        ORDER BY id DESC

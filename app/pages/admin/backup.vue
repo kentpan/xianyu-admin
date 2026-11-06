@@ -120,8 +120,8 @@
             </select>
           </div>
           <p class="text-slate-400">
-            上次运行: {{ formatTimeFull(config?.last_run_at) || '从未运行' }}
-            <template v-if="config?.next_due"> · 下次到点: {{ formatTimeFull(config.next_due) }}</template>
+            上次运行: {{ formatTime(config?.last_run_at) || '从未运行' }}
+            <template v-if="config?.next_due"> · 下次到点: {{ formatTime(config.next_due) }}</template>
           </p>
         </div>
       </div>
@@ -170,7 +170,7 @@
             <tr v-for="b in backups" :key="b.key">
               <td class="font-mono text-slate-700 dark:text-slate-200">{{ b.key }}</td>
               <td class="text-slate-500 dark:text-slate-400">{{ formatSize(b.size) }}</td>
-              <td class="text-slate-500 dark:text-slate-400">{{ formatTimeFull(b.modified_at) }}</td>
+              <td class="text-slate-500 dark:text-slate-400">{{ formatTime(b.modified_at) }}</td>
               <td>
                 <div class="flex items-center justify-end gap-1">
                   <a class="btn-ghost !px-2 !py-1" title="下载" :href="backupDownloadUrl(b.key)">
@@ -417,6 +417,12 @@ async function reloadAll() {
   }
 }
 
+function formatTime(t?: string) {
+  if (!t) return ''
+  const d = new Date(t)
+  if (Number.isNaN(d.getTime())) return t
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
 function formatSize(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`

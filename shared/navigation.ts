@@ -23,8 +23,6 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/items', label: '商品管理', icon: 'items', group: 'main' },
   { path: '/orders', label: '订单管理', icon: 'orders', group: 'main' },
   { path: '/messages', label: '消息管理', icon: 'message', group: 'main' },
-  // AI知识库紧跟消息管理 (v2.3.0): 消息→沉淀知识库 的动线相邻
-  { path: '/knowledge-base', label: 'AI知识库', icon: 'book', group: 'main' },
   { path: '/manual-ship', label: '补发货', icon: 'ship', group: 'main' },
   { path: '/keywords', label: '自动回复', icon: 'keywords', group: 'main' },
   { path: '/item-replies', label: '指定商品回复', icon: 'itemReply', group: 'main' },

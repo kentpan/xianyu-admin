@@ -22,6 +22,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { H3Event } from 'h3'
 import { DATABASE_URL } from './db-config'
+import { recordQuery, d1MetricsFlushDue, flushD1Metrics } from './d1-metrics'
 
 export interface DatabaseAdapter {
   driver: 'sqlite' | 'mysql' | 'd1' | 'memory'
@@ -126,13 +127,17 @@ class SQLiteAdapter implements DatabaseAdapter {
   constructor(private conn: DatabaseSync) {}
 
   all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    recordQuery(sql, 0, 0)
     return Promise.resolve(this.conn.prepare(sql).all(...params) as T[])
   }
   get<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+    recordQuery(sql, 0, 0)
     return Promise.resolve((this.conn.prepare(sql).get(...params) as T | undefined) ?? null)
   }
   run(sql: string, params: any[] = []): Promise<{ changes: number; lastInsertId: number | string }> {
     const r = this.conn.prepare(sql).run(...params)
+    // 本地 sqlite 无 D1 meta: 行写以 changes 近似, 行读不计量 (dashboard 按驱动区分口径)
+    recordQuery(sql, 0, Number(r.changes))
     return Promise.resolve({ changes: Number(r.changes), lastInsertId: Number(r.lastInsertRowid) })
   }
   async exec(sql: string): Promise<void> {
@@ -160,15 +165,18 @@ class MySQLAdapter implements DatabaseAdapter {
   constructor(private conn: any) {}
 
   async all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    recordQuery(sql, 0, 0)
     const [rows] = await this.conn.execute(sql, params)
     return rows as T[]
   }
   async get<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+    recordQuery(sql, 0, 0)
     const [rows] = await this.conn.execute(sql, params)
     return (rows as T[])[0] ?? null
   }
   async run(sql: string, params: any[] = []): Promise<{ changes: number; lastInsertId: number | string }> {
     const [r] = await this.conn.execute(sql, params)
+    recordQuery(sql, 0, (r as any).affectedRows ?? 0)
     return { changes: (r as any).affectedRows ?? 0, lastInsertId: (r as any).insertId ?? 0 }
   }
   async exec(sql: string): Promise<void> {
@@ -191,18 +199,33 @@ class MySQLAdapter implements DatabaseAdapter {
 }
 
 /* --------------------------------- D1 ------------------------------------ */
+/**
+ * D1 适配器 (v2.3.5 装表): 每条语句从 meta.rows_read / meta.rows_written 精确抄表,
+ * 口径与 Cloudflare 官方配额完全一致。get() 由 .first() 改走 .all() 取首行 —
+ * first() 不返回 meta, 行读计量会全部丢失; 同一 SQL 的行读数不变, 行为零差异。
+ * 写路径 (run/exec) 顺带节流落账 (60s 一次原子 UPSERT), 让引擎 isolate
+ * (消息/发货链路) 不经过 dashboard 也能把当日累计落到 d1_metrics 表。
+ */
 class D1Adapter implements DatabaseAdapter {
   driver = 'd1' as const
   constructor(private d1: any) {}
   all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-    return this.d1.prepare(sql).bind(...params).all().then((r: any) => r.results ?? [])
+    return this.d1.prepare(sql).bind(...params).all().then((r: any) => {
+      recordQuery(sql, r.meta?.rows_read, r.meta?.rows_written)
+      return r.results ?? []
+    })
   }
   async get<T = any>(sql: string, params: any[] = []): Promise<T | null> {
-    const r = await this.d1.prepare(sql).bind(...params).first()
-    return (r as T) ?? null
+    // .first() 不带 meta (行读无法计量) → 统一走 .all() 取首行, 语义完全一致
+    const r = await this.d1.prepare(sql).bind(...params).all()
+    recordQuery(sql, r.meta?.rows_read, r.meta?.rows_written)
+    return ((r.results ?? []) as T[])[0] ?? null
   }
   async run(sql: string, params: any[] = []): Promise<{ changes: number; lastInsertId: number | string }> {
     const r = await this.d1.prepare(sql).bind(...params).run()
+    recordQuery(sql, r.meta?.rows_read, r.meta?.rows_written)
+    // 写路径顺带落账: 节流 60s, 命中才多一次 UPSERT 往返 (await 保证在请求生命周期内完成)
+    if (d1MetricsFlushDue()) await flushD1Metrics(this).catch(() => {})
     return { changes: r.meta?.changes ?? 0, lastInsertId: r.meta?.last_row_id ?? 0 }
   }
   async exec(sql: string): Promise<void> {
@@ -212,10 +235,19 @@ class D1Adapter implements DatabaseAdapter {
     const stmts = sql.split(';').map((s) => s.trim()).filter(Boolean)
     if (!stmts.length) return
     if (stmts.length === 1) {
-      await this.d1.prepare(stmts[0]).run()
+      const r = await this.d1.prepare(stmts[0]).run()
+      recordQuery(stmts[0], r.meta?.rows_read, r.meta?.rows_written)
       return
     }
-    await this.d1.batch(stmts.map((s) => this.d1.prepare(s)))
+    const rs: any[] = await this.d1.batch(stmts.map((s) => this.d1.prepare(s)))
+    // batch 结果逐条抄表求和 (每条 statement 自带 meta)
+    let reads = 0
+    let writes = 0
+    for (const r of rs) {
+      reads += Number(r?.meta?.rows_read ?? 0)
+      writes += Number(r?.meta?.rows_written ?? 0)
+    }
+    recordQuery(stmts[0], reads, writes, stmts.length)
   }
   async transaction<T>(fn: () => Promise<T>): Promise<T> {
     // D1 batch is non-interactive; emulate best-effort (no nested tx)

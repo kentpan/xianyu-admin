@@ -261,13 +261,10 @@ export async function upsertSoldOrderFull(
     .map(([col]) => `, ${col} = excluded.${col}`)
     .join('')
 
-  // (v2.3.0 修复) 新插入也必须打 full_sync 标: v2.2.6 只在 ON CONFLICT 更新分支写
-  // sync_source='full_sync', 首次插入的订单永远无标记 → 闲鱼趋势 tab 全量口径
-  // (sync_source='full_sync') 永远查不到它们, 列表恒为空
   await db
     .run(
-      `INSERT INTO orders (${cols}, sync_source)
-       VALUES (${vals}, 'full_sync')
+      `INSERT INTO orders (${cols})
+       VALUES (${vals})
        ON CONFLICT(order_id) DO UPDATE SET
          order_status = CASE WHEN excluded.order_status != 'unknown' THEN excluded.order_status ELSE orders.order_status END,
          item_id = CASE WHEN excluded.item_id != '' THEN excluded.item_id ELSE orders.item_id END,

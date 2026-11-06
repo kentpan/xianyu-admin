@@ -124,49 +124,6 @@
             <input v-model.number="aiForm.max_bargain_rounds" type="number" min="0" class="input" />
           </div>
         </div>
-        <!-- v2.3.0: 知识库与回复风格三开关 -->
-        <div class="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
-          <div class="px-3 py-2 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-700">
-            <p class="text-sm font-medium text-slate-700 dark:text-slate-200">知识库与回复风格 (v2.3.0)</p>
-          </div>
-          <div class="p-3 space-y-3">
-            <label class="flex items-start gap-2 cursor-pointer">
-              <input
-                v-model="aiForm.use_item_kb"
-                type="checkbox"
-                class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500"
-                @change="onUseItemKbChange"
-              />
-              <span>
-                使用商品消息作为知识库
-                <span class="block mt-0.5 text-slate-400">AI 回复时引用本商品历史真实对话作为上下文</span>
-              </span>
-            </label>
-            <label
-              class="flex items-start gap-2"
-              :class="aiForm.use_item_kb ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
-              :title="aiForm.use_item_kb ? '' : '先开启商品消息知识库'"
-            >
-              <input
-                v-model="aiForm.share_item_kb"
-                type="checkbox"
-                class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500"
-                :disabled="!aiForm.use_item_kb"
-              />
-              <span>
-                同商品消息跨账号共享
-                <span class="block mt-0.5 text-slate-400">商品历史对话样本不限当前账号 (多账号聚合)</span>
-              </span>
-            </label>
-            <label class="flex items-start gap-2 cursor-pointer">
-              <input v-model="aiForm.use_account_style" type="checkbox" class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500" />
-              <span>
-                使用当前账号回复风格
-                <span class="block mt-0.5 text-slate-400">AI 语气/用语与该账号历史回复保持一致</span>
-              </span>
-            </label>
-          </div>
-        </div>
         <div>
           <label class="label">商品专属提示词</label>
           <textarea v-model="aiForm.custom_prompts" rows="5" class="input" placeholder="该商品的回复风格 / 商品说明 / 禁语等 (留空则用默认提示词)"></textarea>
@@ -328,21 +285,10 @@ async function openAiConfig(r: ItemReply) {
       max_discount_amount: conf.max_discount_amount ?? 100,
       max_bargain_rounds: conf.max_bargain_rounds ?? 3,
       custom_prompts: conf.custom_prompts || '',
-      // v2.3.0 三开关 (0/1 → 布尔, 默认关闭)
-      use_item_kb: !!Number(conf.use_item_kb ?? 0),
-      share_item_kb: !!Number(conf.share_item_kb ?? 0),
-      use_account_style: !!Number(conf.use_account_style ?? 0),
     }
   } catch (e: any) {
     toast.error(e.message || 'AI 配置加载失败')
     aiModalOpen.value = false
-  }
-}
-
-/** 关闭「使用商品消息作为知识库」时, 子选项「跨账号共享」一并关闭 */
-function onUseItemKbChange() {
-  if (aiForm.value && !aiForm.value.use_item_kb) {
-    aiForm.value.share_item_kb = false
   }
 }
 
@@ -364,10 +310,6 @@ async function saveAiConfig() {
       max_discount_amount: Number(aiForm.value.max_discount_amount) || 0,
       max_bargain_rounds: Number(aiForm.value.max_bargain_rounds) || 0,
       custom_prompts: aiForm.value.custom_prompts || '',
-      // v2.3.0 三开关: 布尔 → 0/1 (后端两者均兼容)
-      use_item_kb: aiForm.value.use_item_kb ? 1 : 0,
-      share_item_kb: aiForm.value.share_item_kb ? 1 : 0,
-      use_account_style: aiForm.value.use_account_style ? 1 : 0,
     })
     toast.success('商品 AI 配置已保存')
     aiModalOpen.value = false
@@ -418,6 +360,13 @@ async function deleteOne(r: ItemReply) {
   } catch (e: any) {
     toast.error(e.message || '删除失败')
   }
+}
+
+function formatTime(t?: string) {
+  if (!t) return '—'
+  const d = new Date(t.replace(' ', 'T'))
+  if (isNaN(d.getTime())) return t
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(reload)

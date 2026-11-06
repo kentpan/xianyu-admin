@@ -31,15 +31,6 @@ export default defineEventHandler(
     await db.run('UPDATE engines SET is_active = 0, updated_at = CURRENT_TIMESTAMP')
     await db.run('UPDATE engines SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [id])
 
-    // 所有权同步 (v2.3.2): 激活内置 → owner=builtin (config 立即对代理 active=false);
-    // 激活远程代理 → owner=remote (授权即时归还, 不等 90s 交回稳定窗)。
-    // 不做这步: 上一轮接管残留的 owner=builtin 会让新激活的代理拿不到账号 (config.active=false)。
-    await db
-      .run('UPDATE engine_failover SET owner = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [
-        row.type === 'builtin' ? 'builtin' : 'remote',
-      ])
-      .catch(() => {})
-
     return ok({ active_slug: row.slug, active_name: row.name }, `已切换为使用「${row.name}」`)
   }),
 )

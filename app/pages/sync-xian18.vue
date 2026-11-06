@@ -141,8 +141,7 @@ async function syncFromXian18() {
   try {
     const r = await syncXian18()
     list.value = r.commodities || []
-    // 北京时间 (v2.3.0): naive 串按 UTC 解析后按 Asia/Shanghai 展示
-    lastSyncedAt.value = bjTime(r.syncedAt || Date.now())
+    lastSyncedAt.value = new Date(r.syncedAt || Date.now()).toLocaleString('zh-CN')
     toast.success(`同步成功,共 ${r.total} 个商品`)
   } catch (e: any) {
     toast.error(e.message || '同步失败')

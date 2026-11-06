@@ -35,13 +35,12 @@ interface DayBucket {
 
 function emptyDayBuckets(): DayBucket[] {
   const days: DayBucket[] = []
-  // 北京时间 (v2.3.0): 桶按北京日历日 (UTC+8) — DB 存 UTC, +8h 后取 UTC 日期即北京日期
-  const bjNow = new Date(Date.now() + 8 * 3600 * 1000)
+  const now = new Date()
   for (let i = 6; i >= 0; i--) {
-    const d = new Date(bjNow)
-    d.setUTCDate(d.getUTCDate() - i)
-    const key = d.toISOString().slice(0, 10) // YYYY-MM-DD (北京日历日)
-    days.push({ date: key, label: `${d.getUTCMonth() + 1}/${d.getUTCDate()}`, count: 0, revenue: 0, paid: 0, received: 0, refunded: 0 })
+    const d = new Date(now)
+    d.setDate(d.getDate() - i)
+    const key = d.toISOString().slice(0, 10) // YYYY-MM-DD (与 created_at 的 UTC 存储对齐)
+    days.push({ date: key, label: `${d.getMonth() + 1}/${d.getDate()}`, count: 0, revenue: 0, paid: 0, received: 0, refunded: 0 })
   }
   return days
 }
@@ -74,15 +73,15 @@ export default defineEventHandler(
         received: number
         refunded: number
       }>(
-        `SELECT substr(datetime(created_at, '+8 hours'), 1, 10) as d,
+        `SELECT substr(created_at, 1, 10) as d,
                 COUNT(*) as c,
                 COALESCE(SUM(CAST(amount AS REAL)), 0) as rev,
                 COALESCE(SUM(CASE WHEN order_status IN (${PAID_STATUSES.map(() => '?').join(',')}) THEN 1 ELSE 0 END), 0) as paid,
                 COALESCE(SUM(CASE WHEN order_status IN (${RECEIVED_STATUSES.map(() => '?').join(',')}) THEN 1 ELSE 0 END), 0) as received,
                 COALESCE(SUM(CASE WHEN order_status IN (${REFUNDED_STATUSES.map(() => '?').join(',')}) THEN 1 ELSE 0 END), 0) as refunded
          FROM orders
-         WHERE created_at >= datetime('now', '-7 days', '-8 hours')
-         GROUP BY substr(datetime(created_at, '+8 hours'), 1, 10)`,
+         WHERE created_at >= date('now', '-7 days')
+         GROUP BY substr(created_at, 1, 10)`,
         [...PAID_STATUSES, ...RECEIVED_STATUSES, ...REFUNDED_STATUSES],
       )
       for (const r of rows) {
@@ -100,10 +99,7 @@ export default defineEventHandler(
         'SELECT created_at, amount, order_status FROM orders',
       )
       for (const o of all) {
-        // 北京时间 (v2.3.0): naive UTC 串 +8h 后取日期 (与 SQL 分支 datetime(created_at,'+8 hours') 同口径)
-        const ms = Date.parse((o.created_at || '').replace(' ', 'T') + 'Z')
-        if (Number.isNaN(ms)) continue
-        const d = new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 10)
+        const d = (o.created_at || '').slice(0, 10)
         const day = dayIndex.get(d)
         if (!day) continue
         day.count++

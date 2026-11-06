@@ -37,7 +37,7 @@
           >
             <div class="flex items-center justify-between gap-2">
               <p class="font-medium text-slate-800 dark:text-slate-100 truncate">{{ c.peer_nick || c.peer_user_id || c.chat_id }}</p>
-              <span class="shrink-0 text-slate-400">{{ bjChatTime(c.last_message_time) }}</span>
+              <span class="shrink-0 text-slate-400">{{ shortTime(c.last_message_time) }}</span>
             </div>
             <div class="flex items-center justify-between gap-2 mt-1">
               <p class="truncate text-slate-500 dark:text-slate-400">{{ c.last_message || '—' }}</p>
@@ -72,48 +72,21 @@
               <Icon name="refresh" class="animate-spin mr-2" /> 加载中...
             </div>
             <template v-else>
-              <div v-for="m in msgs" :key="m.id" class="flex items-center gap-1.5 group" :class="m.direction === 'out' ? 'justify-end' : 'justify-start'">
-                <!-- 知识库 toggle 按钮 (v2.3.1): 买家消息右外侧 / 卖家消息左外侧。
-                     ✅ 已添加 = 常显 (不依赖 hover); + 未添加 = hover 消息行才显现 (占位不跳动)。
-                     点击 + 添加到知识库变 ✅, 再点 ✅ 从知识库移除变回 +。 -->
-                <button
-                  v-if="m.direction !== 'system'"
-                  type="button"
-                  class="shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-white transition-opacity focus-visible:opacity-100"
-                  :class="[
-                    m.direction === 'in' ? 'order-last' : 'order-first',
-                    capturedSet.has(String(m.id))
-                      ? 'bg-emerald-500 hover:bg-emerald-600 opacity-100'
-                      : 'bg-amber-500 hover:bg-amber-600 opacity-0 group-hover:opacity-100',
-                    capturingId === String(m.id) ? '!opacity-100 animate-pulse pointer-events-none' : '',
-                  ]"
-                  :title="capturedSet.has(String(m.id)) ? '已添加到知识库, 点击移除' : '添加到知识库'"
-                  :aria-label="capturedSet.has(String(m.id)) ? '从知识库移除' : '添加到知识库'"
-                  :aria-pressed="capturedSet.has(String(m.id))"
-                  @click="toggleKb(m)"
+              <div v-for="m in msgs" :key="m.id" class="flex" :class="m.direction === 'out' ? 'justify-end' : 'justify-start'">
+                <div
+                  class="max-w-[75%] rounded-2xl px-4 py-2"
+                  :class="m.direction === 'out'
+                    ? 'bg-brand-500 text-white rounded-br-sm'
+                    : m.direction === 'system'
+                      ? 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-sm'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 rounded-bl-sm'"
                 >
-                  <Icon :name="capturedSet.has(String(m.id)) ? 'check' : 'plus'" class="w-3.5 h-3.5" />
-                </button>
-                <div class="max-w-[75%]">
-                  <div
-                    class="rounded-2xl px-4 py-2"
-                    :class="m.direction === 'out'
-                      ? 'bg-brand-500 text-white rounded-br-sm'
-                      : m.direction === 'system'
-                        ? 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-sm'
-                        : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 rounded-bl-sm'"
-                  >
-                    <span
-                      v-if="m.direction === 'out' && m.is_ai === 1"
-                      class="badge bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 !text-[10px] !px-1.5 !py-0 mb-1"
-                    >AI</span>
-                    <p v-if="m.direction === 'system'" class="text-center">{{ m.content }}<template v-if="m.amount"> · ¥{{ m.amount }}</template></p>
-                    <template v-else>
-                      <p v-if="m.content_type === 'image'" class="break-all">{{ m.content }}</p>
-                      <p v-else class="whitespace-pre-wrap break-words">{{ m.content }}</p>
-                    </template>
-                    <p class="mt-1 opacity-60" :class="m.direction === 'out' ? 'text-right' : ''">{{ bjChatTime(m.msg_time) }}</p>
-                  </div>
+                  <p v-if="m.direction === 'system'" class="text-center">{{ m.content }}<template v-if="m.amount"> · ¥{{ m.amount }}</template></p>
+                  <template v-else>
+                    <p v-if="m.content_type === 'image'" class="break-all">{{ m.content }}</p>
+                    <p v-else class="whitespace-pre-wrap break-words">{{ m.content }}</p>
+                  </template>
+                  <p class="mt-1 opacity-60" :class="m.direction === 'out' ? 'text-right' : ''">{{ shortTime(m.msg_time) }}</p>
                 </div>
               </div>
               <EmptyState v-if="!msgs.length" message="该会话暂无落库消息" icon="message" />
@@ -171,17 +144,21 @@ const draft = ref('')
 const liveConnected = ref(false)
 const chatBox = ref<HTMLElement | null>(null)
 
-/** 知识库: 已采集的 source_message_id 集合 (仅拉取一次, 失败不阻塞页面) */
-const capturedSet = ref(new Set<string>())
-const capturingId = ref<string | null>(null)
-let capturedLoaded = false
-
 
 function isActive(c: ImConversation) {
   return activeConv.value?.cookie_id === c.cookie_id && activeConv.value?.chat_id === c.chat_id
 }
 
-// (v2.3.1) 本地 shortTime 包装已删: 会话/消息时间统一用全局 bjChatTime (app/utils/datetime.ts, 北京时间, 同日只显 HH:mm)
+function shortTime(t?: string | null) {
+  if (!t) return ''
+  const d = new Date(String(t).replace(' ', 'T'))
+  if (isNaN(d.getTime())) return String(t)
+  const now = new Date()
+  const sameDay = d.toDateString() === now.toDateString()
+  return sameDay
+    ? d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
 
 async function reload() {
   loading.value = true
@@ -254,74 +231,6 @@ async function syncConversations() {
   }
 }
 
-/** 拉取已入知识库的 source_message_id 集合 (GET /api/kb, 独立 try/catch 不阻塞页面) */
-async function loadCapturedMessages() {
-  if (capturedLoaded) return
-  capturedLoaded = true
-  try {
-    const data = await useApi().get<{ captured: string[] }>('/api/kb')
-    capturedSet.value = new Set((data?.captured || []).map(String))
-  } catch {
-    capturedLoaded = false // 失败允许下次进入页面重试
-  }
-}
-
-/** 气泡按钮 toggle (v2.3.1): + 未添加 → 点击捕获进知识库; ✅ 已添加 → 再点移除出知识库 */
-async function toggleKb(m: ImMessage) {
-  const sourceMessageId = String(m.id)
-  if (capturedSet.value.has(sourceMessageId)) await removeFromKb(m, sourceMessageId)
-  else await captureToKb(m, sourceMessageId)
-}
-
-/** 添加消息到知识库 (重复时后端自动去重并 freq+1, 仍返回成功) */
-async function captureToKb(m: ImMessage, sourceMessageId: string) {
-  const c = activeConv.value
-  if (!c) return
-  capturingId.value = sourceMessageId
-  try {
-    const r = await useApi().post<{ duplicated: boolean; id: number | string }>('/api/kb/capture', {
-      role: m.direction === 'in' ? 'question' : 'answer',
-      content: m.content,
-      source_message_id: sourceMessageId,
-      source_chat_id: c.chat_id,
-      source_cookie_id: c.cookie_id,
-      item_id: m.item_id || c.item_id || '',
-    })
-    if (r?.duplicated) {
-      toast.info('该消息已在知识库中, 频次 +1')
-    } else {
-      toast.success('已添加到知识库')
-    }
-    capturedSet.value = new Set([...capturedSet.value, sourceMessageId])
-  } catch (e: any) {
-    toast.error(e.message || '添加到知识库失败')
-  } finally {
-    capturingId.value = null
-  }
-}
-
-/** 从知识库移除 (✅ → + toggle 另一半; 带 content 兜底: 同内容被其他消息沉淀时也能正确移除整条) */
-async function removeFromKb(m: ImMessage, sourceMessageId: string) {
-  capturingId.value = sourceMessageId
-  try {
-    await useApi().post('/api/kb/capture-remove', {
-      source_message_id: sourceMessageId,
-      role: m.direction === 'in' ? 'question' : 'answer',
-      content: m.content,
-    })
-    toast.success('已从知识库移除')
-    const next = new Set(capturedSet.value)
-    next.delete(sourceMessageId)
-    capturedSet.value = next
-  } catch (e: any) {
-    toast.error(e.message || '移除失败')
-    capturedLoaded = false // 集合可能与库不一致, 刷新重拉
-    loadCapturedMessages()
-  } finally {
-    capturingId.value = null
-  }
-}
-
 /** 实时推送: edge 走 Durable Object WebSocket, node 走 SSE (useRealtime 自动选择, 零轮询) */
 const realtime = useRealtime()
 watch(realtime.status, (s) => (liveConnected.value = s === 'open'))
@@ -349,7 +258,6 @@ function scheduleConvRefresh() {
 
 onMounted(() => {
   reload()
-  loadCapturedMessages()
   realtime.connect()
 })
 onBeforeUnmount(() => {

@@ -54,7 +54,7 @@
             </thead>
             <tbody>
               <tr v-for="r in logs" :key="r.id">
-                <td class="text-slate-500 dark:text-slate-400 text-xs font-mono">{{ formatTimeFull(r.created_at) }}</td>
+                <td class="text-slate-500 dark:text-slate-400 text-xs font-mono">{{ formatTime(r.created_at) }}</td>
                 <td class="font-mono text-xs">{{ r.cookie_id }}</td>
                 <td>
                   <span class="badge bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300">{{ r.event_type || '—' }}</span>
@@ -159,6 +159,13 @@ async function deleteOne(r: RiskLog) {
   } catch (e: any) {
     toast.error(e.message || '删除失败')
   }
+}
+
+function formatTime(t?: string) {
+  if (!t) return '—'
+  const d = new Date(t.replace(' ', 'T'))
+  if (isNaN(d.getTime())) return t
+  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 onMounted(reload)

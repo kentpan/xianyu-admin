@@ -49,7 +49,7 @@
                       <span v-if="!n.read" class="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0" />
                     </p>
                     <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2">{{ n.message }}</p>
-                    <p class="text-[10px] text-slate-400 mt-1">{{ formatAgo(n.created_at) }}</p>
+                    <p class="text-[10px] text-slate-400 mt-1">{{ formatTime(n.created_at) }}</p>
                   </div>
                 </div>
               </div>
@@ -132,13 +132,32 @@ function dotClass(type: string) {
   }[type] || 'bg-slate-400'
 }
 
-// (v2.3.1) 本地时间包装已删: 统一用全局 formatAgo (app/utils/datetime.ts, 北京时间)
+function formatTime(t?: string) {
+  if (!t) return ''
+  const d = new Date(String(t).replace(' ', 'T'))
+  if (isNaN(d.getTime())) return t
+  const diff = Date.now() - d.getTime()
+  if (diff < 60000) return '刚刚'
+  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前'
+  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前'
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
 onMounted(() => {
   load()
-  // Poll every 60s
+  // Poll every 60s (v2.3.5: 页面隐藏时完全暂停, 回到前台立即补一次 — 后台标签页零请求)
   if (import.meta.client) {
-    const t = setInterval(load, 60000)
-    onBeforeUnmount(() => clearInterval(t))
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load()
+    }, 60000)
+    const onVis = () => {
+      if (document.visibilityState === 'visible') load()
+    }
+    document.addEventListener('visibilitychange', onVis)
+    onBeforeUnmount(() => {
+      clearInterval(t)
+      document.removeEventListener('visibilitychange', onVis)
+    })
   }
 })
 </script>

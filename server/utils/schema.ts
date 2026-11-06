@@ -5,8 +5,6 @@
  * with the `{AUTO}` marker which the initializer replaces per-driver.
  */
 import type { DatabaseAdapter } from './db'
-// (v2.3.0) 菜单种子计数比对: 相对路径导入 (#shared 别名在 Nitro 部分热更新时可能未解析)
-import { NAV_ITEMS } from '../../shared/navigation'
 
 const AUTO = {
   sqlite: 'INTEGER PRIMARY KEY AUTOINCREMENT',
@@ -221,6 +219,15 @@ const SCHEMA: string[] = [
     key_name VARCHAR(64) PRIMARY KEY,
     value TEXT NOT NULL,
     description TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
+  // D1 用量计量表 (v2.3.5): UTC 日期主键一天一行, 各 isolate 电表增量原子 UPSERT 汇总;
+  // 自身读写不计入计量 (电表不给电表充电), 落账节流 60s/isolate
+  `CREATE TABLE IF NOT EXISTS d1_metrics (
+    metric_date VARCHAR(10) PRIMARY KEY,
+    rows_read INTEGER DEFAULT 0,
+    rows_written INTEGER DEFAULT 0,
+    query_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS user_settings (
@@ -556,10 +563,6 @@ const SCHEMA: string[] = [
     max_discount_amount INTEGER DEFAULT 100,
     max_bargain_rounds INTEGER DEFAULT 3,
     custom_prompts TEXT,
-    -- 商品级三开关 (v2.3.0): 商品消息作知识库 / 同商品消息跨账号共享 / 当前账号回复风格
-    use_item_kb INTEGER DEFAULT 0,
-    share_item_kb INTEGER DEFAULT 0,
-    use_account_style INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(cookie_id, item_id)
@@ -595,15 +598,6 @@ const SCHEMA: string[] = [
     last_status TEXT,
     last_poll_ip VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  // 监听所有权仲裁表 (v2.3.2 双连接根治): 同一账号同一时刻只允许一个进程持有闲鱼长连接
-  // (独立代理 或 内置引擎), owner 是唯一真源 — 内置引擎接管时置 builtin, /api/engine/config
-  // 据此对代理返回 active=false 吊销其授权 (代理 ≤30s 内退避), 结构性消灭双连接
-  // (双设备指纹双出口 IP → 平台风控判「环境异常, 重新登录 + 人脸核验」)。
-  `CREATE TABLE IF NOT EXISTS engine_failover (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    owner VARCHAR(16) NOT NULL DEFAULT 'remote',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   // 事件发布订阅者: 引擎监听到的原始事件 (聊天/系统/风控) 转发给下游项目,
@@ -678,6 +672,16 @@ const SCHEMA: string[] = [
     pending INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+  // ── v2.3.5 D1 免费额度保卫战: 大表 created_at 索引 (消除 ORDER BY created_at
+  //    全表扫描 — D1 按扫描行数计费, 无索引排序 = 每次轮询把整张表读完一遍) ──
+  // dashboard 工作台/活动流/趋势: orders 按时间取最近 + 按账号聚合
+  `CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_cookie_created ON orders(cookie_id, created_at)`,
+  // 系统日志/风控日志: 最近 N 条取最新 (dashboard 活动流 + 日志页)
+  `CREATE INDEX IF NOT EXISTS idx_system_logs_created ON system_logs(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_risk_logs_created ON risk_control_logs(created_at)`,
+  // 账号在线状态: 按账号聚合订单数/关键词数 (dashboard online 轮询)
+  `CREATE INDEX IF NOT EXISTS idx_keywords_cookie ON keywords(cookie_id)`,
 ]
 
 /**
@@ -805,9 +809,6 @@ const MIGRATIONS: string[] = [
   )`,
   `INSERT OR IGNORE INTO engines (id, slug, name, type, is_active, remark)
    VALUES (1, 'builtin', '内置监听引擎', 'builtin', 1, '与后台同进程, 共享数据库')`,
-  // 监听所有权仲裁行 (v2.3.2): 默认 remote = 远程代理在服务时的初始所有权;
-  // 内置引擎接管/激活时由 engine-manager 原子翻转为 builtin
-  `INSERT OR IGNORE INTO engine_failover (id, owner) VALUES (1, 'remote')`,
   // 引擎接入令牌: 统一 Authorization: Bearer <token> 鉴权, 每个引擎独立令牌
   `ALTER TABLE engines ADD COLUMN token VARCHAR(64) DEFAULT ''`,
   // 风控: 设备指纹持久化 (重连/换机不换设备 ID, 避免风控)
@@ -967,79 +968,6 @@ const MIGRATIONS: string[] = [
     reason VARCHAR(255) DEFAULT 'user_delete',
     deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
-  // 全平台热门商品趋势 (v2.3.0): 闲鱼站内搜索 (mtop.taobao.idle.pc.search, goofish.com
-  // 搜索页同源) 按关键词抓取的**全平台**在售商品快照聚合 — 卖家订单接口是账号维度
-  // (只返回该账号自己的订单), 全平台数据的真实来源只有搜索。重复搜到同一商品:
-  // seen_count 累加 (在售稳定度), want_count/价格/卖家取最新快照, 用于热门榜排序。
-  `CREATE TABLE IF NOT EXISTS trend_hot_items (
-    item_id VARCHAR(64) PRIMARY KEY,
-    title VARCHAR(512) DEFAULT '',
-    price VARCHAR(32) DEFAULT '',
-    seller_id VARCHAR(64) DEFAULT '',
-    seller_nick VARCHAR(128) DEFAULT '',
-    area VARCHAR(128) DEFAULT '',
-    pic_url TEXT DEFAULT '',
-    want_count INTEGER DEFAULT 0,
-    keyword VARCHAR(128) DEFAULT '',
-    // 商品类型 (v2.3.0): virtual=虚拟商品 / physical=实体商品, 按标题特征词分类;
-    // 趋势页默认只看虚拟商品 (与卖虚拟服务的运营口径一致), '' = 未分类旧数据 (读时自愈回填)
-    item_type VARCHAR(16) DEFAULT '',
-    seen_count INTEGER DEFAULT 1,
-    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  // AI 知识库 (v2.3.0): 3 列表模型 (分组/问话/回答) + 多对多分组映射。
-  // 问话/回答从消息管理页手动添加 (买家消息→问话, 卖家消息→回答, 不做自动同步),
-  // 存储采用「文本快照 + 溯源」混合式: content 反范式化快照 (AI 检索零 JOIN, 快),
-  // source_message_id/conversation 溯源唯一数据源; 去重 hash 唯一索引, 重复添加
-  // freq+1 作置信度依据; sort 字段即优先级 (AI 检索按 sort 升序, 越靠前越优先)。
-  `CREATE TABLE IF NOT EXISTS kb_groups (
-    id __AUTO__,
-    name VARCHAR(128) NOT NULL,
-    sort INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  `CREATE TABLE IF NOT EXISTS kb_questions (
-    id __AUTO__,
-    content TEXT NOT NULL,
-    content_hash VARCHAR(64) NOT NULL UNIQUE,
-    source_message_id VARCHAR(64) DEFAULT '',
-    source_chat_id VARCHAR(64) DEFAULT '',
-    source_cookie_id VARCHAR(64) DEFAULT '',
-    item_id VARCHAR(64) DEFAULT '',
-    buyer_id VARCHAR(64) DEFAULT '',
-    freq INTEGER DEFAULT 1,
-    sort INTEGER DEFAULT 0,
-    ai_hit_count INTEGER DEFAULT 0,
-    ai_last_used_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  `CREATE TABLE IF NOT EXISTS kb_answers (
-    id __AUTO__,
-    content TEXT NOT NULL,
-    content_hash VARCHAR(64) NOT NULL UNIQUE,
-    source_message_id VARCHAR(64) DEFAULT '',
-    source_chat_id VARCHAR(64) DEFAULT '',
-    source_cookie_id VARCHAR(64) DEFAULT '',
-    item_id VARCHAR(64) DEFAULT '',
-    is_ai_generated INTEGER DEFAULT 0,
-    freq INTEGER DEFAULT 1,
-    sort INTEGER DEFAULT 0,
-    ai_hit_count INTEGER DEFAULT 0,
-    ai_last_used_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  `CREATE TABLE IF NOT EXISTS kb_group_members (
-    id __AUTO__,
-    group_id INTEGER NOT NULL,
-    item_type VARCHAR(8) NOT NULL,
-    item_id INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(group_id, item_type, item_id)
-  )`,
   // 全量订单同步 (v2.2.6): 商品名称/买家昵称/卖家身份/商品真实单价 真实解析落库 —— 卖家订单列表
   // 接口响应里本身携带商品标题/买卖家数据/单价与各状态时间, 此前从未解析入库, 订单页商品列
   // 只能 JOIN item_info 兑底 (非已添加账号的订单无 item_info 记录 → 只能显示 item_id)。老库 ALTER 幂等。
@@ -1051,13 +979,6 @@ const MIGRATIONS: string[] = [
   // 闲鱼趋势 tab 数据源) 真实拉取入库; 空串 = 其余既有链路 (引擎事件/一键同步/手动录入)。
   // 纯新增列, 既有链路零读写零影响; 老库 ALTER 幂等。
   `ALTER TABLE orders ADD COLUMN sync_source VARCHAR(16) DEFAULT ''`,
-  // 全平台热门商品趋势 (v2.3.0): 商品类型列 — 虚拟/实体分类 (老库 ALTER 幂等)
-  `ALTER TABLE trend_hot_items ADD COLUMN item_type VARCHAR(16) DEFAULT ''`,
-  // (v2.3.4 修复) 成功日志脏数据修复: 2.3.1~2.3.3 代理回报链路发送成功时把空错误串经
-  // mtopFailMessage('') 兑底成「未知错误」写进 error_message, 盖住了发货内容 (线上实证)。
-  // 服务端已修复 (events.post.ts 成功回报清空 error_message), 此处一次性清历史脏行 —
-  // 条件精确匹配 (成功 + 文案逐字等于「未知错误」), 幂等可重入, 只动被 bug 污染的行。
-  `UPDATE auto_reply_logs SET error_message = NULL WHERE send_status = 'success' AND error_message = '未知错误'`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [
@@ -1149,8 +1070,6 @@ function schemaFingerprint(): string {
 
 export async function initSchema(db: DatabaseAdapter): Promise<void> {
   const auto = AUTO[db.driver] || AUTO.sqlite
-  // (v2.3.0) 菜单种子计数: warm boot 用菜单数与种子数比对判断是否需要补种新菜单
-  const NAV_ITEM_COUNT = NAV_ITEMS.length
 
   // 冷启动短路: 指纹一致 = 全部结构/迁移/种子已就位, 1 次查询即返回。
   // 首次启动/升级时 system_settings 尚无此行或表不存在 → 全量初始化后写入指纹。
@@ -1170,9 +1089,7 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
         // menus 表不存在 → 指纹不可信, 走全量初始化
         menuCount = -1
       }
-      // (v2.3.0) 菜单数少于种子数也补种: 版本升级新增菜单 (如 AI知识库) 在老库上
-      // 自动入表 — seedRbac 按 path 幂等补种, 已存在的名称/图标/排序不覆盖
-      if (menuCount >= NAV_ITEM_COUNT) return
+      if (menuCount > 0) return
       try {
         const { seedRbac } = await import('./rbac')
         await seedRbac(db)
@@ -1197,34 +1114,6 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     } catch {
       // column already exists — expected on re-run
     }
-  }
-
-  // (v2.3.0) __AUTO__ 残留自检: 任何执行路径若以未替换标记的 DDL 建表 (id 列退化为
-  // 非主键文本类型, INSERT 后 id 恒为 NULL), 在此检测并重建 — 坏表一旦存在会静默
-  // 污染全部写入 (主键去重失效), 必须在启动期根治。
-  // ⚠️ 匹配必须用 instr() 而非 LIKE '%__AUTO__%': SQLite 的 _ 是单字符通配符,
-  // '%__AUTO__%' 会命中一切含 AUTOINCREMENT 的正常表 (每个 _ 吞一个字符) —
-  // 历史版本曾因此把全库自增表 DROP 重建清空 (v2.3.0 修复)。
-  try {
-    const badTables = await db.all<{ name: string; sql: string }>(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND instr(sql, '__AUTO__') > 0",
-    )
-    for (const t of badTables || []) {
-      console.warn(`[xianyu-admin] 检测到 __AUTO__ 残留坏表: ${t.name} → 重建`)
-      try {
-        await db.exec(`DROP TABLE IF EXISTS "${t.name}"`)
-        const fixed = SCHEMA.find((s) => s.includes(`CREATE TABLE IF NOT EXISTS ${t.name}`))
-        if (fixed) {
-          await db.exec(fixed.replace(/__AUTO__/g, auto))
-          console.log(`[xianyu-admin] 坏表 ${t.name} 已按标准 DDL 重建`)
-        }
-      } catch (e: any) {
-        // 单表重建失败不中断其余坏表处理
-        console.error(`[xianyu-admin] 坏表 ${t.name} 重建失败:`, String(e?.message || e).slice(0, 120))
-      }
-    }
-  } catch (e: any) {
-    console.error('[xianyu-admin] __AUTO__ 自检失败:', String(e?.message || e).slice(0, 120))
   }
 
   // 一次性数据迁移: 存量分散在账号级/商品级的模型接入信息聚合为 ai_configs 记录并建立引用。
@@ -1259,30 +1148,6 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     }
   } catch (e: any) {
     console.error('[xianyu-admin] ai_configs data migration failed:', e?.message || e)
-  }
-
-  // 一次性数据迁移 (v2.3.0): 消息时间统一定标 — 历史 im_messages.msg_time /
-  // im_conversations.last_message_time 曾由 imTimestamp 预移位 +8 (北京时间墙钟) 写入,
-  // 与全库 UTC 口径不一致 (展示层统一 +8 渲染会双重偏移) → 一次性 -8h 归位为 UTC,
-  // 新写入 (imTimestamp 已改 UTC) 不受影响。标记位保证只跑一次。
-  try {
-    const msgMigrated = await db.get<{ value: string }>(
-      "SELECT value FROM system_settings WHERE key_name = 'msg_time_utc_migrated'",
-    )
-    if (!msgMigrated) {
-      await db.exec(
-        "UPDATE im_messages SET msg_time = datetime(msg_time, '-8 hours') WHERE msg_time IS NOT NULL AND msg_time != ''",
-      )
-      await db.exec(
-        "UPDATE im_conversations SET last_message_time = datetime(last_message_time, '-8 hours') WHERE last_message_time IS NOT NULL AND last_message_time != ''",
-      )
-      await db.run(
-        "INSERT INTO system_settings (key_name, value, description) VALUES ('msg_time_utc_migrated', '1', '消息时间已从北京时间墙钟统一定标为 UTC (v2.3.0 一次性迁移)')",
-      )
-      console.log('[xianyu-admin] 消息时间北京墙钟 → UTC 一次性定标完成 (im_messages / im_conversations)')
-    }
-  } catch (e: any) {
-    console.error('[xianyu-admin] msg_time utc migration failed:', e?.message || e)
   }
 
   // Seed default system settings (idempotent, cross-driver); 一次读全量 key 再补插, 避免逐条 SELECT

@@ -63,6 +63,39 @@ export interface OnlineStatusResponse {
   }
 }
 
+export interface D1TopQuery {
+  sql: string
+  count: number
+  rowsRead: number
+  rowsWritten: number
+  lastAt: number
+}
+
+export interface D1MetricsResponse {
+  driver: string
+  metered: boolean
+  dateUtc: string
+  limits: { reads: number; writes: number }
+  today: {
+    rowsRead: number
+    rowsWritten: number
+    queryCount: number
+    readPercent: number
+    writePercent: number
+  }
+  resetInSec: number
+  live: {
+    rowsRead: number
+    rowsWritten: number
+    queryCount: number
+    pendingReads: number
+    pendingWrites: number
+    uptimeSec: number
+  }
+  topQueries: D1TopQuery[]
+  history: { date: string; rowsRead: number; rowsWritten: number; queryCount: number }[]
+}
+
 export function getDashboardStats() {
   return useApi().get<DashboardStats>('/api/dashboard/stats')
 }
@@ -85,6 +118,11 @@ export function getDashboardComparison() {
 
 export function getDashboardActivity() {
   return useApi().get<ActivityResponse>('/api/dashboard/activity')
+}
+
+/** D1 读写用量核心指标 (v2.3.5) */
+export function getDashboardD1Metrics() {
+  return useApi().get<D1MetricsResponse>('/api/dashboard/d1-metrics')
 }
 
 /**

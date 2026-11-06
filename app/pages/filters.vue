@@ -215,6 +215,17 @@ async function remove(f: MessageFilter) {
   }
 }
 
+function formatTime(t: string) {
+  if (!t) return '-'
+  try {
+    const d = t.includes('T') || t.includes('Z') ? new Date(t) : new Date(t.replace(' ', 'T') + 'Z')
+    if (Number.isNaN(d.getTime())) return t
+    return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return t
+  }
+}
+
 onMounted(async () => {
   try {
     accounts.value = await getAccounts()

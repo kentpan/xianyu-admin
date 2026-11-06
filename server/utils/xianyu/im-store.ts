@@ -49,12 +49,10 @@ export function imEventPacket(e: ImEvent): Record<string, any> {
   return p
 }
 
-/** 统一 "YYYY-MM-DD HH:MM:SS" 时间戳 (UTC, 与全库 TIMESTAMP 列一致; 展示层统一转北京时间)。 */
+/** 统一 "YYYY-MM-DD HH:MM:SS" 时间戳 (北京时间, 与全站 TIMESTAMP 列一致)。 */
 export function imTimestamp(ms?: number): string {
   const d = ms && ms > 0 ? new Date(ms) : new Date()
-  // (v2.3.0) 全库统一 UTC 存储: msg_time 不再预移位 +8 (历史 hack),
-  // 展示层统一由 app/utils/datetime.ts (bjChatTime 等) 按北京时区渲染。
-  return d.toISOString().slice(0, 19).replace('T', ' ')
+  return new Date(d.getTime() + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')
 }
 
 function messageKey(parts: (string | number)[]): string {
@@ -121,14 +119,13 @@ export async function persistSystemMessage(cookieId: string, msg: ParsedSystemMe
   }
 }
 
-/** 出站消息落库 (引擎回复/手动发送共用)。isAi=true 时写入 AI 标志 (仅管理后台可见, v2.3.0)。 */
+/** 出站消息落库 (引擎回复/手动发送共用)。 */
 export async function persistOutgoingMessage(
   cookieId: string,
   chatId: string,
   toUserId: string,
   content: string,
   contentType: 'text' | 'image',
-  isAi = false,
 ): Promise<void> {
   const db = await getDb().catch(() => null)
   if (!db || !chatId) return
@@ -136,9 +133,9 @@ export async function persistOutgoingMessage(
   const key = messageKey([cookieId, chatId, 'out', Date.now(), content, Math.random()])
   await db
     .run(
-      `INSERT OR IGNORE INTO im_messages (cookie_id, chat_id, direction, message_key, sender_user_id, sender_nick, content, content_type, msg_time, is_ai)
-       VALUES (?, ?, 'out', ?, ?, '我', ?, ?, ?, ?)`,
-      [cookieId, chatId, key, toUserId, content, contentType, timeStr, isAi ? 1 : 0],
+      `INSERT OR IGNORE INTO im_messages (cookie_id, chat_id, direction, message_key, sender_user_id, sender_nick, content, content_type, msg_time)
+       VALUES (?, ?, 'out', ?, ?, '我', ?, ?, ?)`,
+      [cookieId, chatId, key, toUserId, content, contentType, timeStr],
     )
     .catch(() => {})
   await upsertConversation(cookieId, chatId, {

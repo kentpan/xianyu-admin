@@ -53,13 +53,6 @@ import { mergeReportedCookies } from '../../utils/xianyu/cookie-store'
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
 
-/** 引擎账号心跳快照的 system_settings key (v2.3.4): value = { cookieId: { t: 毫秒, s: 状态文本 } } */
-const ENGINE_HEARTBEAT_KEY = 'engine_account_heartbeat'
-/** 上一轮心跳快照 (进程内存): 状态文本对比用, 只把变化的账号落 cookies (稳态零行写入)。
- * 多实例/重启后丢失 → 下一轮全量写一次 cookies, 等价旧行为, 无损正确性。 */
-let lastHeartbeatSnapshot: Record<string, { t: number; s: string }> | null = null
-let lastHeartbeatSnapshotAt = 0
-
 /** 后台决策整体超时预算 (v2.1.6): 兜底任何未知挂起点 (网关+任务+直连全超时/外部 API 卡死),
  *  必须 < PENDING_TTL_MS — 保证代理在本预算内拿到失效信号重报自愈, 而不是黑箱等满 3 分钟。 */
 const DECISION_BUDGET_MS = 150_000
@@ -102,69 +95,29 @@ export default defineEventHandler(
 
     const db = await getDb()
 
-    // 状态上报 → 引擎账号心跳回写 (v2.3.4 D1 写入额度根治, 原 15s×N 账号逐行 UPDATE):
-    //   ① 单行快照: 每轮心跳只 UPDATE system_settings 1 行 (全部账号 {id:{t,s}} JSON);
-    //      监听页/账号页在线判定读快照 (listener/status.get.ts 与 accounts/index.get.ts
-    //      输出层合并), 60s 判定语义不变, 实时精度反而从 15s 提升到每轮。
-    //   ② cookies 逐账号行仅在「状态文本变化」时写 (单条 CASE WHEN 批量 UPDATE, 一条 SQL
-    //      写 N 变化行); 稳态零行写入。last_check_at 语义 = 最后一次状态变化时间。
-    //   ③ 快照写入失败/旧版代理未上报时, 读方自动回落 cookies.last_check_at 原判定 —
-    //      旧代理 (不写快照但照常逐账号写 cookies) 与回滚旧版后台 (恢复无条件逐账号写)
-    //      全部兼容, 零破坏。
-    //   D1 免费额度 (10 万行写入/天) 测算: 100 账号 = 快照 5760 行/天 + 状态变化偶发,
-    //   原逐账号心跳为 100×5760=57.6 万行/天 (超额度 5.8 倍)。
+    // 状态上报 → cookies/engines 心跳回写
     const statusAccounts: any[] = body?.status?.accounts || []
-    const heartbeatAccounts = statusAccounts.slice(0, 200).filter((acc) => acc?.id)
-    if (heartbeatAccounts.length) {
-      const nowMs = Date.now()
-      const snapshot: Record<string, { t: number; s: string }> = {}
-      for (const acc of heartbeatAccounts) {
-        snapshot[String(acc.id)] = { t: nowMs, s: String(acc.state || 'connecting').slice(0, 32) }
-      }
+    for (const acc of statusAccounts.slice(0, 200)) {
+      if (!acc?.id) continue
       await db
-        .run(
-          `INSERT INTO system_settings (key_name, value) VALUES (?, ?)
-           ON CONFLICT(key_name) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
-          [ENGINE_HEARTBEAT_KEY, JSON.stringify(snapshot)],
-        )
+        .run('UPDATE cookies SET cookie_status_text = ?, last_check_at = CURRENT_TIMESTAMP WHERE id = ?', [
+          String(acc.state || 'connecting').slice(0, 32),
+          String(acc.id),
+        ])
         .catch(() => {})
-      // cookies 仅状态变化账号落库 (与上一轮快照内存对比; 多实例内存独立时极端下多写
-      // 几行, 无损正确性; 进程重启/首次收到上报时全量写一轮, 等价旧行为)
-      const prev = lastHeartbeatSnapshot && nowMs - lastHeartbeatSnapshotAt < 120_000 ? lastHeartbeatSnapshot : null
-      const changed = prev ? heartbeatAccounts.filter((acc) => prev[String(acc.id)]?.s !== String(acc.state || 'connecting').slice(0, 32)) : heartbeatAccounts
-      if (changed.length) {
-        const cases = changed.map(() => 'WHEN ? THEN ?').join(' ')
-        const ids = changed.map((acc) => String(acc.id))
-        await db
-          .run(
-            `UPDATE cookies SET
-               cookie_status_text = CASE id ${cases} ELSE cookie_status_text END,
-               last_check_at = CURRENT_TIMESTAMP
-             WHERE id IN (${ids.map(() => '?').join(',')})`,
-            [
-              ...changed.flatMap((acc) => [String(acc.id), String(acc.state || 'connecting').slice(0, 32)]),
-              ...ids,
-            ],
-          )
-          .catch(() => {})
-      }
-      lastHeartbeatSnapshot = snapshot
-      lastHeartbeatSnapshotAt = nowMs
       // 登录态失效 (与内置引擎 onCookieInvalid 同语义): 通知用户重新扫码, 否则监听静默死亡
-      for (const acc of heartbeatAccounts) {
-        if (String(acc.state) === 'need_relogin') {
-          dispatchNotify({
-            type: 'cookie_invalid',
-            cookieId: String(acc.id),
-            title: '登录态失效 · 请重新扫码',
-            fields: {
-              详情: String(acc.detail || 'Session 过期').slice(0, 200),
-              影响: '该账号监听已停止, 消息无法收发',
-              处理: '在「账号管理」页对该账号重新扫码登录即可自动恢复监听',
-            },
-            link: '/accounts',
-          })
-        }
+      if (String(acc.state) === 'need_relogin') {
+        dispatchNotify({
+          type: 'cookie_invalid',
+          cookieId: String(acc.id),
+          title: '登录态失效 · 请重新扫码',
+          fields: {
+            详情: String(acc.detail || 'Session 过期').slice(0, 200),
+            影响: '该账号监听已停止, 消息无法收发',
+            处理: '在「账号管理」页对该账号重新扫码登录即可自动恢复监听',
+          },
+          link: '/accounts',
+        })
       }
     }
 
@@ -198,35 +151,23 @@ export default defineEventHandler(
         if (ev.type === 'action_result') {
           const logId = Number(ev.log_id || 0)
           if (logId > 0) {
-            // (v2.3.4 修复) 成功回报不得写 error_message：此前 mtopFailMessage('') 对空错误
-            // 兑底返回「未知错误」，代理路径发送成功时把发货内容(reply_text)盖成了红字
-            // 「未知错误」(线上 2.3.3 实证)。内置引擎 markActionResult 同场景成功即置 NULL
-            // (engine-manager.ts)，两条回报路径在此对齐：成功=清空，失败=人话翻译。
             await db
               .run('UPDATE auto_reply_logs SET send_status = ?, error_message = ? WHERE id = ?', [
                 ev.ok ? 'success' : 'failed',
-                ev.ok ? null : mtopFailMessage(String(ev.error || '')).slice(0, 300),
+                mtopFailMessage(String(ev.error || '')).slice(0, 300),
                 logId,
               ])
               .catch(() => {})
             // 发送成功 → 出站消息落库 (代理链路与内置引擎 executeActions 同语义, 消息页可见回复内容)
             if (ev.ok) {
               const logRow = await db
-                .get<{ cookie_id: string; chat_id: string; sender_user_id: string; reply_text: string; reply_strategy: string }>(
-                  'SELECT cookie_id, chat_id, sender_user_id, reply_text, reply_strategy FROM auto_reply_logs WHERE id = ?',
+                .get<{ cookie_id: string; chat_id: string; sender_user_id: string; reply_text: string }>(
+                  'SELECT cookie_id, chat_id, sender_user_id, reply_text FROM auto_reply_logs WHERE id = ?',
                   [logId],
                 )
                 .catch(() => null)
               if (logRow?.chat_id && logRow.reply_text) {
-                // AI 标志 (v2.3.0): reply_strategy=ai 的日志随单落 is_ai (仅管理后台可见)
-                void persistOutgoingMessage(
-                  logRow.cookie_id || account,
-                  logRow.chat_id,
-                  logRow.sender_user_id || '',
-                  logRow.reply_text,
-                  'text',
-                  String(logRow.reply_strategy || '') === 'ai',
-                )
+                void persistOutgoingMessage(logRow.cookie_id || account, logRow.chat_id, logRow.sender_user_id || '', logRow.reply_text, 'text')
               }
             }
           }

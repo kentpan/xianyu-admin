@@ -232,89 +232,6 @@
 
     <!-- ==================== 闲鱼趋势 tab (v2.2.5) ==================== -->
     <template v-else>
-      <!-- 全平台热门商品趋势 (v2.3.0): 闲鱼站内搜索快照聚合 — 热门榜/同款竞争度/价格带 -->
-      <div class="card p-5 mb-4">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-          <div>
-            <h3 class="font-semibold text-slate-900 dark:text-white">全平台热门商品趋势</h3>
-            <p class="text-xs text-slate-400 mt-0.5">按关键词搜索闲鱼站内全平台在售商品, 聚合想要人数/同款卖家数/价格带做热门榜 (搜索为全平台口径, 与账号无关)</p>
-          </div>
-          <div class="flex items-center gap-2">
-            <!-- 商品类型筛选 (v2.3.0): 默认虚拟商品, 与卖虚拟服务的运营口径一致 -->
-            <div class="flex rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-800" role="group" aria-label="商品类型筛选">
-              <button
-                v-for="t in HOT_TYPE_OPTIONS"
-                :key="t.value || 'all'"
-                type="button"
-                class="px-2.5 py-1.5 text-xs transition-colors"
-                :class="hotItemType === t.value ? 'bg-brand-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700'"
-                :aria-pressed="hotItemType === t.value"
-                @click="hotItemType = t.value; loadHotTrends()"
-              >{{ t.label }}</button>
-            </div>
-            <input
-              v-model="hotKeyword"
-              class="input !py-1.5 !text-sm w-44"
-              placeholder="搜索关键词, 如: TG API"
-              aria-label="热门商品搜索关键词"
-              @keyup.enter="runHotSync"
-            />
-            <button class="btn-primary !py-1.5 !px-3 whitespace-nowrap" :disabled="hotSyncing || !hotKeyword.trim()" @click="runHotSync">
-              <Icon name="refresh" :class="hotSyncing ? 'animate-spin' : ''" /> {{ hotSyncing ? '搜索中...' : '搜索全平台' }}
-            </button>
-          </div>
-        </div>
-        <!-- 聚合统计 chips -->
-        <div class="flex flex-wrap items-center gap-2 mb-3">
-          <span class="badge bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300">在售商品 {{ hotStats.total }}</span>
-          <span class="badge bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-300">不同卖家 {{ hotStats.sellers }}</span>
-          <span v-if="hotStats.min_price != null" class="badge bg-emerald-50 text-emerald-600 dark:bg-emerald-900/20 dark:text-emerald-400">价格带 ¥{{ hotStats.min_price }} ~ ¥{{ hotStats.max_price }}</span>
-          <button
-            v-for="k in hotKeywords.slice(0, 5)"
-            :key="k.keyword"
-            class="badge bg-brand-50 text-brand-600 hover:bg-brand-100 dark:bg-brand-900/20 dark:text-brand-400 cursor-pointer"
-            @click="hotKeyword = k.keyword; loadHotTrends()"
-          >{{ k.keyword || '(未记词)' }} · {{ k.c }}</button>
-        </div>
-        <div v-if="hotLoading" class="p-8 flex items-center justify-center text-slate-400">
-          <Icon name="refresh" class="animate-spin mr-2" /> 加载热门榜...
-        </div>
-        <template v-else>
-          <div v-if="hotItems.length" class="max-h-96 overflow-y-auto table-wrap" style="scrollbar-width: thin">
-            <table class="table">
-              <thead class="sticky top-0 bg-white dark:bg-slate-800 z-10">
-                <tr>
-                  <th>#</th>
-                  <th>商品标题</th>
-                  <th>价格</th>
-                  <th>想要人数</th>
-                  <th class="hidden md:table-cell">卖家</th>
-                  <th class="hidden lg:table-cell">地区</th>
-                  <th class="hidden md:table-cell">命中次数</th>
-                  <th>最近发现</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="(h, i) in hotItems" :key="h.item_id">
-                  <td class="text-slate-400 tabular-nums">{{ i + 1 }}</td>
-                  <td class="max-w-[280px]">
-                    <p class="truncate text-slate-800 dark:text-slate-100" :title="h.title">{{ h.title || '—' }}</p>
-                    <p class="text-xs text-slate-400 truncate">ID {{ h.item_id }}</p>
-                  </td>
-                  <td><span class="font-medium text-slate-700 dark:text-slate-200 tabular-nums">{{ h.price ? `¥${h.price}` : '—' }}</span></td>
-                  <td class="tabular-nums">{{ h.want_count || '—' }}</td>
-                  <td class="hidden md:table-cell max-w-[120px]"><p class="truncate">{{ h.seller_nick || h.seller_id || '—' }}</p></td>
-                  <td class="hidden lg:table-cell text-slate-500 dark:text-slate-400">{{ h.area || '—' }}</td>
-                  <td class="hidden md:table-cell tabular-nums text-slate-500">{{ h.seen_count }}</td>
-                  <td class="text-slate-500 dark:text-slate-400">{{ formatTime(h.last_seen_at) }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <EmptyState v-else message="暂无热门商品数据 — 输入关键词点击「搜索全平台」抓取闲鱼站在售商品" icon="activity" />
-        </template>
-      </div>
-
       <!-- 7天全账号订单趋势 (chart.js 柱线混合图, 点击查看核心指标) -->
       <div class="card p-5">
         <div class="flex items-center justify-between mb-4">
@@ -357,19 +274,14 @@
 
       <!-- 全量订单分页列表 (v2.2.7): 全量同步拉取的所有状态订单 + 非已添加账号历史订单 -->
       <div class="card overflow-hidden">
-        <div class="px-5 py-4 border-b border-slate-100 dark:border-slate-700 flex items-center justify-between flex-wrap gap-2">
+        <div class="px-5 py-4 border-b border-slate-100 dark:border-slate-700 flex items-center justify-between">
           <div>
             <h3 class="font-semibold text-slate-900 dark:text-white">全量订单</h3>
             <p class="text-xs text-slate-400 mt-0.5">同步拉取的所有状态订单 (待付款/待发货/已发货/已完成/已取消/退款) 及非已添加账号的历史订单, 共 {{ trendOtherTotal }} 条</p>
           </div>
-          <div class="flex items-center gap-2">
-            <button class="btn-ghost !py-1.5 !px-3 !text-xs" :disabled="repairing" title="逐单调闲鱼订单详情对账: 回填真实下单时间/卖家身份, 清理订单号精度丢失的截断脏单" @click="runRepair">
-              <Icon name="refresh" :class="repairing ? 'animate-spin' : ''" /> {{ repairing ? '核验中...' : '订单核验修复' }}
-            </button>
-            <button class="btn-secondary !py-1.5 !px-3" :disabled="otherSyncing" @click="syncTrendOrders">
-              <Icon name="refresh" :class="otherSyncing ? 'animate-spin' : ''" /> 同步订单
-            </button>
-          </div>
+          <button class="btn-secondary !py-1.5 !px-3" :disabled="otherSyncing" @click="syncTrendOrders">
+            <Icon name="refresh" :class="otherSyncing ? 'animate-spin' : ''" /> 同步订单
+          </button>
         </div>
         <div v-if="otherLoading" class="p-10 flex items-center justify-center text-slate-400">
           <Icon name="refresh" class="animate-spin mr-2" /> 加载中...
@@ -625,8 +537,8 @@
 </template>
 
 <script setup lang="ts">
-import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, syncAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi, getOrderTrends, repairOrders, getHotTrends, syncHotTrends } from '~/api/orders'
-import type { Order, OrderTrends, HotTrendItem } from '~/api/orders'
+import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, syncAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi, getOrderTrends } from '~/api/orders'
+import type { Order, OrderTrends } from '~/api/orders'
 import { getAccounts } from '~/api/accounts'
 import type { AccountLite } from '~/api/accounts'
 import { exportCsv } from '~/api/export'
@@ -668,7 +580,6 @@ function switchTab(tab: 'mine' | 'trend') {
     trendsLoaded = true
     loadTrends()
     loadOtherOrders()
-    loadHotTrends()
   }
 }
 
@@ -775,87 +686,6 @@ async function syncTrendOrders() {
     otherSyncing.value = false
     loadOtherOrders()
     loadTrends()
-  }
-}
-
-/* ---- 存量订单核验修复 (v2.3.0): 时间堆积回填 / 截断脏单清理 / 卖家身份回填 ---- */
-const repairing = ref(false)
-
-async function runRepair() {
-  repairing.value = true
-  try {
-    const r = await repairOrders({ limit: 60 })
-    const parts: string[] = []
-    if (r.checked) parts.push(`核验 ${r.checked} 单`)
-    if (r.time_fixed) parts.push(`回填下单时间 ${r.time_fixed}`)
-    if (r.seller_fixed) parts.push(`回填卖家 ${r.seller_fixed}`)
-    if (r.removed) parts.push(`清理截断脏单 ${r.removed}`)
-    if (r.skipped_risk) parts.push(`风控跳过 ${r.skipped_risk}`)
-    if (!r.checked) toast.info(r.errors?.[0] || '没有需要修复的存量订单')
-    else toast.success(parts.join(', ') || '修复完成')
-    if (r.errors?.length) console.log('[orders/repair] 明细:', r.errors)
-  } catch (e: any) {
-    toast.error(e.message || '存量订单修复失败')
-  } finally {
-    repairing.value = false
-    loadOtherOrders()
-    loadTrends()
-  }
-}
-
-/* ---- 全平台热门商品趋势 (v2.3.0): 闲鱼站内搜索快照聚合 ---- */
-/** 商品类型筛选选项: 默认虚拟商品 (标题特征词分类) */
-const HOT_TYPE_OPTIONS: { value: string; label: string }[] = [
-  { value: 'virtual', label: '虚拟商品' },
-  { value: 'physical', label: '实体商品' },
-  { value: '', label: '全部' },
-]
-const hotItemType = ref<string>('virtual')
-const hotKeyword = ref('')
-const hotSyncing = ref(false)
-const hotLoading = ref(false)
-const hotItems = ref<HotTrendItem[]>([])
-const hotStats = ref<{ total: number; sellers: number; min_price: number | null; max_price: number | null }>({
-  total: 0,
-  sellers: 0,
-  min_price: null,
-  max_price: null,
-})
-const hotKeywords = ref<{ keyword: string; c: number }[]>([])
-
-async function loadHotTrends() {
-  hotLoading.value = true
-  try {
-    const r = await getHotTrends({ keyword: hotKeyword.value.trim() || undefined, item_type: hotItemType.value || undefined, limit: 100, sort: 'want' })
-    hotItems.value = r.items || []
-    hotStats.value = r.stats || { total: 0, sellers: 0, min_price: null, max_price: null }
-    hotKeywords.value = r.keywords || []
-  } catch (e: any) {
-    toast.error(e.message || '热门商品趋势加载失败')
-  } finally {
-    hotLoading.value = false
-  }
-}
-
-async function runHotSync() {
-  const kw = hotKeyword.value.trim()
-  if (!kw) return
-  hotSyncing.value = true
-  try {
-    const r = await syncHotTrends({ keyword: kw, pages: 3 })
-    const parts: string[] = []
-    if (r.synced) parts.push(`抓取 ${r.synced} 件在售商品`)
-    if (r.new_items) parts.push(`新增 ${r.new_items}`)
-    if (r.updated_items) parts.push(`更新 ${r.updated_items}`)
-    const hardError = r.errors?.[0]
-    if (hardError && !r.synced) toast.error(`搜索异常: ${hardError}`)
-    else if (!parts.length) toast.info(r.errors?.[0] || '本次未抓到商品')
-    else toast.success(parts.join(', '))
-  } catch (e: any) {
-    toast.error(e.message || '全平台搜索失败')
-  } finally {
-    hotSyncing.value = false
-    loadHotTrends()
   }
 }
 
@@ -1162,6 +992,13 @@ async function exportCSV() {
   } catch (e: any) {
     toast.error(e.message || 'CSV导出失败')
   }
+}
+
+function formatTime(t?: string) {
+  if (!t) return '—'
+  const d = new Date(t.replace(' ', 'T'))
+  if (isNaN(d.getTime())) return t
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 // Read initial cookie_id filter from URL (e.g. linked from items page)
