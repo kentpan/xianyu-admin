@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.2.7; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.5; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -151,12 +151,21 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.2.7 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.2.7'
+// XY_PKG_VERSION 读取, 缺省 2.3.2 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.5'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
 const DEFAULT_POLL_SECONDS = Math.max(10, Math.round(Number(process.env.XY_POLL_SECONDS || 30)) || 30)
+/**
+ * 授权失联释放阈值 (v2.3.2 双连接根治 · 代理侧):
+ * 连接的所有权来自后台 config 下发的 active 授权, 授权必须保持新鲜 (config 轮询
+ * 默认 ≤30s 一次)。后台连续 90s 拉不到配置 = 授权已不可续 — 此时绝不能继续持有
+ * 该后台账号的闲鱼连接: 后台侧会因心跳陈旧接管监听, 双连接 = 双设备指纹双出口 IP,
+ * 平台风控直接判「环境异常, 重新登录 + 人脸核验」。释放后后台恢复下发 (active=true)
+ * 账号自动重连 (丢了的消息由重连后的同步包补齐, 无监听空窗风险)。
+ */
+const OWNERSHIP_RELEASE_MS = 90_000
 /** 任务轮询间隔秒 (选填, 默认 3): http_fetch 等下发任务的领取频率, 越短后台等得越短 */
 const DEFAULT_TASK_POLL_SECONDS = Math.max(2, Math.round(Number(process.env.XY_TASK_POLL_SECONDS || 3)) || 3)
 // Web 管理面板登录密钥 (选填): 配置后 XY_PROXY_PORT 端口同源开启 Web 面板。
@@ -287,6 +296,8 @@ const backends = ADMIN_URLS.map((url, index) => {
     pollOkCount: 0,
     lastOkAt: 0,
     lastConfig: null,
+    /** 最后一次 config 轮询成功时刻 (0=从未成功): 所有权授权新鲜度的唯一时钟 */
+    lastConfigOkAt: 0,
     accounts: [],
   }
 })
@@ -1747,6 +1758,7 @@ async function pollBackendConfig(b) {
   try {
     const cfg = await fetchConfigWithRetry(b)
     b.configFailStreak = 0
+    b.lastConfigOkAt = Date.now()
     b.lastConfig = cfg
     const wasActive = b.active
     b.active = !!cfg.active
@@ -1810,6 +1822,16 @@ let lastDupWarnAt = 0
  * 限频告警。Cookie 热替换只认 owner 后台下发的值 (防两个后台的会话互相打摆)。
  */
 function reconcileAccounts() {
+  // 授权失联释放 (v2.3.2 双连接根治 · 代理侧): 连接的所有者后台 config 连续 90s 拉不到
+  // = 授权不可续 — 立即释放该后台名下全部账号连接 (后台侧心跳陈旧后会接管, 双连接 =
+  // 风控「重新登录 + 人脸核验」; 先释放才能让接管方安全建连)。后台恢复后账号自动重连。
+  for (const [id, client] of [...clients]) {
+    const ob = backends[client.ownerBackend]
+    if (ob && ob.lastConfigOkAt && Date.now() - ob.lastConfigOkAt > OWNERSHIP_RELEASE_MS) {
+      log(`⚠ 账号 ${id} 的后台[${ob.index}] ${ob.host} 配置授权已失联超 90s, 释放连接 (防双连接风控); 后台恢复下发后自动重连`)
+      void stopClient(id)
+    }
+  }
   // 面板禁用监听的后台不参与账号对齐 (即使 active 尚未轮到重置也绝不创建/保留其连接)
   const actives = backends.filter((b) => b.active && backendListenEnabled(b))
   if (!actives.length) {
