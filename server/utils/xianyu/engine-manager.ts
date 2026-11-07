@@ -13,6 +13,7 @@ import { XianyuAccountClient, type AccountState, type ManualTokenOutcome } from 
 import { generateDeviceId, transCookies, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
 import { fetchItemList, polishItem, fetchSellerOrders } from './mtop'
 import { upsertSoldOrders } from './order-sync'
+import { backfillReceiverForAccount } from './receiver-backfill'
 import { isProxyEngineMode, sendTextViaProxy } from './order-task'
 import { probeRemoteEngine } from './engine-probe'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from './brain'
@@ -797,7 +798,34 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
         if (r.inserted > 0) {
           console.log(`[xianyu-engine] 账号 ${acct.id} 全状态订单列表同步: 新入库 ${r.inserted} 单`)
         }
+        // (v2.3.5) 隔离拦截必须显性留痕, 绝不允许再静默: v2.3.0~v2.3.4 深扫 seller_id
+        // 把买家/他人 uid 污染进隔离复核输入, 自己的订单被整批拦截且零日志 (11-06 起收货
+        // 人数据断流的主因)。此后任何拦截都在 system_logs 留 WARN + 样例订单号, 一眼可查。
+        if (r.blocked > 0) {
+          const samples = r.blockedSamples?.length ? `, 样例: ${r.blockedSamples.join(' / ')}` : ''
+          await db
+            .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'order_sync', ?)", [
+              `账号 ${acct.id} 列表同步拦截 ${r.blocked}/${r.total} 单 (响应卖家身份与账号 uid 不符${samples}; 若为本人订单请检查账号 Cookie 是否串号)`,
+            ])
+            .catch(() => {})
+        }
+        if (r.errors.length) {
+          await db
+            .run("INSERT INTO system_logs (level, module, message) VALUES ('WARN', 'order_sync', ?)", [
+              `账号 ${acct.id} 列表同步落库失败 ${r.errors.length} 单: ${r.errors[0]}`,
+            ])
+            .catch(() => {})
+        }
       }
+      // 收货信息定向补全 (v2.3.5): 列表响应拿不到收货字段时 (隔离误拦修复前的存量卡片
+      // 单 / 或列表接口字段变动), 每轮每账号最多 3 单走详情接口定向补全
+      // (receiver_attempts<3 防死循环, 取消单不补, 候选耗尽 6h 冷却零查询零调用)
+      try {
+        const bf = await backfillReceiverForAccount(db, String(acct.id), 3)
+        if (bf.recovered > 0) {
+          console.log(`[xianyu-engine] 账号 ${acct.id} 收货信息补全: 恢复 ${bf.recovered} 单`)
+        }
+      } catch {}
     } catch {
       // 单账号列表拉取失败不阻断详情刷新
     }
@@ -805,8 +833,11 @@ async function runOrderSyncForAllAccounts(db: Awaited<ReturnType<typeof getDb>>)
   }
 
   // 详情精修能力已全链路移除 (按用户需求): 定时同步只做纯列表拉取入库, 不再逐单调
-  // order.detail 精修 (批量逐单实查动辄数百次请求, 是超时/风控元凶)。单个订单需要
-  // 详情精修时在订单页点单条「详情精修」按钮走 /api/orders/:id/refresh。
+  // order.detail 精修 (批量逐单实查动辄数百次请求, 是超时/风控元凶)。唯一的定向例外是
+  // 上面的收货信息补全 (v2.3.5): 只针对列表接口已拿不到收货字段的订单, 每账号每轮限
+  // 3 单且每单最多 3 次尝试, 不是全量逐单精修。单个订单需要完整详情精修时在订单页点
+  // 单条「详情精修」按钮走 /api/orders/:id/refresh; 批量补收货信息用订单页「补全收货
+  // 信息」按钮走 /api/orders/backfill-receiver。
   const summary = `订单定时同步完成: 全状态订单列表已按账号拉取入库 (纯列表同步, 无逐单精修)`
   console.log(`[xianyu-engine] ${summary}`)
   await db

@@ -850,14 +850,22 @@ function pickTimeText(sources: any[], keys: string[]): string {
   return ''
 }
 
-/** 卖家身份深扫禁入容器: 买家相关容器绝不可能是卖家身份来源。 */
-const SELLER_SCAN_EXCLUDE_KEYS = new Set(['buyerInfoVO', 'buyerVO', 'buyer', 'buyerUserVO'])
-
 /**
- * 卖家身份提取 (v2.3.0 增强): 响应各版本卖家字段位置不统一
- * (commonData.sellerId / sellerInfoVO / sellerVO / 顶层), 已知候选落空后在订单
- * item 范围内受限深扫 (sellerId/seller_id/userNumberId 等身份键名锚定, 排除买家
- * 容器)。取到即返回纯数字 uid (供账号隔离复核与趋势卖家维度统计), 取不到返回空串。
+ * 卖家身份提取 (v2.3.5 回滚修复): 只信已知候选位置
+ * (commonData.sellerId / sellerInfoVO / sellerVO / item 顶层), 取不到返回空串。
+ *
+ * (v2.3.5 事故复盘 — 为什么砍掉 v2.3.0 的"item 范围受限深扫"兜底):
+ * 深扫会在整个订单 item 里按键名 sellerId/seller_id/userNumberId 扫身份字段, 但闲鱼
+ * 响应各容器 (商品快照 itemVO.itemDO / 交易上下文 tradeInfoVO 等) 里广泛存在"闲鱼号"
+ * (userNumberId) — 买家也有 userNumberId, 商品快照里还有原发布者的 sellerId (转卖场景)。
+ * 深扫扫出买家/他人 uid 后, 账号隔离复核 (upsertSoldOrders: sid !== expectedUid →
+ * blocked) 会把「自己的订单」误判为「他人店铺订单」**全部静默拦截** → 列表同步从部署
+ * 新版起 (11-06 03:57) 全军覆没, 新订单只能靠付款卡片兜底 INSERT 落库 (无收货人/无
+ * 状态时间/金额=卡片原价), 表现为「收货人/手机/地址全空」。mock 复现实锤:
+ * tradeInfoVO.userNumberId (买家) → seller_id 被污染 → BLOCKED。
+ * 教训: 隔离复核的输入取错比取不到危害大一万倍 — 取不到 (空串) = 放行 (v2.2.7 语义,
+ * 从未误拦); 取错 = 拦光自己的订单。身份的权威来源是订单详情接口 (repair/补全链路回填),
+ * 列表层宁可空串放行, 绝不做无锚定的深扫猜测。
  */
 function extractSellerIdFromItem(item: any, common: any): string {
   const sellerVO = item?.sellerInfoVO || item?.sellerVO || {}
@@ -874,8 +882,7 @@ function extractSellerIdFromItem(item: any, common: any): string {
     const s = String(c ?? '').trim()
     if (s && /^\d+$/.test(s)) return s
   }
-  const hit = deepScanString(item, /^(sellerId|seller_id|userNumberId)$/i, SELLER_SCAN_EXCLUDE_KEYS, 4)
-  return hit && /^\d+$/.test(hit) ? hit : ''
+  return ''
 }
 
 /**

@@ -8,6 +8,14 @@
         <button class="btn-secondary" :disabled="syncing" @click="syncAll">
           <Icon name="refresh" :class="syncing ? 'animate-spin' : ''" /> 获取最新的订单列表
         </button>
+        <button
+          class="btn-secondary"
+          :disabled="backfilling"
+          title="闲鱼列表接口 11-06 起不再返回收货人信息，点击用订单详情接口补全缺失的手机号/收货人/地址"
+          @click="runBackfillReceiver"
+        >
+          <Icon name="refresh" :class="backfilling ? 'animate-spin' : ''" /> 补全收货信息
+        </button>
         <button class="btn-secondary" @click="openImport">
           <Icon name="upload" /> 导入
         </button>
@@ -625,7 +633,7 @@
 </template>
 
 <script setup lang="ts">
-import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, syncAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi, getOrderTrends, repairOrders, getHotTrends, syncHotTrends } from '~/api/orders'
+import { getOrders, updateOrder, deleteOrder, batchOrders, refreshOrder, refreshAllOrders, syncAllOrders, manualShip as manualShipApi, importOrders, exportOrders as exportOrdersApi, getOrderTrends, repairOrders, getHotTrends, syncHotTrends, backfillReceiver } from '~/api/orders'
 import type { Order, OrderTrends, HotTrendItem } from '~/api/orders'
 import { getAccounts } from '~/api/accounts'
 import type { AccountLite } from '~/api/accounts'
@@ -1070,6 +1078,32 @@ async function syncAll() {
       loadTrends()
       loadOtherOrders()
     }
+  }
+}
+
+/* ---- 收货信息补全 (v2.3.5): 闲鱼列表接口 11-06 起不再返回 buyerInfoVO 收货字段 ---- */
+const backfilling = ref(false)
+async function runBackfillReceiver() {
+  if (backfilling.value) return
+  backfilling.value = true
+  try {
+    // 只补缺失收货人/手机号/地址的订单: 走订单详情接口 (与单条「详情精修」同源)
+    // 定向补全, 每账号每轮最多 20 单, 每单最多 3 次尝试防死循环; 补不完再点一次
+    const r = await backfillReceiver({ cookie_id: filters.cookie_id || undefined })
+    const parts: string[] = []
+    if (r.recovered) parts.push(`恢复 ${r.recovered} 单`)
+    if (r.empty) parts.push(`${r.empty} 单平台未返回收货字段`)
+    if (r.failed) parts.push(`${r.failed} 单查询失败`)
+    if (r.remaining) parts.push(`仍缺 ${r.remaining} 单，可再点一次继续补`)
+    if (!parts.length) toast.info('没有需要补全的订单 — 收货信息已齐全')
+    else if (r.recovered > 0) toast.success(`补全完成: ${parts.join(', ')}`)
+    else toast.info(`本轮未补到数据: ${parts.join(', ')}`)
+  } catch (e: any) {
+    toast.error(e.message || '补全失败')
+  } finally {
+    backfilling.value = false
+    reload()
+    if (trendsLoaded) loadOtherOrders()
   }
 }
 

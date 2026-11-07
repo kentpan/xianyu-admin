@@ -594,7 +594,7 @@ CREATE TABLE orders (
     receiver_city VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, delivery_claim_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP, item_title VARCHAR(512) DEFAULT '', buyer_nick VARCHAR(128) DEFAULT '', seller_id VARCHAR(64) DEFAULT '', item_price VARCHAR(32) DEFAULT '', sync_source VARCHAR(16) DEFAULT '');
+  , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, delivery_claim_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP, item_title VARCHAR(512) DEFAULT '', buyer_nick VARCHAR(128) DEFAULT '', seller_id VARCHAR(64) DEFAULT '', item_price VARCHAR(32) DEFAULT '', sync_source VARCHAR(16) DEFAULT '', receiver_attempts INTEGER DEFAULT 0);
 CREATE TABLE qr_login_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key VARCHAR(64) NOT NULL UNIQUE,
@@ -726,6 +726,28 @@ CREATE INDEX idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
 CREATE INDEX idx_qrlogin_user ON qr_login_sessions(user_id);
 CREATE INDEX idx_settle_user ON settlement_records(user_id);
 CREATE INDEX idx_ship_card ON card_shipments(card_id, id);
+
+-- (v2.3.5) 与 server/utils/schema.ts 运行时索引对齐 — orders 是最高频扫描表,
+-- 缺索引 = D1 按全表扫描计读配额, 免费层 500 万行/天极易耗尽
+CREATE INDEX idx_orders_created ON orders(created_at);
+CREATE INDEX idx_orders_cookie ON orders(cookie_id);
+CREATE INDEX idx_syslog_created ON system_logs(created_at);
+CREATE INDEX idx_risklog_created ON risk_control_logs(created_at);
+CREATE INDEX idx_cookies_created ON cookies(created_at);
+CREATE INDEX idx_itemai_cookie ON item_ai_settings(cookie_id, item_id);
+CREATE INDEX idx_aireply_cookie ON ai_reply_settings(cookie_id);
+CREATE INDEX idx_kbq_sort ON kb_questions(sort, id);
+CREATE INDEX idx_kba_sort ON kb_answers(sort, id);
+
+-- (v2.3.5) D1 读写用量台账 (dashboard 配额核心指标数据源, 运行时 MIGRATIONS 幂等补建)
+CREATE TABLE IF NOT EXISTS d1_usage_daily (
+    day VARCHAR(10) PRIMARY KEY,
+    rows_read INTEGER DEFAULT 0,
+    rows_written INTEGER DEFAULT 0,
+    read_queries INTEGER DEFAULT 0,
+    write_queries INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 
 CREATE TRIGGER trg_engine_tasks_expire AFTER UPDATE ON engine_tasks
     WHEN NEW.status = 'running' AND OLD.status = 'pending' AND NEW.updated_at < datetime('now', '-90 seconds', 'localtime')

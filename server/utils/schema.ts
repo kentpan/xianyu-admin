@@ -166,7 +166,8 @@ const SCHEMA: string[] = [
     shipped_at TIMESTAMP,
     finished_at TIMESTAMP,
     cancelled_at TIMESTAMP,
-    sync_source VARCHAR(16) DEFAULT ''
+    sync_source VARCHAR(16) DEFAULT '',
+    receiver_attempts INTEGER DEFAULT 0
   )`,
   `CREATE TABLE IF NOT EXISTS delivery_rules (
     id __AUTO__,
@@ -971,6 +972,12 @@ const MIGRATIONS: string[] = [
   // 搜索页同源) 按关键词抓取的**全平台**在售商品快照聚合 — 卖家订单接口是账号维度
   // (只返回该账号自己的订单), 全平台数据的真实来源只有搜索。重复搜到同一商品:
   // seen_count 累加 (在售稳定度), want_count/价格/卖家取最新快照, 用于热门榜排序。
+  // 商品类型 item_type (v2.3.0): virtual=虚拟商品 / physical=实体商品, 按标题特征词分类;
+  // 趋势页默认只看虚拟商品 (与卖虚拟服务的运营口径一致), '' = 未分类旧数据 (读时自愈回填)。
+  // ⚠️ v2.3.5 修复: v2.3.0~v2.3.4 把这两行 TS 注释写进了 SQL 字符串内 ("// 商品类型…"),
+  // SQLite/D1 不认 // 注释 → near "/" syntax error → 语句被 MIGRATIONS 的幂等 catch
+  // 静默吞掉 → 全新部署 (SQLite/D1 从零建库) trend_hot_items 永远建不出来,
+  // 全平台热门商品趋势 (含全平台搜索) 直接断供。注释必须留在字符串外!
   `CREATE TABLE IF NOT EXISTS trend_hot_items (
     item_id VARCHAR(64) PRIMARY KEY,
     title VARCHAR(512) DEFAULT '',
@@ -981,8 +988,6 @@ const MIGRATIONS: string[] = [
     pic_url TEXT DEFAULT '',
     want_count INTEGER DEFAULT 0,
     keyword VARCHAR(128) DEFAULT '',
-    // 商品类型 (v2.3.0): virtual=虚拟商品 / physical=实体商品, 按标题特征词分类;
-    // 趋势页默认只看虚拟商品 (与卖虚拟服务的运营口径一致), '' = 未分类旧数据 (读时自愈回填)
     item_type VARCHAR(16) DEFAULT '',
     seen_count INTEGER DEFAULT 1,
     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1088,6 +1093,11 @@ const MIGRATIONS: string[] = [
     write_queries INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+
+  // ---- (v2.3.5 修复) 收货信息补全尝试计数: 闲鱼列表接口 11-06 起不再返回 buyerInfoVO
+  // 姓名/手机/地址 (平台隐私收紧), 同步代码零改动三字段全空。详情接口定向补全的
+  // 尝试次数持久化在此列 — 每单最多尝试 3 次, 平台详情接口也不给的绝不死循环。
+  `ALTER TABLE orders ADD COLUMN receiver_attempts INTEGER DEFAULT 0`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [
@@ -1221,9 +1231,15 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
   await db.exec(SCHEMA.map((stmt) => stmt.replace(/__AUTO__/g, auto)).join(';\n'))
 
   // Idempotent column migrations (ALTER TABLE ADD COLUMN) — ignore "duplicate column" errors
+  // ⚠️ (v2.3.5 根治) 必须与 SCHEMA exec 同样做 __AUTO__ 替换: MIGRATIONS 里有带
+  // `id __AUTO__` 的 CREATE TABLE (kb_groups/kb_questions/kb_answers/kb_group_members/
+  // trend_hot_items 等 v2.3.0 新表) — 历史版本裸执行, 全新部署把这些表建成「id 列为
+  // 字面量 __AUTO__ 类型」的坏表 (主键去重失效, INSERT id 恒 NULL), 随后被 __AUTO__
+  // 自检 DROP; 而坏表重建当时只查 SCHEMA 找不到这些表的 DDL → 表蒸发, AI 知识库/
+  // 全平台热门商品趋势在新装环境双双断供。
   for (const stmt of MIGRATIONS) {
     try {
-      await db.exec(stmt)
+      await db.exec(stmt.replace(/__AUTO__/g, auto))
     } catch {
       // column already exists — expected on re-run
     }
@@ -1243,10 +1259,18 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
       console.warn(`[xianyu-admin] 检测到 __AUTO__ 残留坏表: ${t.name} → 重建`)
       try {
         await db.exec(`DROP TABLE IF EXISTS "${t.name}"`)
-        const fixed = SCHEMA.find((s) => s.includes(`CREATE TABLE IF NOT EXISTS ${t.name}`))
+        // (v2.3.5 修复) 标准 DDL 查找范围: SCHEMA + MIGRATIONS 双数组。
+        // 此前只查 SCHEMA — kb_groups / kb_questions 等 v2.3.0 新表定义在 MIGRATIONS
+        // 里, 坏表 DROP 后在 SCHEMA 里找不到 DDL → 只删不建, 表直接蒸发
+        // (AI 知识库数据全丢)。修复后优先 SCHEMA 兼顾 MIGRATIONS, 坏表必定可重建。
+        const fixed =
+          SCHEMA.find((s) => s.includes(`CREATE TABLE IF NOT EXISTS ${t.name}`)) ||
+          MIGRATIONS.find((s) => s.includes(`CREATE TABLE IF NOT EXISTS ${t.name}`))
         if (fixed) {
           await db.exec(fixed.replace(/__AUTO__/g, auto))
           console.log(`[xianyu-admin] 坏表 ${t.name} 已按标准 DDL 重建`)
+        } else {
+          console.error(`[xianyu-admin] 坏表 ${t.name} 在 SCHEMA/MIGRATIONS 均无 DDL, 仅已 DROP`)
         }
       } catch (e: any) {
         // 单表重建失败不中断其余坏表处理
