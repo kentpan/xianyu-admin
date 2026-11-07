@@ -24,10 +24,6 @@ export interface SoldOrderSyncResult {
   total: number
   /** 账号隔离拦截数: 响应中卖家身份与账号 uid 不符的订单 (未入库)。 */
   blocked: number
-  /** (v2.3.5) 被拦截订单号样例 (最多 3 个) — 拦截必须显性可查, 绝不允许再静默
-   * (v2.3.0~v2.3.4 深扫 seller_id 误染买家/他人 uid, 拦光自己的订单却零日志, 是
-   * 11-06 起收货人数据断流的主因)。全部放行后此项恒为空数组。 */
-  blockedSamples: string[]
   /** 删除屏蔽数: 命中 deleted_orders 屏蔽表的订单 (未入库)。 */
   skippedDeleted: number
   /** (v2.2.7) 单条落库失败明细 (SQL 错误原文, 截断) — 绝不静默吞错, 计数只统计真实成功。 */
@@ -83,16 +79,7 @@ export async function upsertSoldOrder(
     ['finished_at', 'finished_at_text', normalizeCreatedAt(String(o.finished_at_text || ''))],
     ['cancelled_at', 'cancelled_at_text', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
   ]
-  // (v2.3.5) 存在性检查读容错: 此查询只决定返回 inserted/updated 统计值, 不是落库
-  // 本体 — D1 读额度超限时 SELECT 会抛错, 绝不能让它拖死后面的 upsert 写语句 (D1 写
-  // 额度独立, 读挂时写必须照常落库; v2.3.4 之前读挂 = 整单落库失败被 errors 吞掉,
-  // 订单只能靠卡片兜底 INSERT, 无收货人/无状态时间)。失败时按 'unknown' 统计。
-  let before: { order_id: string } | null = null
-  try {
-    before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
-  } catch {
-    before = null
-  }
+  const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
   // 动态拼 created_at: 解析成功才写/回填, 失败时插入走列默认值、更新保留本地
   // .join('') 必须显式调用: timeCols 是数组, 直接内插模板字符串会触发 Array.toString()
@@ -168,16 +155,12 @@ export async function upsertSoldOrders(
   let blocked = 0
   let skippedDeleted = 0
   const errors: string[] = []
-  const blockedSamples: string[] = []
   for (const o of items) {
     if (!o?.order_id) continue
-    // 账号隔离复核: 响应自带卖家身份且与账号 uid 不符 = 他人店铺订单, 绝不入库。
-    // (v2.3.5) 拦截必须显性可查: 记录样例订单号供上层日志/同步结果展示 —
-    // v2.3.0~v2.3.4 的静默拦截让列表同步全灭却零痕可查, 是收货人断流的主因。
+    // 账号隔离复核: 响应自带卖家身份且与账号 uid 不符 = 他人店铺订单, 绝不入库
     const sid = String((o as SellerOrderItem & { seller_id?: string }).seller_id || '').trim()
     if (sid && expectedUid && /^\d+$/.test(sid) && sid !== expectedUid) {
       blocked++
-      if (blockedSamples.length < 3) blockedSamples.push(String(o.order_id))
       continue
     }
     // (v2.2.7) 逐单捕获写库错误计入 errors 显性上报, 计数只统计真实落库;
@@ -192,7 +175,7 @@ export async function upsertSoldOrders(
       errors.push(`订单 ${String(o.order_id).slice(0, 24)} 落库失败: ${String(e?.message || e).slice(0, 120)}`)
     }
   }
-  return { inserted, updated, total: items.length, blocked, blockedSamples, skippedDeleted, errors }
+  return { inserted, updated, total: items.length, blocked, skippedDeleted, errors }
 }
 
 /** 记录用户删除的订单号 (同步屏蔽): 删除后任何同步链路都不再拉回。 */
@@ -242,13 +225,7 @@ export async function upsertSoldOrderFull(
     ['finished_at', normalizeCreatedAt(String(o.finished_at_text || ''))],
     ['cancelled_at', normalizeCreatedAt(String(o.cancelled_at_text || ''))],
   ]
-  // (v2.3.5) 存在性检查读容错 (与 upsertSoldOrder 同语义): 统计值查询绝不能拖死写语句
-  let before: { order_id: string } | null = null
-  try {
-    before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
-  } catch {
-    before = null
-  }
+  const before = await db.get<{ order_id: string }>('SELECT order_id FROM orders WHERE order_id = ?', [o.order_id])
 
   // 同上: .join('') 必须显式调用, 防数组内插触发 Array.toString() 双逗号语法错误
   const timeCols = statusTimes.filter(([, v]) => v).map(([col]) => `, ${col}`).join('')

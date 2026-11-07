@@ -36,7 +36,6 @@ export default defineEventHandler(
     let listBlocked = 0
     let listSkippedDeleted = 0
     const listErrors: string[] = []
-    const listBlockedSamples: string[] = []
     const MAX_LIST_PAGES = 5
 
     /* ---- 全局时间预算闸门: 同步接口必须在请求预算内完成并如实返回 ----
@@ -89,7 +88,6 @@ export default defineEventHandler(
                 listInserted += r.inserted
                 listUpdated += r.updated
                 listBlocked += r.blocked
-                for (const s of r.blockedSamples || []) if (!listBlockedSamples.includes(s) && listBlockedSamples.length < 5) listBlockedSamples.push(s)
                 listSkippedDeleted += r.skippedDeleted
               }
               if (!pg.nextPage || !pg.items.length) break
@@ -114,7 +112,6 @@ export default defineEventHandler(
             listInserted += ur.inserted
             listUpdated += ur.updated
             listBlocked += ur.blocked
-            for (const s of ur.blockedSamples || []) if (!listBlockedSamples.includes(s) && listBlockedSamples.length < 5) listBlockedSamples.push(s)
             listSkippedDeleted += ur.skippedDeleted
           }
         }
@@ -153,7 +150,6 @@ export default defineEventHandler(
             listInserted += r.inserted
             listUpdated += r.updated
             listBlocked += r.blocked
-            for (const s of r.blockedSamples || []) if (!listBlockedSamples.includes(s) && listBlockedSamples.length < 5) listBlockedSamples.push(s)
             listSkippedDeleted += r.skippedDeleted
           }
           if (!pg.nextPage || !pg.items.length) break
@@ -164,10 +160,7 @@ export default defineEventHandler(
     }
 
     if (listBlocked > 0) {
-      const samples = listBlockedSamples.length ? `, 样例: ${listBlockedSamples.join(' / ')}` : ''
-      listErrors.push(
-        `账号隔离: 拦截 ${listBlocked} 条订单 (响应中卖家身份与账号 uid 不符, 未入库${samples})。若是本人订单被误拦, 请检查账号 Cookie 是否串号或反馈给开发者`,
-      )
+      listErrors.push(`账号隔离: 拦截 ${listBlocked} 条非本账号订单 (响应中卖家身份与账号 uid 不符, 未入库)`)
     }
     if (listSkippedDeleted > 0) {
       listErrors.push(`已删除屏蔽: 跳过 ${listSkippedDeleted} 条曾手动删除的订单 (不再拉回)`)

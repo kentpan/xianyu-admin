@@ -137,29 +137,6 @@ export function syncAllOrders(body: { pages?: number } = {}) {
   return useApi().post<SyncAllResult>('/api/orders/sync-all', body)
 }
 
-/* ==================== 收货信息补全 (v2.3.5) ==================== */
-
-export interface ReceiverBackfillResult {
-  accounts: string[]
-  scanned: number
-  recovered: number
-  attempted: number
-  failed: number
-  /** 详情返回了数据但收货字段仍全空 (平台侧确实没有) */
-  empty: number
-  /** 补全后仍缺失收货信息的订单总数 (再点一次继续补) */
-  remaining: number
-  errors: string[]
-}
-
-/**
- * 一键补全缺失的收货人/手机号/地址: 闲鱼列表接口 11-06 起不再返回 buyerInfoVO
- * 收货字段 (平台隐私收紧), 走订单详情接口定向补全 (与单条「详情精修」同源)。
- */
-export function backfillReceiver(body: { cookie_id?: string; limit?: number } = {}) {
-  return useApi().post<ReceiverBackfillResult>('/api/orders/backfill-receiver', body)
-}
-
 export function manualShip(body: { order_id: string; mode: string }) {
   return useApi().post('/api/orders/manual-ship', body)
 }

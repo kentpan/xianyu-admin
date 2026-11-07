@@ -17,9 +17,8 @@
  * 仅「使用中」(is_active=1) 引擎可触发; 并发触发以进程内闸门防重 (CF 多隔离实例下
  * 极端双触发也只是幂等 upsert, 无害)。
  */
-import { fetchOrdersViaProxy, taskChannelTransport } from '../../utils/xianyu/order-task'
+import { fetchOrdersViaProxy } from '../../utils/xianyu/order-task'
 import { upsertSoldOrders } from '../../utils/xianyu/order-sync'
-import { backfillReceiverForAccount } from '../../utils/xianyu/receiver-backfill'
 import { cookieIdentityMismatch } from '../../utils/xianyu/mtop'
 import { consumeRate } from '../../utils/rate-limit'
 
@@ -54,7 +53,6 @@ export default defineEventHandler(
       let updated = 0
       let blocked = 0
       let skippedDeleted = 0
-      let receiverRecovered = 0
       const errors: string[] = []
       const synced: string[] = []
 
@@ -79,18 +77,6 @@ export default defineEventHandler(
           skippedDeleted += ur.skippedDeleted
           synced.push(String(acct.id))
         }
-        // 收货信息定向补全 (v2.3.5): 列表接口 11-06 起不再返回 buyerInfoVO 收货字段
-        // (平台隐私收紧), 经代理任务通道走详情接口定向补全, 每轮每账号限 3 单
-        // (receiver_attempts<3 防死循环, 取消单不补, 候选耗尽 6h 冷却零查询零调用)
-        try {
-          const bf = await backfillReceiverForAccount(db, String(acct.id), 3, {
-            transport: taskChannelTransport(db, 15_000),
-          })
-          if (bf.recovered > 0) {
-            receiverRecovered += bf.recovered
-            console.log(`[order-sync] 账号 ${acct.id} 收货信息补全: 恢复 ${bf.recovered} 单`)
-          }
-        } catch {}
       }
 
       return ok(
@@ -101,12 +87,9 @@ export default defineEventHandler(
           updated,
           blocked,
           skipped_deleted: skippedDeleted,
-          receiver_recovered: receiverRecovered,
           errors,
         },
-        inserted
-          ? `全状态订单自动同步: 新增 ${inserted}, 更新 ${updated}${receiverRecovered ? `, 补全收货信息 ${receiverRecovered} 单` : ''}`
-          : '全状态订单自动同步完成 (无新单)',
+        inserted ? `全状态订单自动同步: 新增 ${inserted}, 更新 ${updated}` : '全状态订单自动同步完成 (无新单)',
       )
     } finally {
       inFlight = false
