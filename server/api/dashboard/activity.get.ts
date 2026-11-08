@@ -1,10 +1,17 @@
-/** GET /api/dashboard/activity — recent activity feed (orders + logs + risk events + account changes, merged & time-sorted). */
+/** GET /api/dashboard/activity — recent activity feed (orders + logs + risk events + account changes, merged & time-sorted).
+ *
+ * (v2.3.5 hotfix) TTL 缓存 60s: 四表 ORDER BY created_at LIMIT 查询被多标签页轮询
+ * 放大, 缓存折叠为每 isolate 每分钟 1 次。 */
+import { cachedQuery } from '../../utils/db-cache'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-    const db = await getDb()
     const { limit = 15 } = getQuery(event) as any
     const n = Math.min(Number(limit) || 15, 50)
+
+    return ok(await cachedQuery(`dash:activity:${n}`, 60_000, async () => {
+    const db = await getDb()
 
     // Gather events from multiple sources in parallel
     const [orders, logs, riskLogs, accounts] = await Promise.all([
@@ -92,6 +99,7 @@ export default defineEventHandler(
 
     // Sort by time desc, take top N
     activities.sort((a, b) => b.ts - a.ts)
-    return ok({ activities: activities.slice(0, n), total: activities.length })
+    return { activities: activities.slice(0, n), total: activities.length }
+    }))
   }),
 )

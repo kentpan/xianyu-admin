@@ -32,7 +32,10 @@ export default defineNuxtRouteMiddleware(async (to) => {
       const data = await getSystemStatus()
       installed.value = data.installed
     } catch {
-      installed.value = false
+      // (v2.3.5 hotfix) 探测失败绝不伪装成未安装: 网络/D1 暂态故障(如日读限额
+      // 用尽)时按「已安装」放行, 页面自身 API 错误如实展示 —— 否则全站会被 302
+      // 到 /install, 用户误以为数据库丢失。仅当接口明确返回 installed:false 才进安装向导。
+      installed.value = true
     }
   }
 

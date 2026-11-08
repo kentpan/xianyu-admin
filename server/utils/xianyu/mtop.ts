@@ -83,16 +83,37 @@ export function cookieHeader(jar: Map<string, string>): string {
     .join('; ')
 }
 
-/** 把 Set-Cookie 列表合并进 jar。 */
+/** 把 Set-Cookie 列表合并进 jar。
+ *
+ * (v2.3.5 hotfix) 过期删除感知 (与 ws-client.ts/proxy 的 applySetCookies 同源):
+ * Max-Age<=0 / Expires 已过 → 从 jar 删除该字段, 否则覆盖。旧实现无观测属性,
+ * 平台在会话失效/风控响应里下发的「清除指令」(cookie2=; Max-Age=0) 会被当成
+ * 空值覆盖写入 → 活会话被自己毒化, 账号隔天必掉线要求重新扫码。
+ */
 export function mergeSetCookies(jar: Map<string, string>, setCookieList: string[]): void {
   for (const sc of setCookieList) {
-    const pair = sc.split(';', 1)[0]
+    const segments = String(sc || '').split(';')
+    const pair = segments[0] || ''
     if (!pair) continue
     const eq = pair.indexOf('=')
     if (eq <= 0) continue
     const name = pair.slice(0, eq).trim()
     const value = pair.slice(eq + 1).trim()
-    if (name) jar.set(name, value)
+    if (!name) continue
+    let expired = false
+    for (const attr of segments.slice(1)) {
+      const a = attr.trim()
+      const al = a.toLowerCase()
+      if (al.startsWith('max-age=')) {
+        const n = Number(a.slice(8))
+        if (Number.isFinite(n) && n <= 0) expired = true
+      } else if (al.startsWith('expires=')) {
+        const ts = Date.parse(a.slice(8))
+        if (Number.isFinite(ts) && ts <= Date.now()) expired = true
+      }
+    }
+    if (expired) jar.delete(name)
+    else jar.set(name, value)
   }
 }
 
@@ -275,11 +296,17 @@ export async function mtopCall<T = any>(
   })
 
   // 合并轮换后的 cookie (尤其是 _m_h5_tk)
-  mergeSetCookies(jar, res.setCookie)
+  // (v2.3.5 hotfix) 会话已失效的响应绝不合并: 此时下发的往往是清除指令/空值,
+  // 合并只会毒化 cookie (瞬时误判时更会误伤仍有效的会话), 与 token 链路的
+  // auth 裁定同口径 — 会话生死由判定链路宣布, 不由失效响应的 Set-Cookie 改写。
   const raw = parseMtopJson(res.text)
-
-  // token 过期: FAIL_SYS_TOKEN_EXOIRED (闲鱼官方拼写错误, 含 O) 或 FAIL_SYS_TOKEN_EXPIRED
   const retStr = Array.isArray(raw?.ret) ? raw.ret[0] : ''
+  if (!/SESSION_EXPIRED/i.test(retStr)) {
+    mergeSetCookies(jar, res.setCookie)
+  } else {
+    console.warn(`[mtop] ${api} 会话失效响应, 跳过 Set-Cookie 合并 (防毒化)`)
+  }
+  // token 过期: FAIL_SYS_TOKEN_EXOIRED (闲鱼官方拼写错误, 含 O) 或 FAIL_SYS_TOKEN_EXPIRED
   if (retStr.includes('FAIL_SYS_TOKEN_EXOIRED') || retStr.includes('FAIL_SYS_TOKEN_EXPIRED')) {
     // 用轮换后的 _m_h5_tk 重试一次
     const newCookieStr = cookieHeader(jar)
@@ -470,8 +497,10 @@ export async function polishItem(cookieStr: string, itemId: string): Promise<Pol
       headers,
       body: `data=${encodeURIComponent(dataStr)}`,
     })
-    // 合并轮换后的 cookie (尤其是 _m_h5_tk)
-    mergeSetCookies(jar, res.setCookie)
+    // 合并轮换后的 cookie (尤其是 _m_h5_tk) — 会话失效响应不合并 (防毒化, 同 mtopCall)
+    if (!/SESSION_EXPIRED/i.test(String(Array.isArray(parseMtopJson(res.text)?.ret) ? parseMtopJson(res.text).ret[0] : ''))) {
+      mergeSetCookies(jar, res.setCookie)
+    }
     newCookieStr = cookieHeader(jar)
     raw = parseMtopJson(res.text)
   } catch (e: any) {
@@ -495,7 +524,10 @@ export async function polishItem(cookieStr: string, itemId: string): Promise<Pol
           headers: { ...headers, cookie: newCookieStr },
           body: `data=${encodeURIComponent(dataStr)}`,
         })
-        mergeSetCookies(jar, res2.setCookie)
+        const ret0 = Array.isArray(parseMtopJson(res2.text)?.ret) ? parseMtopJson(res2.text).ret[0] : ''
+        if (!/SESSION_EXPIRED/i.test(String(ret0 || ''))) {
+          mergeSetCookies(jar, res2.setCookie)
+        }
         newCookieStr = cookieHeader(jar)
         raw = parseMtopJson(res2.text)
       } catch {}

@@ -523,31 +523,53 @@ export class XianyuAccountClient {
     if (this.lastChatMessageAt && Date.now() - this.lastChatMessageAt < COOKIE_MSG_COOLDOWN_MS) return
     this.cookieRefreshing = true
     try {
-      const res = await fetch(WEB_HOME_URL, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: {
-          'User-Agent': resolveChromeUA().ua,
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          Cookie: this.cookieStr,
-        },
-        signal: AbortSignal.timeout(20_000),
-      })
-      const setCookies: string[] = (res.headers as any).getSetCookie?.() || []
-      if (setCookies.length) {
-        const merged = transCookies(this.cookieStr)
-        applySetCookies(merged, setCookies)
-        const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
+      // (v2.3.5 hotfix) 会话自毒修复: 旧实现无条件合并任何响应的 Set-Cookie —
+      // 主站瞬时 302 (风控抖动/AB 实验/网关切换) 的响应携带的是「会话清除指令」
+      // (cookie2/skt 等 Max-Age=0), 合并等于亲手删掉自己仍有效的登录会话 →
+      // 表现为账号隔天必掉线要求重新扫码。铁律: 只有 200 OK 的主站响应才允许
+      // 合并 Set-Cookie (滑动续期生效点); 一切 30x 一律只跟跳不合并, 直到
+      // 拿到 200 或发现 passport 重定向 (会话失效信号, 只留痕绝不写库)。
+      let url = WEB_HOME_URL
+      const jar = transCookies(this.cookieStr)
+      let mergedAny = false
+      for (let hop = 0; hop < 2; hop++) {
+        const res = await fetch(url, {
+          method: 'GET',
+          redirect: 'manual',
+          headers: {
+            'User-Agent': resolveChromeUA().ua,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            Referer: 'https://www.goofish.com/',
+            'Cache-Control': 'no-cache',
+            Cookie: Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; '),
+          },
+          signal: AbortSignal.timeout(20_000),
+        })
+        const location = res.headers.get('location') || ''
+        // passport 重定向 = 会话失效判定信号: 本跳 Set-Cookie 是清除指令, 绝不合并
+        if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {
+          logWarn(`[${this.cookieId}] web 会话保活: 主站重定向登录页 (会话可能已失效, 以 token 链路判定为准)`)
+          return
+        }
+        const setCookies: string[] = (res.headers as any).getSetCookie?.() || []
+        if (setCookies.length) {
+          applySetCookies(jar, setCookies)
+          mergedAny = true
+        }
+        if (res.status >= 300 && res.status < 400 && location) {
+          // 同站跳转: 跟一跳再拿 200 (Set-Cookie 可能下发在第二跳)
+          url = new URL(location, url).toString()
+          continue
+        }
+        break
+      }
+      if (mergedAny) {
+        const mergedStr = Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
           this.cookieStr = mergedStr
           this.events.onCookieRotated(this.cookieId, mergedStr)
         }
-      }
-      // 重定向到 passport = 会话已失效 (仅留痕; 登录态判定与状态机仍由 token 链路负责)
-      const location = res.headers.get('location') || ''
-      if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {
-        logWarn(`[${this.cookieId}] web 会话保活: 主站重定向登录页 (会话可能已失效, 以 token 链路判定为准)`)
       }
     } catch {
       // 主站不可达/网络异常: 静默, 下一周期重试

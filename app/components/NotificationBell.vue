@@ -133,12 +133,23 @@ function dotClass(type: string) {
 }
 
 // (v2.3.1) 本地时间包装已删: 统一用全局 formatAgo (app/utils/datetime.ts, 北京时间)
+// (v2.3.5 hotfix) 轮询 60s→120s + 页面隐藏时暂停: D1 免费层日读配额治理。
+// 服务端另有 60s TTL 缓存兜底, 此处降频把多标签页 × 长挂机的读放大再砍一半。
 onMounted(() => {
   load()
-  // Poll every 60s
   if (import.meta.client) {
-    const t = setInterval(load, 60000)
+    const t = setInterval(() => {
+      if (document.hidden) return // 后台标签页不消耗数据库读取
+      load()
+    }, 120000)
     onBeforeUnmount(() => clearInterval(t))
+    document.addEventListener('visibilitychange', onVisibility)
+    onBeforeUnmount(() => document.removeEventListener('visibilitychange', onVisibility))
   }
 })
+
+function onVisibility() {
+  // 从隐藏切回前台立即刷新一次 (数据跟上, 不额外增加后台期读取)
+  if (import.meta.client && !document.hidden) load()
+}
 </script>

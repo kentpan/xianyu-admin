@@ -981,8 +981,11 @@ const MIGRATIONS: string[] = [
     pic_url TEXT DEFAULT '',
     want_count INTEGER DEFAULT 0,
     keyword VARCHAR(128) DEFAULT '',
-    // 商品类型 (v2.3.0): virtual=虚拟商品 / physical=实体商品, 按标题特征词分类;
-    // 趋势页默认只看虚拟商品 (与卖虚拟服务的运营口径一致), '' = 未分类旧数据 (读时自愈回填)
+    -- 商品类型 (v2.3.0): virtual=虚拟商品 / physical=实体商品, 按标题特征词分类;
+    -- 趋势页默认只看虚拟商品 (与卖虚拟服务的运营口径一致), '' = 未分类旧数据 (读时自愈回填)
+    -- (v2.3.5 hotfix) 注释用 SQL 方言 -- 而非 JS 的 // : // 不是合法 SQLite 注释,
+    -- 本建表迁移历来静默失败 (catch 吞掉), 存量库上 trend_hot_items 从未建出,
+    -- 全平台热门商品趋势直接 "no such table" 500 — 这正是该 bug 的修复。
     item_type VARCHAR(16) DEFAULT '',
     seen_count INTEGER DEFAULT 1,
     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -18,6 +18,8 @@
  *     (与 dashboard/trend.get.ts 同款兜底模式, 数据语义完全一致)
  */
 
+import { cachedQuery } from '../../utils/db-cache'
+
 /** 已付款口径的状态集合 (order_status 实际取值, 见 mtop.ts SELLER_ORDER_STATUS_MAP) */
 const PAID_STATUSES = ['pending_ship', 'shipped', 'completed', 'refunding', 'refunded', 'processing']
 const RECEIVED_STATUSES = ['completed']
@@ -59,6 +61,9 @@ function metricOf(status: string | null | undefined): 'paid' | 'received' | 'ref
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
+    // (v2.3.5 hotfix) TTL 缓存 120s: 趋势 tab 重聚合接口, 多标签页轮询折叠为
+    // 每分钟级 1 次真实查询。这是库内 orders 订单趋势, 与全平台热门商品趋势/全平台搜索零交集。
+    return ok(await cachedQuery('orders:trends', 120_000, async () => {
     const db = await getDb()
 
     const days = emptyDayBuckets()
@@ -172,7 +177,7 @@ export default defineEventHandler(
       }).length
     }
 
-    return ok({
+    return {
       days,
       metrics: {
         totals,
@@ -185,6 +190,7 @@ export default defineEventHandler(
         },
       },
       other_total: otherTotal,
-    })
+    }
+    }))
   }),
 )

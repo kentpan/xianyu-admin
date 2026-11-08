@@ -1,7 +1,13 @@
-/** GET /api/dashboard/online — account online status summary (enabled accounts, last activity, cookie freshness). */
+/** GET /api/dashboard/online — account online status summary (enabled accounts, last activity, cookie freshness).
+ *
+ * (v2.3.5 hotfix) TTL 缓存 60s: 每账号订单/关键词 GROUP BY 聚合被轮询放大, 缓存折叠。 */
+import { cachedQuery } from '../../utils/db-cache'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
+
+    return ok(await cachedQuery('dash:online', 60_000, async () => {
     const db = await getDb()
 
     const accounts = await db.all<{
@@ -56,9 +62,10 @@ export default defineEventHandler(
     const offline = items.filter((i) => !i.isOnline && i.enabled).length
     const disabled = items.filter((i) => !i.enabled).length
 
-    return ok({
+    return {
       items,
       summary: { total: items.length, online, offline, disabled },
-    })
+    }
+    }))
   }),
 )

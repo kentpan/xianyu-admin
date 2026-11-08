@@ -1,7 +1,14 @@
-/** GET /api/dashboard/stats — aggregated metrics for the dashboard. */
+/** GET /api/dashboard/stats — aggregated metrics for the dashboard.
+ *
+ * (v2.3.5 hotfix) TTL 缓存 60s: 多标签页轮询折叠为每 isolate 每分钟 1 次真实查询,
+ * 叠加索引迁移把日读行数压回 D1 免费额度内。 */
+import { cachedQuery } from '../../utils/db-cache'
+
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
+
+    return ok(await cachedQuery('dash:stats', 60_000, async () => {
     const db = await getDb()
 
     // (v2.3.5) 订单总数从状态分布一次 GROUP BY 推导, 不再单独 COUNT(*) —
@@ -30,7 +37,7 @@ export default defineEventHandler(
       'SELECT id, level, module, message, created_at FROM system_logs ORDER BY created_at DESC LIMIT 10',
     ).catch(() => [])
 
-    return ok({
+    return {
       totalAccounts: accountsRow?.c || 0,
       activeAccounts: activeRow?.c || 0,
       totalKeywords: keywordsRow?.c || 0,
@@ -41,6 +48,7 @@ export default defineEventHandler(
       orderStatusDist,
       recentOrders,
       recentLogs,
-    })
+    }
+    }))
   }),
 )

@@ -708,6 +708,7 @@ CREATE INDEX idx_agent_order_no ON agent_orders(order_no);
 CREATE INDEX idx_agent_owner ON agent_orders(owner_user_id);
 CREATE INDEX idx_agent_upstream ON agent_orders(upstream_user_id);
 CREATE INDEX idx_agent_user ON agent_orders(user_id);
+CREATE INDEX idx_aireply_cookie ON ai_reply_settings(cookie_id);
 CREATE INDEX idx_apilog_key ON api_key_logs(api_key_id, id);
 CREATE INDEX idx_autolog_cookie ON auto_reply_logs(cookie_id, id);
 CREATE INDEX idx_card_vars_enabled ON card_variables(enabled, category, sort);
@@ -716,6 +717,7 @@ CREATE INDEX idx_cardcode_status ON card_code_logs(status, created_at);
 CREATE UNIQUE INDEX idx_cardcode_unique ON card_code_logs(code);
 CREATE INDEX idx_cardconsume_code ON card_consume_logs(code);
 CREATE INDEX idx_cardconsume_created ON card_consume_logs(created_at);
+CREATE INDEX idx_cookies_created ON cookies(created_at);
 CREATE INDEX idx_dock_card ON dock_records(card_id);
 CREATE INDEX idx_dock_parent ON dock_records(parent_dock_id);
 CREATE INDEX idx_dock_user ON dock_records(user_id);
@@ -723,9 +725,16 @@ CREATE INDEX idx_enginetasks_status ON engine_tasks(status, engine_id, id);
 CREATE INDEX idx_fund_user ON fund_flows(user_id, id);
 CREATE INDEX idx_imconv_account ON im_conversations(cookie_id, updated_at);
 CREATE INDEX idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
+CREATE INDEX idx_itemai_cookie ON item_ai_settings(cookie_id, item_id);
+CREATE INDEX idx_kbq_sort ON kb_questions(sort, id);
+CREATE INDEX idx_kba_sort ON kb_answers(sort, id);
+CREATE INDEX idx_orders_cookie ON orders(cookie_id);
+CREATE INDEX idx_orders_created ON orders(created_at);
 CREATE INDEX idx_qrlogin_user ON qr_login_sessions(user_id);
+CREATE INDEX idx_risklog_created ON risk_control_logs(created_at);
 CREATE INDEX idx_settle_user ON settlement_records(user_id);
 CREATE INDEX idx_ship_card ON card_shipments(card_id, id);
+CREATE INDEX idx_syslog_created ON system_logs(created_at);
 
 CREATE TRIGGER trg_engine_tasks_expire AFTER UPDATE ON engine_tasks
     WHEN NEW.status = 'running' AND OLD.status = 'pending' AND NEW.updated_at < datetime('now', '-90 seconds', 'localtime')

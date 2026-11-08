@@ -115,20 +115,58 @@ export async function ensureSecrets(event?: H3Event): Promise<void> {
  * 安装状态判定（数据真源）：环境变量快路径之外，库中存在可用管理员账号即视为
  * 已安装。CI 把本地 SQLite（含 admin 用户）全量导入 D1 后，线上无需依赖
  * XY_INSTALLED 注入即可直接进入登录流程 —— 安装与否由数据说话，而非人工补环境变量。
- * 仅缓存肯定结果（管理员存在是稳态）；库未就绪时保持未安装判定，下次请求重试。
+ *
+ * (v2.3.5 hotfix) 三态判定 + 暂态故障 fail-open —— 线上事故根因修复：
+ *  D1 日读限额用尽后每条 SELECT 抛错, 旧逻辑把「查询失败」与「库是空的」混为一谈,
+ *  导致全站被误判未安装、所有请求 302 到 /install (用户误以为数据库丢失)。
+ *  - 仅当错误明确指向「users 表不存在」才判定未安装 (全新库的真实初始态);
+ *  - 其余一切错误 (D1 限额/网络抖动/超时/绑定缺失) 一律视为暂态故障, fail-open
+ *    视为已安装 —— 绝不把线上站伪装成未安装;
+ *  - 探针 60s 节流 (含未安装/暂态判定), 防限流期每请求一发 COUNT 继续放读。
  */
 let _dbInstalled = false
+let _probeAt = 0
+let _probeState: 'yes' | 'no' | 'unknown' = 'no'
+const PROBE_TTL_MS = 60_000
+
+/** 错误分类：false = 确定性「未安装」（表不存在）；true = 暂态故障（限流/网络/未知） */
+function isTransientDbError(e: unknown): boolean {
+  const msg = String((e as any)?.message || e || '')
+  if (/no such table/i.test(msg)) return false
+  if (/table .* (does not|doesn't) exist/i.test(msg)) return false
+  if (/no such database/i.test(msg)) return false
+  return true
+}
+
 export async function isInstalledAsync(event?: H3Event): Promise<boolean> {
   if (isInstalled()) return true
   if (_dbInstalled) return true
+  const now = Date.now()
+  if (now - _probeAt < PROBE_TTL_MS) {
+    // 节流窗口内复用上次判定；unknown(暂态故障) fail-open 视为已安装
+    return _probeState !== 'no'
+  }
+  _probeAt = now
   try {
     const db = await getDb(event)
     const row = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND is_active = 1')
-    if (row && Number(row.n) > 0) _dbInstalled = true
-  } catch {
-    // 库未就绪/绑定缺失：保持未安装，不缓存
+    if (row && Number(row.n) > 0) {
+      _dbInstalled = true
+      _probeState = 'yes'
+      return true
+    }
+    _probeState = 'no'
+    return false
+  } catch (e) {
+    if (!isTransientDbError(e)) {
+      _probeState = 'no'
+      return false
+    }
+    // 暂态故障（D1 限流/网络抖动）：fail-open 视为已安装，绝不伪装未安装
+    console.error('[config] isInstalledAsync transient DB error → fail-open as installed:', (e as any)?.message || e)
+    _probeState = 'unknown'
+    return true
   }
-  return _dbInstalled
 }
 
 function readEnvFile(): Record<string, string> {
