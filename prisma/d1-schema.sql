@@ -1,7 +1,7 @@
 -- ⚠️ 自动生成文件: 由 server/utils/schema.ts 的 initSchema() 在临时库上物化导出, 请勿手改
 -- 重新生成: 对新库跑 initSchema 后 dump sqlite_master (SCHEMA + MIGRATIONS 全量终态)
 
-CREATE TABLE affiliate_accounts (
+CREATE TABLE IF NOT EXISTS affiliate_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     network_id VARCHAR(64) NOT NULL,
@@ -14,7 +14,7 @@ CREATE TABLE affiliate_accounts (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, network_id)
   );
-CREATE TABLE affiliate_products (
+CREATE TABLE IF NOT EXISTS affiliate_products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     account_id INTEGER NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE affiliate_products (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(account_id, item_id)
   );
-CREATE TABLE agent_orders (
+CREATE TABLE IF NOT EXISTS agent_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     order_no VARCHAR(64) NOT NULL,
@@ -61,7 +61,7 @@ CREATE TABLE agent_orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE ai_configs (
+CREATE TABLE IF NOT EXISTS ai_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
     model_name VARCHAR(64) DEFAULT 'qwen-plus',
@@ -72,7 +72,7 @@ CREATE TABLE ai_configs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE ai_conversations (
+CREATE TABLE IF NOT EXISTS ai_conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     chat_id VARCHAR(64) NOT NULL,
@@ -84,7 +84,7 @@ CREATE TABLE ai_conversations (
     bargain_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE ai_reply_settings (
+CREATE TABLE IF NOT EXISTS ai_reply_settings (
     cookie_id VARCHAR(64) PRIMARY KEY,
     ai_enabled INTEGER DEFAULT 0,
     model_name VARCHAR(64) DEFAULT 'qwen-plus',
@@ -97,7 +97,7 @@ CREATE TABLE ai_reply_settings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , user_agent VARCHAR(255) DEFAULT '', context_enabled INTEGER DEFAULT 1, context_message_limit INTEGER DEFAULT 12, context_expire_minutes INTEGER DEFAULT 120, ai_config_id INTEGER DEFAULT 0);
-CREATE TABLE api_key_logs (
+CREATE TABLE IF NOT EXISTS api_key_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     api_key_id INTEGER NOT NULL,
     endpoint VARCHAR(64) DEFAULT '',
@@ -107,7 +107,7 @@ CREATE TABLE api_key_logs (
     ip VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE api_keys (
+CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
     api_key VARCHAR(64) NOT NULL UNIQUE,
@@ -122,7 +122,7 @@ CREATE TABLE api_keys (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , expires_at TIMESTAMP);
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     username VARCHAR(64),
@@ -135,7 +135,7 @@ CREATE TABLE audit_logs (
     user_agent TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE auto_reply_logs (
+CREATE TABLE IF NOT EXISTS auto_reply_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cookie_id VARCHAR(64) NOT NULL,
                 chat_id VARCHAR(64) DEFAULT '',
@@ -153,7 +153,7 @@ CREATE TABLE auto_reply_logs (
                 send_status VARCHAR(16) DEFAULT 'unknown',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             , is_test INTEGER DEFAULT 0);
-CREATE TABLE card_code_logs (
+CREATE TABLE IF NOT EXISTS card_code_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id INTEGER DEFAULT 0,
     card_name VARCHAR(128) DEFAULT '',
@@ -169,7 +169,7 @@ CREATE TABLE card_code_logs (
     source VARCHAR(16) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE card_consume_logs (
+CREATE TABLE IF NOT EXISTS card_consume_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code_id INTEGER DEFAULT 0,
     code VARCHAR(64) DEFAULT '',
@@ -184,7 +184,7 @@ CREATE TABLE card_consume_logs (
     message VARCHAR(240) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , source VARCHAR(16) DEFAULT '');
-CREATE TABLE card_shipments (
+CREATE TABLE IF NOT EXISTS card_shipments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 card_id INTEGER NOT NULL,
                 card_name VARCHAR(128) DEFAULT '',
@@ -196,7 +196,7 @@ CREATE TABLE card_shipments (
                 user_id INTEGER DEFAULT 1,
                 shipped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-CREATE TABLE card_variables (
+CREATE TABLE IF NOT EXISTS card_variables (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     var_key VARCHAR(64) NOT NULL UNIQUE,
     label VARCHAR(128) NOT NULL,
@@ -209,7 +209,7 @@ CREATE TABLE card_variables (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE cards (
+CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
     type VARCHAR(16) NOT NULL,
@@ -227,18 +227,18 @@ CREATE TABLE cards (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , price VARCHAR(32) DEFAULT '0.00', is_dockable INTEGER DEFAULT 0, fee_payer VARCHAR(16) DEFAULT 'distributor', min_price VARCHAR(32), dock_visibility VARCHAR(16) DEFAULT 'public', code_length INTEGER DEFAULT 6, code_letters INTEGER DEFAULT 1, code_digits INTEGER DEFAULT 1, code_case VARCHAR(8) DEFAULT 'mixed', code_template TEXT);
-CREATE TABLE chat_pauses (
+CREATE TABLE IF NOT EXISTS chat_pauses (
     cookie_id VARCHAR(64) NOT NULL,
     chat_id VARCHAR(64) NOT NULL,
     paused_until TIMESTAMP NOT NULL,
     PRIMARY KEY (cookie_id, chat_id)
   );
-CREATE TABLE cookie_status (
+CREATE TABLE IF NOT EXISTS cookie_status (
     cookie_id VARCHAR(64) PRIMARY KEY,
     enabled INTEGER DEFAULT 1,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE cookies (
+CREATE TABLE IF NOT EXISTS cookies (
     id VARCHAR(64) PRIMARY KEY,
     value TEXT NOT NULL,
     user_id INTEGER NOT NULL,
@@ -250,7 +250,7 @@ CREATE TABLE cookies (
     show_browser INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , xianyu_uid VARCHAR(64) DEFAULT '', avatar TEXT, login_type VARCHAR(16) DEFAULT 'cookie', cookie_status_text VARCHAR(32) DEFAULT 'unknown', last_check_at TIMESTAMP, auto_rate_enabled INTEGER DEFAULT 0, auto_flower_enabled INTEGER DEFAULT 0, auto_thanks_enabled INTEGER DEFAULT 0, auto_receive_flower_enabled INTEGER DEFAULT 0, nickname VARCHAR(128) DEFAULT '', avatar_url TEXT, location VARCHAR(255) DEFAULT '', bio TEXT, followers INTEGER DEFAULT 0, following INTEGER DEFAULT 0, profile_updated_at TIMESTAMP, device_id VARCHAR(128) DEFAULT '');
-CREATE TABLE default_replies (
+CREATE TABLE IF NOT EXISTS default_replies (
     cookie_id VARCHAR(64) PRIMARY KEY,
     enabled INTEGER DEFAULT 0,
     reply_content TEXT,
@@ -259,20 +259,20 @@ CREATE TABLE default_replies (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE default_reply_records (
+CREATE TABLE IF NOT EXISTS default_reply_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cookie_id VARCHAR(64) NOT NULL,
                 chat_id VARCHAR(64) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(cookie_id, chat_id)
             );
-CREATE TABLE deleted_orders (
+CREATE TABLE IF NOT EXISTS deleted_orders (
     order_id VARCHAR(64) PRIMARY KEY,
     cookie_id VARCHAR(64) DEFAULT '',
     reason VARCHAR(255) DEFAULT 'user_delete',
     deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE delivery_block_rules (
+CREATE TABLE IF NOT EXISTS delivery_block_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id VARCHAR(64) NOT NULL,
                 rule_code VARCHAR(64) NOT NULL,
@@ -287,7 +287,7 @@ CREATE TABLE delivery_block_rules (
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(account_id, rule_code)
             );
-CREATE TABLE delivery_rules (
+CREATE TABLE IF NOT EXISTS delivery_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword VARCHAR(255) NOT NULL,
     card_id INTEGER NOT NULL,
@@ -298,7 +298,7 @@ CREATE TABLE delivery_rules (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , require_paid INTEGER DEFAULT 1, trigger_type VARCHAR(16) DEFAULT 'keyword', item_id VARCHAR(64) DEFAULT '', cookie_id VARCHAR(64), ship_mode VARCHAR(16) DEFAULT '');
-CREATE TABLE dock_code_bindings (
+CREATE TABLE IF NOT EXISTS dock_code_bindings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     dock_code VARCHAR(32) NOT NULL,
@@ -306,7 +306,7 @@ CREATE TABLE dock_code_bindings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, target_user_id)
   );
-CREATE TABLE dock_records (
+CREATE TABLE IF NOT EXISTS dock_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     card_id INTEGER NOT NULL,
@@ -326,17 +326,17 @@ CREATE TABLE dock_records (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE engine_event_dedup (
+CREATE TABLE IF NOT EXISTS engine_event_dedup (
     event_id VARCHAR(80) PRIMARY KEY,
     actions_json TEXT DEFAULT '[]',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , pending INTEGER DEFAULT 0);
-CREATE TABLE engine_failover (
+CREATE TABLE IF NOT EXISTS engine_failover (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     owner VARCHAR(16) NOT NULL DEFAULT 'remote',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE engine_subscribers (
+CREATE TABLE IF NOT EXISTS engine_subscribers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
     token VARCHAR(64) DEFAULT '',
@@ -351,7 +351,7 @@ CREATE TABLE engine_subscribers (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE engine_tasks (
+CREATE TABLE IF NOT EXISTS engine_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type VARCHAR(32) NOT NULL,
     payload TEXT DEFAULT '',
@@ -361,7 +361,7 @@ CREATE TABLE engine_tasks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE engines (
+CREATE TABLE IF NOT EXISTS engines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug VARCHAR(32) NOT NULL UNIQUE,
     name VARCHAR(128) NOT NULL,
@@ -376,7 +376,7 @@ CREATE TABLE engines (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , token VARCHAR(64) DEFAULT '', last_poll_ip VARCHAR(64) DEFAULT '');
-CREATE TABLE fund_flows (
+CREATE TABLE IF NOT EXISTS fund_flows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     type VARCHAR(16) NOT NULL,
@@ -388,7 +388,7 @@ CREATE TABLE fund_flows (
     description VARCHAR(500),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE im_conversations (
+CREATE TABLE IF NOT EXISTS im_conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     chat_id VARCHAR(64) NOT NULL,
@@ -404,7 +404,7 @@ CREATE TABLE im_conversations (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(cookie_id, chat_id)
   );
-CREATE TABLE im_messages (
+CREATE TABLE IF NOT EXISTS im_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     chat_id VARCHAR(64) NOT NULL,
@@ -422,7 +422,7 @@ CREATE TABLE im_messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_ai INTEGER DEFAULT 0,
     UNIQUE(cookie_id, message_key)
   );
-CREATE TABLE in_app_notifications (
+CREATE TABLE IF NOT EXISTS in_app_notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     type VARCHAR(32) DEFAULT 'info',
@@ -432,7 +432,7 @@ CREATE TABLE in_app_notifications (
     link VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE item_ai_settings (
+CREATE TABLE IF NOT EXISTS item_ai_settings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     item_id VARCHAR(64) NOT NULL,
@@ -448,7 +448,7 @@ CREATE TABLE item_ai_settings (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ai_config_id INTEGER DEFAULT 0, use_item_kb INTEGER DEFAULT 0, share_item_kb INTEGER DEFAULT 0, use_account_style INTEGER DEFAULT 0,
     UNIQUE(cookie_id, item_id)
   );
-CREATE TABLE item_info (
+CREATE TABLE IF NOT EXISTS item_info (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     item_id VARCHAR(64) NOT NULL,
@@ -463,7 +463,7 @@ CREATE TABLE item_info (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(cookie_id, item_id)
   );
-CREATE TABLE item_replay (
+CREATE TABLE IF NOT EXISTS item_replay (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id VARCHAR(64) NOT NULL,
     cookie_id VARCHAR(64) NOT NULL,
@@ -471,7 +471,7 @@ CREATE TABLE item_replay (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , delay_seconds INTEGER DEFAULT 10);
-CREATE TABLE kb_answers (
+CREATE TABLE IF NOT EXISTS kb_answers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   content TEXT NOT NULL,
   content_hash VARCHAR(64) NOT NULL UNIQUE,
@@ -487,7 +487,7 @@ CREATE TABLE kb_answers (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE kb_group_members (
+CREATE TABLE IF NOT EXISTS kb_group_members (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id INTEGER NOT NULL,
   item_type VARCHAR(8) NOT NULL,
@@ -495,14 +495,14 @@ CREATE TABLE kb_group_members (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(group_id, item_type, item_id)
 );
-CREATE TABLE kb_groups (
+CREATE TABLE IF NOT EXISTS kb_groups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name VARCHAR(128) NOT NULL,
   sort INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE kb_questions (
+CREATE TABLE IF NOT EXISTS kb_questions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   content TEXT NOT NULL,
   content_hash VARCHAR(64) NOT NULL UNIQUE,
@@ -518,7 +518,7 @@ CREATE TABLE kb_questions (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE keywords (
+CREATE TABLE IF NOT EXISTS keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     keyword VARCHAR(255) NOT NULL,
@@ -528,7 +528,7 @@ CREATE TABLE keywords (
     image_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , delay_min REAL DEFAULT 0, delay_max REAL DEFAULT 0, delay_seconds INTEGER DEFAULT 10);
-CREATE TABLE menu_groups (
+CREATE TABLE IF NOT EXISTS menu_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key VARCHAR(32) NOT NULL UNIQUE,
     label VARCHAR(64) NOT NULL,
@@ -537,7 +537,7 @@ CREATE TABLE menu_groups (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE menus (
+CREATE TABLE IF NOT EXISTS menus (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id INTEGER DEFAULT 0,
     name VARCHAR(64) NOT NULL,
@@ -550,7 +550,7 @@ CREATE TABLE menus (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE message_filters (
+CREATE TABLE IF NOT EXISTS message_filters (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cookie_id VARCHAR(64) NOT NULL,
                 keyword VARCHAR(255) NOT NULL,
@@ -559,7 +559,7 @@ CREATE TABLE message_filters (
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-CREATE TABLE message_notifications (
+CREATE TABLE IF NOT EXISTS message_notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     channel_id INTEGER NOT NULL,
@@ -567,7 +567,7 @@ CREATE TABLE message_notifications (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, name VARCHAR(128) DEFAULT '', event_types TEXT,
     UNIQUE(cookie_id, channel_id)
   );
-CREATE TABLE notification_channels (
+CREATE TABLE IF NOT EXISTS notification_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(128) NOT NULL,
     type VARCHAR(32) NOT NULL,
@@ -576,7 +576,7 @@ CREATE TABLE notification_channels (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
     order_id VARCHAR(64) PRIMARY KEY,
     item_id VARCHAR(64),
     buyer_id VARCHAR(64),
@@ -595,7 +595,7 @@ CREATE TABLE orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , system_shipped INTEGER DEFAULT 0, version INTEGER DEFAULT 1, buy_num INTEGER DEFAULT 1, auction_price VARCHAR(32) DEFAULT '', confirm_fee VARCHAR(32) DEFAULT '', refund_fee VARCHAR(32) DEFAULT '', post_fee VARCHAR(32) DEFAULT '', consign_status VARCHAR(16) DEFAULT '', consign_message VARCHAR(255) DEFAULT '', consign_at TIMESTAMP, delivery_claim_at TIMESTAMP, paid_at TIMESTAMP, shipped_at TIMESTAMP, finished_at TIMESTAMP, cancelled_at TIMESTAMP, item_title VARCHAR(512) DEFAULT '', buyer_nick VARCHAR(128) DEFAULT '', seller_id VARCHAR(64) DEFAULT '', item_price VARCHAR(32) DEFAULT '', sync_source VARCHAR(16) DEFAULT '');
-CREATE TABLE qr_login_sessions (
+CREATE TABLE IF NOT EXISTS qr_login_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key VARCHAR(64) NOT NULL UNIQUE,
     user_id INTEGER NOT NULL,
@@ -608,7 +608,7 @@ CREATE TABLE qr_login_sessions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , params_json TEXT, jar_json TEXT, face_qr_url TEXT, verification_url TEXT);
-CREATE TABLE risk_control_logs (
+CREATE TABLE IF NOT EXISTS risk_control_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
     event_type VARCHAR(64) NOT NULL DEFAULT 'slider_captcha',
@@ -618,14 +618,14 @@ CREATE TABLE risk_control_logs (
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE role_menus (
+CREATE TABLE IF NOT EXISTS role_menus (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role_id INTEGER NOT NULL,
     menu_id INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(role_id, menu_id)
   );
-CREATE TABLE roles (
+CREATE TABLE IF NOT EXISTS roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name VARCHAR(64) NOT NULL UNIQUE,
     description VARCHAR(255) DEFAULT '',
@@ -633,7 +633,7 @@ CREATE TABLE roles (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE settlement_records (
+CREATE TABLE IF NOT EXISTS settlement_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     payment_type VARCHAR(16),
@@ -646,7 +646,7 @@ CREATE TABLE settlement_records (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE system_logs (
+CREATE TABLE IF NOT EXISTS system_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     level VARCHAR(16) DEFAULT 'INFO',
     module VARCHAR(64),
@@ -655,13 +655,13 @@ CREATE TABLE system_logs (
     user_id INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE system_settings (
+CREATE TABLE IF NOT EXISTS system_settings (
     key_name VARCHAR(64) PRIMARY KEY,
     value TEXT NOT NULL,
     description TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
-CREATE TABLE trend_hot_items (
+CREATE TABLE IF NOT EXISTS trend_hot_items (
     item_id VARCHAR(64) PRIMARY KEY,
     title VARCHAR(512) DEFAULT '',
     price VARCHAR(32) DEFAULT '',
@@ -675,14 +675,14 @@ CREATE TABLE trend_hot_items (
     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , item_type VARCHAR(16) DEFAULT '');
-CREATE TABLE user_roles (
+CREATE TABLE IF NOT EXISTS user_roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     role_id INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, role_id)
   );
-CREATE TABLE user_settings (
+CREATE TABLE IF NOT EXISTS user_settings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     key_name VARCHAR(64) NOT NULL,
@@ -690,7 +690,7 @@ CREATE TABLE user_settings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, key_name)
   );
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username VARCHAR(64) NOT NULL UNIQUE,
     email VARCHAR(128) NOT NULL UNIQUE,
@@ -701,33 +701,33 @@ CREATE TABLE users (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   , dock_code VARCHAR(32), secret_key VARCHAR(64), phone VARCHAR(32));
 
-CREATE INDEX idx_aff_account_user ON affiliate_accounts(user_id);
-CREATE INDEX idx_aff_product_account ON affiliate_products(account_id);
-CREATE INDEX idx_aff_product_user ON affiliate_products(user_id);
-CREATE INDEX idx_agent_order_no ON agent_orders(order_no);
-CREATE INDEX idx_agent_owner ON agent_orders(owner_user_id);
-CREATE INDEX idx_agent_upstream ON agent_orders(upstream_user_id);
-CREATE INDEX idx_agent_user ON agent_orders(user_id);
-CREATE INDEX idx_apilog_key ON api_key_logs(api_key_id, id);
-CREATE INDEX idx_autolog_cookie ON auto_reply_logs(cookie_id, id);
-CREATE INDEX idx_card_vars_enabled ON card_variables(enabled, category, sort);
-CREATE INDEX idx_cardcode_created ON card_code_logs(created_at);
-CREATE INDEX idx_cardcode_status ON card_code_logs(status, created_at);
-CREATE UNIQUE INDEX idx_cardcode_unique ON card_code_logs(code);
-CREATE INDEX idx_cardconsume_code ON card_consume_logs(code);
-CREATE INDEX idx_cardconsume_created ON card_consume_logs(created_at);
-CREATE INDEX idx_dock_card ON dock_records(card_id);
-CREATE INDEX idx_dock_parent ON dock_records(parent_dock_id);
-CREATE INDEX idx_dock_user ON dock_records(user_id);
-CREATE INDEX idx_enginetasks_status ON engine_tasks(status, engine_id, id);
-CREATE INDEX idx_fund_user ON fund_flows(user_id, id);
-CREATE INDEX idx_imconv_account ON im_conversations(cookie_id, updated_at);
-CREATE INDEX idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
-CREATE INDEX idx_qrlogin_user ON qr_login_sessions(user_id);
-CREATE INDEX idx_settle_user ON settlement_records(user_id);
-CREATE INDEX idx_ship_card ON card_shipments(card_id, id);
+CREATE INDEX IF NOT EXISTS idx_aff_account_user ON affiliate_accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_aff_product_account ON affiliate_products(account_id);
+CREATE INDEX IF NOT EXISTS idx_aff_product_user ON affiliate_products(user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_order_no ON agent_orders(order_no);
+CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_orders(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_upstream ON agent_orders(upstream_user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_user ON agent_orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_apilog_key ON api_key_logs(api_key_id, id);
+CREATE INDEX IF NOT EXISTS idx_autolog_cookie ON auto_reply_logs(cookie_id, id);
+CREATE INDEX IF NOT EXISTS idx_card_vars_enabled ON card_variables(enabled, category, sort);
+CREATE INDEX IF NOT EXISTS idx_cardcode_created ON card_code_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_cardcode_status ON card_code_logs(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cardcode_unique ON card_code_logs(code);
+CREATE INDEX IF NOT EXISTS idx_cardconsume_code ON card_consume_logs(code);
+CREATE INDEX IF NOT EXISTS idx_cardconsume_created ON card_consume_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_dock_card ON dock_records(card_id);
+CREATE INDEX IF NOT EXISTS idx_dock_parent ON dock_records(parent_dock_id);
+CREATE INDEX IF NOT EXISTS idx_dock_user ON dock_records(user_id);
+CREATE INDEX IF NOT EXISTS idx_enginetasks_status ON engine_tasks(status, engine_id, id);
+CREATE INDEX IF NOT EXISTS idx_fund_user ON fund_flows(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_imconv_account ON im_conversations(cookie_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_qrlogin_user ON qr_login_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_settle_user ON settlement_records(user_id);
+CREATE INDEX IF NOT EXISTS idx_ship_card ON card_shipments(card_id, id);
 
-CREATE TRIGGER trg_engine_tasks_expire AFTER UPDATE ON engine_tasks
+CREATE TRIGGER IF NOT EXISTS trg_engine_tasks_expire AFTER UPDATE ON engine_tasks
     WHEN NEW.status = 'running' AND OLD.status = 'pending' AND NEW.updated_at < datetime('now', '-90 seconds', 'localtime')
     BEGIN UPDATE engine_tasks SET status = 'expired' WHERE id = NEW.id; END;
 
