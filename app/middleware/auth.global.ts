@@ -32,9 +32,10 @@ export default defineNuxtRouteMiddleware(async (to) => {
       const data = await getSystemStatus()
       installed.value = data.installed
     } catch {
-      // (v2.3.5 hotfix) 探测失败绝不伪装成未安装: 网络/D1 暂态故障(如日读限额
-      // 用尽)时按「已安装」放行, 页面自身 API 错误如实展示 —— 否则全站会被 302
-      // 到 /install, 用户误以为数据库丢失。仅当接口明确返回 installed:false 才进安装向导。
+      // 探测请求失败 (网络抖动/边缘瞬态错误) ≠ 未安装 — fail-open (v2.3.6):
+      // 服务端 install 探针同款三态语义; 真未安装时 /api/system/status 会确定性
+      // 返回 installed:false, 不会走这里。误判的代价是全站 302 /install (线上实锤:
+      // D1 瞬态错误期间整站被打进安装向导), 误放行的代价只是页面数据加载自会报错。
       installed.value = true
     }
   }

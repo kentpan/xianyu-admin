@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.5; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.6; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -152,7 +152,7 @@ const dotenvInfo = (() => {
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
 // XY_PKG_VERSION 读取, 缺省 2.3.2 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.5'
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.6'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
@@ -864,6 +864,192 @@ async function fetchTokenDetailed(cookieStr, deviceId) {
   return first
 }
 
+/** passport 续期链专用: 过滤 Max-Age=0 / Expires 1970 删除型 Set-Cookie (参考项目同款 — 保留旧值不清掉)。 */
+function filterDeletionSetCookies(setCookieList) {
+  return (setCookieList || []).filter((sc) => {
+    const s = String(sc || '')
+    return !/max-age=0/i.test(s) && !/expires=.*1970/i.test(s)
+  })
+}
+
+/**
+ * 登录态触摸: 调 mtop.taobao.idlemessage.pc.loginuser.get (参数级照抄参考项目
+ * login_renew_task)。响应 Set-Cookie 合并返回, 调用方按 verdict 决定是否回写。
+ */
+async function fetchLoginUserDetailed(cookieStr) {
+  const callOnce = async (useCookie) => {
+    const cookies = transCookies(useCookie)
+    const dataVal = '{}'
+    const h5tk = cookies['_m_h5_tk'] || ''
+    const signToken = h5tk ? h5tk.split('_')[0] : ''
+    const t = String(Date.now())
+    const params = new URLSearchParams({
+      jsv: '2.7.2',
+      appKey: '34839810',
+      t,
+      sign: md5Sign(t, signToken, dataVal),
+      v: '1.0',
+      type: 'originaljson',
+      accountSite: 'xianyu',
+      dataType: 'json',
+      timeout: '20000',
+      api: 'mtop.taobao.idlemessage.pc.loginuser.get',
+      sessionOption: 'AutoLoginOnly',
+      spm_cnt: 'a21ybx.im.0.0',
+      spm_pre: 'a21ybx.item.want.1.12523da6waCtUp',
+      log_id: '12523da6waCtUp',
+    })
+    const res = await fetch(`${LOGINUSER_API}?${params.toString()}`, {
+      method: 'POST',
+      headers: mtopHeaders(useCookie),
+      body: new URLSearchParams({ data: dataVal }).toString(),
+      signal: AbortSignal.timeout(30_000),
+    })
+    const json = await res.json().catch(() => ({}))
+    const ret = Array.isArray(json?.ret) ? json.ret : []
+    const merged = { ...cookies }
+    try {
+      applySetCookies(merged, res.headers.getSetCookie?.() || [])
+    } catch {}
+    return { ret, mergedCookies: merged }
+  }
+
+  const first = await callOnce(cookieStr)
+  if (classifyTokenError(first.ret) === 'token_roll') {
+    const rolled = Object.entries(first.mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
+    const second = await callOnce(rolled)
+    return { ret: second.ret, mergedCookies: { ...first.mergedCookies, ...second.mergedCookies } }
+  }
+  return first
+}
+
+/**
+ * 长登录续期链 (参数级照抄参考项目 cookie_renew_api_service):
+ *   ① hasLogin.do (web) → ② silentHasLogin.do (sdkSilent) → ③ setLoginSettings.do (status=0)
+ * ③ 下发新 havana_lgc2_77 (30 天长登录), 每次调用即续期; 各接口 Set-Cookie 逐一合并
+ * (删除指令过滤), 后续接口使用合并后的最新 Cookie — 与后台 ws-client.ts 同源实现。
+ */
+async function renewLongLoginChain(cookieStr) {
+  const notes = []
+  const ua = resolveChromeUA()
+  let working = cookieStr
+  const jar = transCookies(working)
+
+  if (!jar['unb']) {
+    return { cookieStr: working, notes: ['Cookie 缺少 unb, 跳过续期链'] }
+  }
+
+  const passportHeaders = (extra = {}) => ({
+    'user-agent': ua.ua,
+    'sec-ch-ua': ua.secChUa,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': ua.secChUaPlatform,
+    cookie: working,
+    ...extra,
+  })
+
+  const applyResult = (res, label) => {
+    const list = filterDeletionSetCookies(res.headers.getSetCookie?.() || [])
+    if (list.length) {
+      const merged = transCookies(working)
+      applySetCookies(merged, list)
+      working = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
+      notes.push(`${label}:+${list.length}cookie`)
+    } else {
+      notes.push(`${label}:无SetCookie`)
+    }
+  }
+
+  // ① hasLogin.do — web 入口登录态确认续期
+  try {
+    const pageTraceId = `21504${Date.now()}${Math.floor(100000 + Math.random() * 900000)}`
+    const body = new URLSearchParams({
+      hid: jar['unb'] || '',
+      ltl: 'true',
+      appName: 'xianyu',
+      appEntrance: 'web',
+      _csrf_token: jar['_tb_token_'] || '',
+      umidToken: jar['_uab_collina'] || jar['cna'] || '',
+      hsiz: jar['cookie2'] || '',
+      bizParams: 'taobaoBizLoginFrom=web&renderRefer=https://www.goofish.com/',
+      mainPage: 'false',
+      isMobile: 'false',
+      lang: 'zh_CN',
+      returnUrl: '',
+      fromSite: '77',
+      isIframe: 'true',
+      documentReferer: 'https://www.goofish.com/',
+      defaultView: 'hasLogin',
+      umidTag: 'SERVER',
+      deviceId: '',
+      pageTraceId,
+    }).toString()
+    const rnd = String(Math.random())
+    const res = await fetch(`${PASSPORT_HAS_LOGIN_URL}?appName=xianyu&fromSite=77`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: passportHeaders({
+        accept: 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN',
+        'content-type': 'application/x-www-form-urlencoded',
+        'bx-v': '2.5.31',
+        referer: `https://passport.goofish.com/mini_login.htm?lang=zh_cn&appName=xianyu&appEntrance=web&styleType=vertical&bizParams=&notLoadSsoView=false&notKeepLogin=false&isMobile=false&qrCodeFirst=false&stie=77&rnd=${rnd}`,
+        ...(jar['XSRF-TOKEN'] ? { 'x-xsrf-token': jar['XSRF-TOKEN'] } : {}),
+      }),
+      body,
+      signal: AbortSignal.timeout(PASSPORT_TIMEOUT_MS),
+    })
+    applyResult(res, 'hasLogin')
+  } catch (e) {
+    notes.push(`hasLogin:${String(e?.message || e).slice(0, 80)}`)
+  }
+
+  // ② silentHasLogin.do — 静默续短登录
+  try {
+    const params = new URLSearchParams({
+      documentReferer: 'https://www.goofish.com/',
+      appName: 'xianyu',
+      appEntrance: 'xianyu_sdkSilent',
+      fromSite: '0',
+      ltl: 'true',
+    }).toString()
+    const res = await fetch(`${PASSPORT_SILENT_HAS_LOGIN_URL}?${params}`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: passportHeaders({
+        accept: '*/*',
+        'accept-language': 'en,zh-CN;q=0.9,zh;q=0.8',
+        Referer: 'https://www.goofish.com/',
+      }),
+      signal: AbortSignal.timeout(PASSPORT_TIMEOUT_MS),
+    })
+    applyResult(res, 'silentHasLogin')
+  } catch (e) {
+    notes.push(`silentHasLogin:${String(e?.message || e).slice(0, 80)}`)
+  }
+
+  // ③ setLoginSettings.do (status=0) — 下发新 havana_lgc2_77 (30 天长登录)
+  try {
+    const res = await fetch(`${PASSPORT_SET_LOGIN_SETTINGS_URL}?fromSite=77&appName=xianyu&bizEntrance=web`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: passportHeaders({
+        accept: 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'content-type': 'application/x-www-form-urlencoded',
+        referer: 'https://www.goofish.com/',
+      }),
+      body: 'status=0',
+      signal: AbortSignal.timeout(PASSPORT_TIMEOUT_MS),
+    })
+    applyResult(res, 'setLoginSettings')
+  } catch (e) {
+    notes.push(`setLoginSettings:${String(e?.message || e).slice(0, 80)}`)
+  }
+
+  return { cookieStr: working, notes }
+}
+
 /* ------------- 单账号长连接客户端 (与后台 ws-client.ts 同源, 去人工验证依赖) ------------- */
 
 const RISK_LADDER_SECONDS = [300, 600, 1200, 1800]
@@ -876,6 +1062,22 @@ const COOKIE_MSG_COOLDOWN_MS = 300 * 1000
 // token API 不能续期 web 会话, 不做这个每 ~24h 必被服务端踢下线要求重新扫码
 const WEB_KEEPALIVE_MS = 30 * 60 * 1000
 const WEB_HOME_URL = 'https://www.goofish.com/'
+
+/**
+ * 登录态触摸周期 (v2.3.6 根治「每天 SESSION_EXPIRED」): 10 分钟 — 与后台 ws-client.ts
+ * 同源。cookie2/skt 短登录会话只有被 web 侧接口触摸才会滑动续期 (参考项目
+ * login_renew_task 默认 600s); token API 只滚 _m_h5_tk、主站 GET 续不了登录态本身,
+ * 短登录态 ~24h 自然死亡 → 每天重扫码 (叠加风控触发人脸核验)。
+ */
+const SESSION_TOUCH_MS = 600 * 1000
+/** loginuser.get (登录态触摸接口)。 */
+const LOGINUSER_API = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.loginuser.get/1.0/'
+/** 长登录续期周期 (v2.3.6): 1 小时 — passport 三接口链续 30 天长登录 havana_lgc2_77。 */
+const LONG_LOGIN_RENEW_MS = 3600 * 1000
+const PASSPORT_HAS_LOGIN_URL = 'https://passport.goofish.com/newlogin/hasLogin.do'
+const PASSPORT_SILENT_HAS_LOGIN_URL = 'https://passport.goofish.com/newlogin/silentHasLogin.do'
+const PASSPORT_SET_LOGIN_SETTINGS_URL = 'https://passport.goofish.com/ac/account/setLoginSettings.do'
+const PASSPORT_TIMEOUT_MS = 20_000
 const SEND_WINDOW_MS = 60_000
 const SEND_MAX_PER_WINDOW = 12
 
@@ -950,6 +1152,8 @@ class XianyuAccountClient {
     this.heartbeatTimer = null
     this.cookieKeepaliveTimer = null
     this.webKeepaliveTimer = null
+    this.sessionTouchTimer = null
+    this.longLoginTimer = null
     this.cookieRefreshing = false
     this.riskCooldownUntil = 0
     this.riskLadderIndex = 0
@@ -996,6 +1200,15 @@ class XianyuAccountClient {
     this.webKeepaliveTimer = setInterval(() => {
       if (!this.stopped) void this.webSessionKeepalive()
     }, jitter(WEB_KEEPALIVE_MS, 0.1))
+    // 登录态触摸 (v2.3.6): 每 10 分钟 loginuser.get 续 cookie2/skt 短登录会话 —
+    // 此前每天 SESSION_EXPIRED 的根因缺口 (与后台 ws-client.ts 同源)
+    this.sessionTouchTimer = setInterval(() => {
+      if (!this.stopped) void this.sessionTouch()
+    }, jitter(SESSION_TOUCH_MS, 0.1))
+    // 长登录续期 (v2.3.6): 每小时 passport 三接口链续 havana_lgc2_77 (30 天长登录)
+    this.longLoginTimer = setInterval(() => {
+      if (!this.stopped) void this.renewLongLogin()
+    }, jitter(LONG_LOGIN_RENEW_MS, 0.15))
   }
 
   async webSessionKeepalive() {
@@ -1047,13 +1260,78 @@ class XianyuAccountClient {
     }
   }
 
+  /**
+   * 登录态触摸一次 (v2.3.6): loginuser.get 续 cookie2/skt 短登录会话 (10min 周期,
+   * 与后台 ws-client.ts 同源)。Set-Cookie 照旧经 sink.onCookieRotated 上报后台落库;
+   * SESSION_EXPIRED 判定与 token 链同语义; 触摸成功自动把 need_relogin 拉回 connecting。
+   */
+  async sessionTouch() {
+    if (this.stopped || this.cookieRefreshing) return
+    if (Date.now() < this.riskCooldownUntil) return
+    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
+    this.cookieRefreshing = true
+    try {
+      const { ret, mergedCookies } = await fetchLoginUserDetailed(this.cookieStr)
+      const verdict = classifyTokenError(ret)
+      // 登录失效 (auth) 响应的 Set-Cookie 不回写 (清理指令/空值, 合并只会毒化会话)
+      if (verdict !== 'auth') {
+        const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
+        if (mergedStr !== this.cookieStr) {
+          this.cookieStr = mergedStr
+          this.sink.onCookieRotated(this.cookieId, mergedStr)
+        }
+      }
+      if (verdict === 'ok') {
+        if (this.state === 'need_relogin') this.setState('connecting', '登录态恢复 (触摸续期成功)')
+        return
+      }
+      if (verdict === 'risk') {
+        this.tripRisk(`登录态触摸被风控拦截: ${ret.join('; ')}`)
+        return
+      }
+      if (verdict === 'auth') {
+        if (this.state !== 'need_relogin') this.setState('need_relogin', ret.join('; ') || '登录态失效, 请重新扫码')
+        return
+      }
+      log(`账号 ${this.cookieId} 登录态触摸未成功: ${ret.join('; ') || '空响应'}`)
+    } catch (e) {
+      log(`账号 ${this.cookieId} 登录态触摸异常: ${e?.message}`)
+    } finally {
+      this.cookieRefreshing = false
+    }
+  }
+
+  /**
+   * 长登录续期一次 (v2.3.6): passport 三接口链续 30 天长登录 (havana_lgc2_77),
+   * 与后台 ws-client.ts 同源。need_relogin 状态下照常执行 — 长登录 token 是会话
+   * 死亡后无感拉活的通道; 拉活后 token 链下次成功刷新会自动带回 connecting。
+   */
+  async renewLongLogin() {
+    if (this.stopped || this.cookieRefreshing) return
+    if (Date.now() < this.riskCooldownUntil) return
+    this.cookieRefreshing = true
+    try {
+      const { cookieStr: mergedStr, notes } = await renewLongLoginChain(this.cookieStr)
+      if (mergedStr !== this.cookieStr) {
+        this.cookieStr = mergedStr
+        this.sink.onCookieRotated(this.cookieId, mergedStr)
+      }
+      log(`账号 ${this.cookieId} 长登录续期: ${notes.join('; ')}`)
+    } catch (e) {
+      log(`账号 ${this.cookieId} 长登录续期异常: ${e?.message}`)
+    } finally {
+      this.cookieRefreshing = false
+    }
+  }
+
   async stop() {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer, this.webKeepaliveTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer, this.webKeepaliveTimer, this.sessionTouchTimer, this.longLoginTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
     this.tokenTimer = this.heartbeatTimer = this.cookieKeepaliveTimer = this.webKeepaliveTimer = null
+    this.sessionTouchTimer = this.longLoginTimer = null
     this.generation++
     this.setState('disabled', '已停止')
     try {

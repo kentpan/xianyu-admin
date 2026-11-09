@@ -5,7 +5,6 @@
  * call — this endpoint must degrade to zeroed metrics, never 500.
  */
 import { databaseFilePath } from '../../utils/db-config'
-import { cachedQuery } from '../../utils/db-cache'
 
 /** Current isolate boot time — uptime source that works on every runtime. */
 const BOOT_AT = Date.now()
@@ -83,10 +82,6 @@ function tryMetric<T>(fn: () => T, fallback: T): T {
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-
-    // (v2.3.5 hotfix) TTL 缓存 60s: sqlite 驱动下本接口对全部 ~62 张表逐个 COUNT(*),
-    // 被前端轮询放大后是可观读行数源; 缓存折叠为每 isolate 每分钟 1 次
-    return ok(await cachedQuery('dash:health', 60_000, async () => {
     const db = await getDb()
     const state = getRuntimeState()
 
@@ -105,7 +100,7 @@ export default defineEventHandler(
     const driver = db.driver || state.dbDriver
     const { dbSize, tableCount, totalRows } = await collectDbStats(db, driver)
 
-    return {
+    return ok({
       uptime,
       uptimeLabel: formatUptime(uptime),
       memory: {
@@ -130,8 +125,7 @@ export default defineEventHandler(
       },
       nodeVersion,
       timestamp: new Date().toISOString(),
-    }
-    }))
+    })
   }),
 )
 

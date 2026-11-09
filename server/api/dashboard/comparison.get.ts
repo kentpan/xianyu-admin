@@ -1,16 +1,10 @@
 /**
  * GET /api/dashboard/comparison — data comparison (today vs yesterday, this week vs last week).
  * Returns order counts + revenue for 4 periods: today, yesterday, thisWeek, lastWeek.
- *
- * (v2.3.5 hotfix) TTL 缓存 120s: 4 个区间 COUNT+SUM 聚合被轮询放大, 缓存折叠。
  */
-import { cachedQuery } from '../../utils/db-cache'
-
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-
-    return ok(await cachedQuery('dash:comparison', 120_000, async () => {
     const db = await getDb()
 
     const now = new Date()
@@ -68,13 +62,12 @@ export default defineEventHandler(
       revenuePct: result.lastWeek.revenue > 0 ? Math.round(((result.thisWeek.revenue - result.lastWeek.revenue) / result.lastWeek.revenue) * 100) : (result.thisWeek.revenue > 0 ? 100 : 0),
     }
 
-    return {
+    return ok({
       periods: result,
       comparison: {
         todayVsYesterday,
         weekVsLastWeek,
       },
-    }
-    }))
+    })
   }),
 )

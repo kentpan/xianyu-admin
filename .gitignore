@@ -5,7 +5,7 @@ __MACOSX/
 dist
 *.log
 dev.log
-prisma/dev.db
+prisma/*.db
 prisma/dev.db-journal
 install.lock
 .env.local

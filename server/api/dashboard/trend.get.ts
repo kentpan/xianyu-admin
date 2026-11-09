@@ -1,14 +1,7 @@
-/** GET /api/dashboard/trend — 7-day order trend (counts + revenue per day).
- *
- * (v2.3.5 hotfix) TTL 缓存 120s: 趋势聚合允许 ≤2 分钟陈旧度, 多标签页轮询折叠。
- * 注意: 这是库内 orders 的订单趋势, 与全平台热门商品趋势/全平台搜索零交集。 */
-import { cachedQuery } from '../../utils/db-cache'
-
+/** GET /api/dashboard/trend — 7-day order trend (counts + revenue per day). */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
-
-    return ok(await cachedQuery('dash:trend', 120_000, async () => {
     const db = await getDb()
 
     // Build last 7 days (including today) — 北京日历日 (v2.3.0): DB 存 UTC, +8h 取北京日期
@@ -52,11 +45,10 @@ export default defineEventHandler(
       }
     }
 
-    return {
+    return ok({
       days,
       totalOrders: days.reduce((s, d) => s + d.count, 0),
       totalRevenue: Math.round(days.reduce((s, d) => s + d.revenue, 0) * 100) / 100,
-    }
-    }))
+    })
   }),
 )

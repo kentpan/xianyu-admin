@@ -116,55 +116,50 @@ export async function ensureSecrets(event?: H3Event): Promise<void> {
  * 已安装。CI 把本地 SQLite（含 admin 用户）全量导入 D1 后，线上无需依赖
  * XY_INSTALLED 注入即可直接进入登录流程 —— 安装与否由数据说话，而非人工补环境变量。
  *
- * (v2.3.5 hotfix) 三态判定 + 暂态故障 fail-open —— 线上事故根因修复：
- *  D1 日读限额用尽后每条 SELECT 抛错, 旧逻辑把「查询失败」与「库是空的」混为一谈,
- *  导致全站被误判未安装、所有请求 302 到 /install (用户误以为数据库丢失)。
- *  - 仅当错误明确指向「users 表不存在」才判定未安装 (全新库的真实初始态);
- *  - 其余一切错误 (D1 限额/网络抖动/超时/绑定缺失) 一律视为暂态故障, fail-open
- *    视为已安装 —— 绝不把线上站伪装成未安装;
- *  - 探针 60s 节流 (含未安装/暂态判定), 防限流期每请求一发 COUNT 继续放读。
+ * 三态判定 (v2.3.6, 线上实锤事故修复):
+ *   独立代理日志实锤 — D1 读限流/瞬态错误期间 (如 14:59:54 成功 → 15:01:57 一次
+ *   503「系统未安装」→ 15:05:03 恢复), 旧版 COUNT 抛错被 catch 空吞后误判「未安装」,
+ *   install 中间件随即对全站 API 返回 503、对页面 302 /install (D1 日读配额耗尽时
+ *   更是整站被打进安装向导)。数据库还在、管理员还在, 判定却是假的。
+ *   因此: ① 仅「表/库不存在」类确定性错误才判「未安装」(全新部署的真实初始态);
+ *         ② 限流/超时/网络等瞬态错误一律按「已安装」放行 (fail-open) — 误放行的
+ *            代价只是后续业务查询自会报错, 而误判未安装的代价是全站 302 /install
+ *            + 独立代理被 503 拒收停摆, 两害取其轻必须放行;
+ *         ③ 瞬态失败后 60s 节流 — 限流期每请求都打 COUNT 只会让 D1 死亡螺旋。
  */
 let _dbInstalled = false
-let _probeAt = 0
-let _probeState: 'yes' | 'no' | 'unknown' = 'no'
-const PROBE_TTL_MS = 60_000
-
-/** 错误分类：false = 确定性「未安装」（表不存在）；true = 暂态故障（限流/网络/未知） */
-function isTransientDbError(e: unknown): boolean {
-  const msg = String((e as any)?.message || e || '')
-  if (/no such table/i.test(msg)) return false
-  if (/table .* (does not|doesn't) exist/i.test(msg)) return false
-  if (/no such database/i.test(msg)) return false
-  return true
-}
+let _dbProbeTransientAt = 0
+const DB_PROBE_THROTTLE_MS = 60_000
+/** 「表/库不存在」类确定性错误特征 (SQLite / D1 / MySQL 三方言)。 */
+const DB_MISSING_RE =
+  /no such table|no such database|unknown database|doesn't exist|unable to open database|sqlite_cantopen|sqlite_notadb|er_no_such_table/i
 
 export async function isInstalledAsync(event?: H3Event): Promise<boolean> {
   if (isInstalled()) return true
   if (_dbInstalled) return true
-  const now = Date.now()
-  if (now - _probeAt < PROBE_TTL_MS) {
-    // 节流窗口内复用上次判定；unknown(暂态故障) fail-open 视为已安装
-    return _probeState !== 'no'
-  }
-  _probeAt = now
+  // 瞬态失败节流窗口内: 按「已安装」放行 (探测结果已知处于瞬态失败状态)
+  if (_dbProbeTransientAt && Date.now() - _dbProbeTransientAt < DB_PROBE_THROTTLE_MS) return true
   try {
     const db = await getDb(event)
     const row = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND is_active = 1')
     if (row && Number(row.n) > 0) {
       _dbInstalled = true
-      _probeState = 'yes'
+      _dbProbeTransientAt = 0
       return true
     }
-    _probeState = 'no'
+    _dbProbeTransientAt = 0
     return false
-  } catch (e) {
-    if (!isTransientDbError(e)) {
-      _probeState = 'no'
+  } catch (e: any) {
+    const msg = String(e?.message || e)
+    if (DB_MISSING_RE.test(msg)) {
+      // 确定性错误: 表还没建 (全新部署的真实未安装态), 正常进入安装向导
+      _dbProbeTransientAt = 0
       return false
     }
-    // 暂态故障（D1 限流/网络抖动）：fail-open 视为已安装，绝不伪装未安装
-    console.error('[config] isInstalledAsync transient DB error → fail-open as installed:', (e as any)?.message || e)
-    _probeState = 'unknown'
+    _dbProbeTransientAt = Date.now()
+    console.log(
+      `[install-probe] 探测瞬态失败, 按「已安装」放行 (60s 节流): ${msg.slice(0, 200)}`,
+    )
     return true
   }
 }
