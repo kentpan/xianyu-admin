@@ -59,6 +59,8 @@ interface EngineRuntime {
   clients: Map<string, XianyuAccountClient>
   /** 缓存账号 Cookie 串, 变更时热替换 */
   cookieCache: Map<string, string>
+  /** 客户端侧最近一次轮换 Cookie 的时刻 (热替换竞态守卫, v2.3.11) */
+  lastClientRotateAt: Map<string, number>
   standby: boolean
   starting: boolean
   itemSyncRunning: boolean
@@ -82,6 +84,7 @@ if (!g.__xianyuEngineRuntime) {
     orderSyncTimer: null,
     clients: new Map(),
     cookieCache: new Map(),
+    lastClientRotateAt: new Map(),
     standby: true,
     starting: false,
     itemSyncRunning: false,
@@ -250,6 +253,7 @@ async function pollOnce(): Promise<void> {
         await client.stop()
         runtime.clients.delete(id)
         runtime.cookieCache.delete(id)
+        runtime.lastClientRotateAt.delete(id)
       }
     }
 
@@ -257,9 +261,19 @@ async function pollOnce(): Promise<void> {
       const existing = runtime.clients.get(account.id)
       if (existing) {
         if (runtime.cookieCache.get(account.id) !== account.value) {
-          existing.setCookieStr(account.value)
-          runtime.cookieCache.set(account.id, account.value)
-          console.log(`[xianyu-engine] 账号 ${account.id} Cookie 已更新, 热替换生效`)
+          // 热替换竞态守卫 (v2.3.11): 客户端保活轮换先写 cache (合并写 DB 在途),
+          // 此刻 DB 短暂落后于 cache — 若立即把 DB 旧快照顶回客户端, 会把刚滚动的
+          // _m_h5_tk/_enc 成对回退 (配对失效 → 监听被踢)。轮换后 60s 内的 DB≠cache
+          // 视为落库在途, 跳过本轮推送; QR 重扫码/后台改 Cookie 等外部写入不写
+          // lastClientRotateAt, 不受影响 (最多延退一轮巡检)。
+          const rotatedAt = runtime.lastClientRotateAt.get(account.id) || 0
+          if (Date.now() - rotatedAt < 60_000) {
+            console.log(`[xianyu-engine] 账号 ${account.id} 保活轮换落库在途, 本轮跳过 Cookie 热替换`)
+          } else {
+            existing.setCookieStr(account.value)
+            runtime.cookieCache.set(account.id, account.value)
+            console.log(`[xianyu-engine] 账号 ${account.id} Cookie 已更新, 热替换生效`)
+          }
         }
         continue
       }
@@ -304,6 +318,7 @@ function createClient(db: Awaited<ReturnType<typeof getDb>>, account: { id: stri
           // 更新的 _m_h5_tk, 整串覆盖会把新 token 顶回旧的 (下一次请求即被判失效)
           const base = runtime.cookieCache.get(cookieId) || ''
           runtime.cookieCache.set(cookieId, merged)
+          runtime.lastClientRotateAt.set(cookieId, Date.now())
           void persistCookieRotation(db, cookieId, base, merged)
         },
       },

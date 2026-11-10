@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.10; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.11; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -151,8 +151,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.3.10 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.10'
+// XY_PKG_VERSION 读取, 缺省 2.3.11 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.11'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
@@ -1061,14 +1061,22 @@ async function renewLongLoginChain(cookieStr) {
 
 const RISK_LADDER_SECONDS = [300, 600, 1200, 1800]
 const RISK_LADDER_WINDOW_MS = 30 * 60 * 1000
+// token TTL 上界 (仅用于重连时判断是否需要刷新, 常规滚动由 3min 任务完成)
 const TOKEN_REFRESH_MS = 3600 * 1000
-// cookie 保活 (复刻参考项目 cookie_refresh_loop): 3 分钟周期, 消息活动后 5 分钟冷却
-const COOKIE_KEEPALIVE_MS = 180 * 1000
-const COOKIE_MSG_COOLDOWN_MS = 300 * 1000
-// web 会话保活 (与后台 ws-client.ts 同源): 30 分钟访问主站一次, 滑动续期 web 登录会话 —
-// token API 不能续期 web 会话, 不做这个每 ~24h 必被服务端踢下线要求重新扫码
-const WEB_KEEPALIVE_MS = 30 * 60 * 1000
-const WEB_HOME_URL = 'https://www.goofish.com/'
+//
+// ── 凭证保活三层模型 (v2.3.11 统一执行器, 与后台 ws-client.ts 同源) ──
+// 闲鱼登录态由三层独立凭证构成, 缺一层就在该层寿命到期时死:
+//   ① _m_h5_tk 签名令牌 (小时级) — token API 调用即滚动, Set-Cookie 回写;
+//   ② cookie2/skt 短登录会话 (~24h 滑动过期) — 只有被 web 侧接口触摸才续期;
+//   ③ havana_lgc2_77 长登录 (30 天) — passport 三接口链续期 (短会话死亡后无感拉活)。
+// v2.3.11 执行层根因: 旧实现「收到下游消息后 5 分钟冷却」的守卫写在
+// lastDownstreamAt (含 15s 心跳回包的任意下行帧) 上 → 连接健康期间续期链
+// 全部永久短路 → 短会话 ~24h 必死。消息冷却彻底删除 (消息走 WS 帧, cookie
+// 轮换走 HTTPS, 互不干扰), 30min 主站 GET 删除 (v2.3.6 实证续不了登录态),
+// 三任务统一串行执行器, 守卫只在执行器一处。
+// 请求量: 每账号每日 480(token)+144(触摸)+72(passport) ≈ 696 次。
+// ① token 滚动周期 3 分钟 ±10% (参考项目 cookie_refresh_interval=180s)
+const TOKEN_ROLL_MS = 180 * 1000
 
 /**
  * 登录态触摸周期 (v2.3.6 根治「每天 SESSION_EXPIRED」): 10 分钟 — 与后台 ws-client.ts
@@ -1166,11 +1174,12 @@ class XianyuAccountClient {
     this.lastTokenRefresh = 0
     this.tokenTimer = null
     this.heartbeatTimer = null
-    this.cookieKeepaliveTimer = null
-    this.webKeepaliveTimer = null
     this.sessionTouchTimer = null
     this.longLoginTimer = null
-    this.cookieRefreshing = false
+    // 统一保活执行器: 串行队列 (同名去重, 含执行中任务) + 单 drain (v2.3.11)
+    this.keepAliveQueue = []
+    this.keepAliveDraining = false
+    this.keepAliveActive = null
     this.riskCooldownUntil = 0
     this.riskLadderIndex = 0
     this.lastRiskTripAt = 0
@@ -1204,88 +1213,79 @@ class XianyuAccountClient {
   start() {
     if (this.stopped) return
     void this.connectLoop()
+    // ① token 滚动 (3min): _m_h5_tk/WS token 保活 + cookie 轮换上报 (无消息冷却)
     this.tokenTimer = setInterval(() => {
-      if (!this.stopped) void this.refreshTokenSafely()
-    }, jitter(TOKEN_REFRESH_MS, 0.08))
-    // cookie 保活 (复刻参考项目 cookie_refresh_loop): 每 3 分钟调一次 token API,
-    // Set-Cookie 滚动合并回写后台; 收到下游消息后 5 分钟冷却 (风控降频)
-    this.cookieKeepaliveTimer = setInterval(() => {
-      if (!this.stopped) void this.maybeCookieKeepalive()
-    }, jitter(COOKIE_KEEPALIVE_MS, 0.1))
-    // web 会话保活: 每 30 分钟访问主站一次 (滑动续期 web 登录会话, 与后台 ws-client.ts 同源)
-    this.webKeepaliveTimer = setInterval(() => {
-      if (!this.stopped) void this.webSessionKeepalive()
-    }, jitter(WEB_KEEPALIVE_MS, 0.1))
-    // 登录态触摸 (v2.3.6): 每 10 分钟 loginuser.get 续 cookie2/skt 短登录会话 —
-    // 此前每天 SESSION_EXPIRED 的根因缺口 (与后台 ws-client.ts 同源)
+      if (!this.stopped) void this.submitKeepAlive('token')
+    }, jitter(TOKEN_ROLL_MS, 0.1))
+    // ② 登录态触摸 (10min): loginuser.get 续 cookie2/skt 短登录会话 (无消息冷却)
     this.sessionTouchTimer = setInterval(() => {
-      if (!this.stopped) void this.sessionTouch()
+      if (!this.stopped) void this.submitKeepAlive('touch')
     }, jitter(SESSION_TOUCH_MS, 0.1))
-    // 长登录续期 (v2.3.6): 每小时 passport 三接口链续 havana_lgc2_77 (30 天长登录)
+    // ③ 长登录续期 (1h): passport 三接口链续 havana_lgc2_77 (30 天长登录)
     this.longLoginTimer = setInterval(() => {
-      if (!this.stopped) void this.renewLongLogin()
+      if (!this.stopped) void this.submitKeepAlive('passport')
     }, jitter(LONG_LOGIN_RENEW_MS, 0.15))
   }
 
-  async webSessionKeepalive() {
-    if (this.stopped || this.cookieRefreshing) return
-    if (Date.now() < this.riskCooldownUntil) return
-    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
-    this.cookieRefreshing = true
-    try {
-      const res = await fetch(WEB_HOME_URL, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: {
-          'User-Agent': resolveChromeUA().ua,
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          Cookie: this.cookieStr,
-        },
-        signal: AbortSignal.timeout(20_000),
-      })
-      const setCookies = res.headers.getSetCookie?.() || []
-      if (setCookies.length) {
-        const merged = transCookies(this.cookieStr)
-        applySetCookies(merged, setCookies)
-        const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
-        if (mergedStr !== this.cookieStr) {
-          this.cookieStr = mergedStr
-          this.sink.onCookieRotated(this.cookieId, mergedStr)
+  /* ---------------- 统一保活执行器 (v2.3.11, 与后台 ws-client.ts 同源) ---------------- */
+
+  /**
+   * 提交保活任务 (串行, 同名去重 — 含执行中任务): 同一账号同一时刻最多一个
+   * 出站保活请求, 执行中的同名提交跟随其完成 (不重复实调)。守卫统一在 drain。
+   */
+  submitKeepAlive(task) {
+    if (this.keepAliveActive?.task === task) return this.keepAliveActive.done
+    return new Promise((resolve) => {
+      const queued = this.keepAliveQueue.find((q) => q.task === task)
+      if (queued) {
+        const prev = queued.resolve
+        queued.resolve = () => {
+          prev()
+          resolve()
         }
+      } else {
+        this.keepAliveQueue.push({ task, resolve })
       }
-      const location = res.headers.get('location') || ''
-      if (res.status >= 300 && res.status < 400 && /passport\.(goofish|taobao)\.com/i.test(location)) {
-        log(`账号 ${this.cookieId} web 会话保活: 主站重定向登录页 (会话可能已失效, 以 token 链路判定为准)`)
-      }
-    } catch {
-      // 主站不可达/网络异常: 静默, 下一周期重试
-    } finally {
-      this.cookieRefreshing = false
-    }
+      void this.drainKeepAlive()
+    })
   }
 
-  async maybeCookieKeepalive() {
-    if (this.cookieRefreshing || this.stopped) return
-    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
-    this.cookieRefreshing = true
+  async drainKeepAlive() {
+    if (this.keepAliveDraining) return
+    this.keepAliveDraining = true
     try {
-      await this.refreshTokenSafely()
+      while (this.keepAliveQueue.length > 0) {
+        const { task, resolve } = this.keepAliveQueue.shift()
+        let done
+        const doneP = new Promise((r) => (done = r))
+        this.keepAliveActive = { task, done: doneP }
+        try {
+          // 守卫唯一收口: 停止 / 风控冷却期 (零请求, 静默是让风控衰减的唯一方式)
+          if (!this.stopped && Date.now() >= this.riskCooldownUntil) {
+            if (task === 'token') await this.refreshTokenSafely()
+            else if (task === 'touch') await this.sessionTouch()
+            else await this.renewLongLogin()
+          }
+        } catch {
+          // 任务体已自兜底, 此处防调度器死亡
+        }
+        done()
+        this.keepAliveActive = null
+        resolve()
+      }
     } finally {
-      this.cookieRefreshing = false
+      this.keepAliveDraining = false
     }
   }
 
   /**
-   * 登录态触摸一次 (v2.3.6): loginuser.get 续 cookie2/skt 短登录会话 (10min 周期,
-   * 与后台 ws-client.ts 同源)。Set-Cookie 照旧经 sink.onCookieRotated 上报后台落库;
-   * SESSION_EXPIRED 判定与 token 链同语义; 触摸成功自动把 need_relogin 拉回 connecting。
+   * ② 登录态触摸任务 (v2.3.6 引入, v2.3.11 去守卫/去判死): loginuser.get 续
+   * cookie2/skt 短登录会话 (10min 周期, 参数级照抄参考项目 login_renew_task)。
+   * Set-Cookie 照旧经 sink.onCookieRotated 上报后台落库; verdict 仅供观测 —
+   * auth 不据此判死, 账号生死由 token 链 (3min 周期) 唯一判定 (端点特异性
+   * 误报会吓迫用户重扫码)。守卫统一在执行器。
    */
   async sessionTouch() {
-    if (this.stopped || this.cookieRefreshing) return
-    if (Date.now() < this.riskCooldownUntil) return
-    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
-    this.cookieRefreshing = true
     try {
       const { ret, mergedCookies } = await fetchLoginUserDetailed(this.cookieStr)
       const verdict = classifyTokenError(ret)
@@ -1297,40 +1297,23 @@ class XianyuAccountClient {
           this.sink.onCookieRotated(this.cookieId, mergedStr)
         }
       }
-      if (verdict === 'ok') {
-        if (this.state === 'need_relogin') this.setState('connecting', '登录态恢复 (触摸续期成功)')
-        return
-      }
+      if (verdict === 'ok') return
       if (verdict === 'risk') {
-        // 触摸链被风控 = 本周期该续期通道不可用, 仅跳过本次触摸 — 绝不 tripRisk 反噬
-        // 主链路 (v2.3.8 修复「无法恢复已监听」回归的根因, 与后台 ws-client.ts 同源):
-        // loginuser.get 的风控判定与主站 token 链的 RGV587 语义并不等价, 照搬
-        // tripRisk 会清空健康账号的 live token 并打入 5min→2h 冷却阶梯, 监听中的
-        // 账号被无故踢出「监听中」且冷却期内无法恢复。账号生死仍由 token 链判定。
         log(`账号 ${this.cookieId} 登录态触摸被风控拦截 (仅跳过本次触摸, 不影响监听链路): ${ret.join('; ')}`)
         return
       }
-      if (verdict === 'auth') {
-        if (this.state !== 'need_relogin') this.setState('need_relogin', ret.join('; ') || '登录态失效, 请重新扫码')
-        return
-      }
-      log(`账号 ${this.cookieId} 登录态触摸未成功: ${ret.join('; ') || '空响应'}`)
+      log(`账号 ${this.cookieId} 登录态触摸未成功 (以 token 链判定为准, 不据此判死): ${ret.join('; ') || '空响应'}`)
     } catch (e) {
       log(`账号 ${this.cookieId} 登录态触摸异常: ${e?.message}`)
-    } finally {
-      this.cookieRefreshing = false
     }
   }
 
   /**
-   * 长登录续期一次 (v2.3.6): passport 三接口链续 30 天长登录 (havana_lgc2_77),
-   * 与后台 ws-client.ts 同源。need_relogin 状态下照常执行 — 长登录 token 是会话
-   * 死亡后无感拉活的通道; 拉活后 token 链下次成功刷新会自动带回 connecting。
+   * ③ 长登录续期任务 (v2.3.6 引入, v2.3.11 去守卫): passport 三接口链续 30 天
+   * 长登录 (havana_lgc2_77), need_relogin 状态下照常执行 — 长登录 token 是
+   * 会话死亡后无感拉活的通道; 拉活后 token 链下次成功刷新会自动带回 connecting。
    */
   async renewLongLogin() {
-    if (this.stopped || this.cookieRefreshing) return
-    if (Date.now() < this.riskCooldownUntil) return
-    this.cookieRefreshing = true
     try {
       const { cookieStr: mergedStr, notes } = await renewLongLoginChain(this.cookieStr)
       if (mergedStr !== this.cookieStr) {
@@ -1340,19 +1323,19 @@ class XianyuAccountClient {
       log(`账号 ${this.cookieId} 长登录续期: ${notes.join('; ')}`)
     } catch (e) {
       log(`账号 ${this.cookieId} 长登录续期异常: ${e?.message}`)
-    } finally {
-      this.cookieRefreshing = false
     }
   }
 
   async stop() {
     this.stopped = true
-    for (const t of [this.tokenTimer, this.heartbeatTimer, this.cookieKeepaliveTimer, this.webKeepaliveTimer, this.sessionTouchTimer, this.longLoginTimer]) {
+    for (const t of [this.tokenTimer, this.heartbeatTimer, this.sessionTouchTimer, this.longLoginTimer]) {
       if (t) clearTimeout(t)
       if (t) clearInterval(t)
     }
-    this.tokenTimer = this.heartbeatTimer = this.cookieKeepaliveTimer = this.webKeepaliveTimer = null
+    this.tokenTimer = this.heartbeatTimer = null
     this.sessionTouchTimer = this.longLoginTimer = null
+    // 排空执行器队列 (resolve 挂起的等待者)
+    for (const q of this.keepAliveQueue.splice(0)) q.resolve()
     this.generation++
     this.setState('disabled', '已停止')
     try {
@@ -1387,8 +1370,9 @@ class XianyuAccountClient {
     const gen = ++this.generation
     this.setState('connecting', '建立连接')
 
+    // token 缺失或接近 TTL 上界先刷新 (经执行器串行, 与保活任务零竞态)
     if (!this.token || Date.now() - this.lastTokenRefresh > TOKEN_REFRESH_MS) {
-      await this.refreshTokenSafely()
+      await this.submitKeepAlive('token')
       if (!this.token) throw new Error('Token 获取失败')
     }
 
@@ -1506,8 +1490,12 @@ class XianyuAccountClient {
     })
   }
 
+  /**
+   * ① token 滚动任务 (守卫统一在执行器): 全账号唯一的两个状态裁决点 —
+   * risk → tripRisk 冷却阶梯; auth → need_relogin (唯一判死点, 状态已标记时
+   * 绝不重复上报)。Set-Cookie 经 sink.onCookieRotated 上报后台落库。
+   */
   async refreshTokenSafely() {
-    if (Date.now() < this.riskCooldownUntil) return
     try {
       const { token, mergedCookies, ret, punishUrl } = await fetchTokenDetailed(this.cookieStr, this.deviceId)
       const verdict = classifyTokenError(ret)
@@ -1533,9 +1521,8 @@ class XianyuAccountClient {
         return
       }
       if (verdict === 'auth') {
-        // 与 sessionTouch auth 分支同守卫 (v2.3.8, 与后台 ws-client.ts 同源): cookie
-        // 保活 (3min) + 重连退避都会走到这里, 状态已标记时绝不重复 setState —
-        // 否则会话死亡期间每次保活/重连都重发一次「登录态失效」状态上报。
+        // 全账号唯一判死点 (v2.3.11): 状态已标记时绝不重复 setState — 否则会话
+        // 死亡期间每 3 分钟重发一次「登录态失效」状态上报。
         if (this.state !== 'need_relogin') this.setState('need_relogin', ret.join('; ') || '登录态失效, 请重新扫码')
         return
       }
