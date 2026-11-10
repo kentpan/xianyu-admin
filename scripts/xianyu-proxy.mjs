@@ -55,7 +55,7 @@
  *   XY_PROXY_ADMIN_SECRET Web 管理面板登录密钥 (选填; 配置后访问 http://代理IP:端口/ 打开面板)
  *   XY_POLL_SECONDS  配置轮询间隔秒 (选填, 默认 30, 后台下发的 intervals 优先)
  *   XY_TASK_POLL_SECONDS 任务轮询间隔秒 (选填, 默认 3, 越短后台等待任务结果越快)
- *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.6; /health 的 script_version 上报;
+ *   XY_PKG_VERSION   脚本版本号 (选填, 默认 2.3.9; /health 的 script_version 上报;
  *                    单文件部署同目录没有 package.json, 版本号从这里配)
  *
  * 唯一触碰报文内容的地方是传输层编帧 (外层帧 JSON 的 mid/ack/心跳/注册 与发送帧构造):
@@ -151,8 +151,8 @@ const dotenvInfo = (() => {
 })()
 
 // 版本号: 单文件部署 (阿里云等) 同目录没有 package.json 可依, 从 .env/环境变量
-// XY_PKG_VERSION 读取, 缺省 2.3.2 (容忍手误带 v 前缀)。
-const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.8'
+// XY_PKG_VERSION 读取, 缺省 2.3.9 (容忍手误带 v 前缀)。
+const SCRIPT_VERSION = String(process.env.XY_PKG_VERSION || '').trim().replace(/^v/i, '') || '2.3.9'
 
 const ENGINE_TOKEN = String(process.env.XY_ENGINE_TOKEN || '')
 const PROXY_PORT = Math.round(Number(process.env.XY_PROXY_PORT || 0)) || 0
@@ -864,54 +864,19 @@ async function fetchTokenDetailed(cookieStr, deviceId) {
   return first
 }
 
-/**
- * 删除型 Set-Cookie 过滤 (v2.3.8 语义对齐修复): 与 applySetCookies 的真实删除判定完全
- * 同源 — Max-Age<=0 (数字解析, 不只匹配字面量 "0") 或 Expires 为任何过去时间 (不只 1970)
- * 都是删除指令。旧版只挡 "max-age=0"/"1970" 两种字面量, 漏掉 Max-Age=-1/其它过去时间,
- * 漏网的删除指令进 applySetCookies 会把 unb/cookie2 等身份字段从工作串中删除 — 工作串
- * 缺 unb 后 createClient 构造函数恒抛异常, 账号永久卡 'disabled' 无法再建连接。
- */
-function isDeletionSetCookie(sc) {
-  const attrs = String(sc || '').split(';').slice(1)
-  for (const attr of attrs) {
-    const a = attr.trim()
-    const al = a.toLowerCase()
-    if (al.startsWith('max-age=')) {
-      const n = Number(a.slice(8))
-      if (Number.isFinite(n) && n <= 0) return true
-    } else if (al.startsWith('expires=')) {
-      const ts = Date.parse(a.slice(8))
-      if (Number.isFinite(ts) && ts <= Date.now()) return true
-    }
-  }
-  return false
-}
-
-/** passport 续期链/触摸链专用: 过滤删除型 Set-Cookie (保留旧值不清掉, 与 applySetCookies 判定同源)。 */
+/** passport 续期链专用: 过滤 Max-Age=0 / Expires 1970 删除型 Set-Cookie (参考项目同款 — 保留旧值不清掉)。 */
 function filterDeletionSetCookies(setCookieList) {
-  return (setCookieList || []).filter((sc) => !isDeletionSetCookie(sc))
-}
-
-/**
- * 身份字段安全合并 (v2.3.8 根治「账号永久卡 disabled 无法恢复监听」):
- * unb (监听身份) / cookie2 (会话主键) 任一在合并后丢失/变空 = 平台在该响应里下发了
- * 会话清理指令, 合并结果是被毒化的串。这种串一旦进入工作区/上报/落库:
- *   ① latestCookies 缓存被毒化 (进程级 Map 永久存活) → 重建客户端时构造函数
- *      "Cookie 缺少 unb" 恒抛异常 → 账号永远建不成连接;
- *   ② 重新扫码下发的新 Cookie 也被毒化缓存屏蔽 (latestCookies 优先于后台下发值)。
- * 因此合并结果丢失身份字段时整体拒绝, 原样保留合并前工作串 — 正常轮换绝不会
- * 丢失这两个字段, 本校验只拦截毒化合并, 绝不阻断合法续期。
- */
-function safeMergedCookieStr(prevStr, mergedStr) {
-  const prev = transCookies(prevStr)
-  const next = transCookies(mergedStr)
-  for (const k of ['unb', 'cookie2']) {
-    if (String(prev[k] || '').trim() && !String(next[k] || '').trim()) {
-      log(`⚠ Cookie 合并结果丢失身份字段 ${k} (会话清理指令), 拒绝本次合并保留原串 — 防账号变砖`)
-      return prevStr
-    }
-  }
-  return mergedStr
+  return (setCookieList || []).filter((sc) => {
+    const s = String(sc || '')
+    if (/max-age=0/i.test(s) || /expires=.*1970/i.test(s)) return false
+    // 空值/占位值同步过滤 (与 applySetCookies 毒化防护同语义, v2.3.8): passport 链
+    // 的 Set-Cookie 常含 cookie2= 空值清理指令, 放行会毒化仍在生效的登录态。
+    const pair = s.split(';')[0] || ''
+    const eq = pair.indexOf('=')
+    if (eq <= 0) return false
+    const v = pair.slice(eq + 1).trim().toLowerCase()
+    return Boolean(v) && v !== 'deleted' && v !== 'null' && v !== 'undefined'
+  })
 }
 
 /**
@@ -951,7 +916,7 @@ async function fetchLoginUserDetailed(cookieStr) {
     const ret = Array.isArray(json?.ret) ? json.ret : []
     const merged = { ...cookies }
     try {
-      applySetCookies(merged, filterDeletionSetCookies(res.headers.getSetCookie?.() || []))
+      applySetCookies(merged, res.headers.getSetCookie?.() || [])
     } catch {}
     return { ret, mergedCookies: merged }
   }
@@ -1155,7 +1120,16 @@ function applySetCookies(record, setCookieList) {
       }
     }
     if (expired) delete record[name]
-    else record[name] = value
+    else {
+      // 空值/占位值不覆盖 (毒化防护, v2.3.8, 与后台 ws-client.ts 同源): 服务端对
+      // 失效/异常会话常下发空值清理指令 (如 cookie2=、xxx=deleted), 照单全收会把
+      // 仍在生效的登录态核心 cookie 写成空值并经轮换链上报持久化入库 → 账号永久
+      // SESSION_EXPIRED、重启也无法恢复监听。一律保留旧值, 真正的删除语义只由
+      // expired 分支 (Max-Age=0/Expires 已过) 负责。
+      const lv = value.toLowerCase()
+      if (!value || lv === 'deleted' || lv === 'null' || lv === 'undefined') continue
+      record[name] = value
+    }
   }
 }
 
@@ -1204,12 +1178,6 @@ class XianyuAccountClient {
     this.connectionFailures = 0
     this.generation = 0
     this.lastDownstreamAt = Date.now()
-    // 登录态触摸门控时钟 (v2.3.8): 只由「真实消息同步帧」刷新 — 心跳 ACK 也是下行帧,
-    // 旧版用 lastDownstreamAt 做门控时, 活跃连接每 15s 就刷一次心跳 ACK, 触摸条件
-    // (静默 >5min) 永远不满足 = 每日过期修复在活连接上从未生效。触摸的语义是
-    // 「无消息往来也要续会话」(参考项目 login_renew_task 无条件 600s), 门控只应
-    // 反映业务消息活跃度, 不应被链路心跳顶掉。
-    this.lastSyncDownstreamAt = Date.now()
 
     this.sendChain = Promise.resolve()
     this.sendTimestamps = []
@@ -1276,17 +1244,14 @@ class XianyuAccountClient {
         },
         signal: AbortSignal.timeout(20_000),
       })
-      const setCookies = filterDeletionSetCookies(res.headers.getSetCookie?.() || [])
+      const setCookies = res.headers.getSetCookie?.() || []
       if (setCookies.length) {
         const merged = transCookies(this.cookieStr)
         applySetCookies(merged, setCookies)
         const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.sink.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.sink.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       const location = res.headers.get('location') || ''
@@ -1319,23 +1284,17 @@ class XianyuAccountClient {
   async sessionTouch() {
     if (this.stopped || this.cookieRefreshing) return
     if (Date.now() < this.riskCooldownUntil) return
-    // (v2.3.8) 门控时钟改为 lastSyncDownstreamAt (真实消息帧) — 心跳 ACK 也是下行帧,
-    // 旧门控 (lastDownstreamAt) 在活跃连接上每 15s 被刷新, 触摸永远不执行 = 修复从未生效
-    if (Date.now() - this.lastSyncDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
+    if (Date.now() - this.lastDownstreamAt < COOKIE_MSG_COOLDOWN_MS) return
     this.cookieRefreshing = true
     try {
       const { ret, mergedCookies } = await fetchLoginUserDetailed(this.cookieStr)
       const verdict = classifyTokenError(ret)
-      // (v2.3.8) 仅成功响应回写: auth 是清理指令 (毒化会话), risk 是挑战/惩罚响应
-      // (Set-Cookie 带挑战态/x5sec, 合并进去会持久化风控状态) — 两者都不回写
-      if (verdict === 'ok' || verdict === 'token_roll') {
+      // 登录失效 (auth) 响应的 Set-Cookie 不回写 (清理指令/空值, 合并只会毒化会话)
+      if (verdict !== 'auth') {
         const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.sink.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.sink.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       if (verdict === 'ok') {
@@ -1343,7 +1302,12 @@ class XianyuAccountClient {
         return
       }
       if (verdict === 'risk') {
-        this.tripRisk(`登录态触摸被风控拦截: ${ret.join('; ')}`)
+        // 触摸链被风控 = 本周期该续期通道不可用, 仅跳过本次触摸 — 绝不 tripRisk 反噬
+        // 主链路 (v2.3.8 修复「无法恢复已监听」回归的根因, 与后台 ws-client.ts 同源):
+        // loginuser.get 的风控判定与主站 token 链的 RGV587 语义并不等价, 照搬
+        // tripRisk 会清空健康账号的 live token 并打入 5min→2h 冷却阶梯, 监听中的
+        // 账号被无故踢出「监听中」且冷却期内无法恢复。账号生死仍由 token 链判定。
+        log(`账号 ${this.cookieId} 登录态触摸被风控拦截 (仅跳过本次触摸, 不影响监听链路): ${ret.join('; ')}`)
         return
       }
       if (verdict === 'auth') {
@@ -1370,11 +1334,8 @@ class XianyuAccountClient {
     try {
       const { cookieStr: mergedStr, notes } = await renewLongLoginChain(this.cookieStr)
       if (mergedStr !== this.cookieStr) {
-        const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-        if (safeStr !== this.cookieStr) {
-          this.cookieStr = safeStr
-          this.sink.onCookieRotated(this.cookieId, safeStr)
-        }
+        this.cookieStr = mergedStr
+        this.sink.onCookieRotated(this.cookieId, mergedStr)
       }
       log(`账号 ${this.cookieId} 长登录续期: ${notes.join('; ')}`)
     } catch (e) {
@@ -1526,8 +1487,6 @@ class XianyuAccountClient {
             } catch {}
           }
           if (isSyncPackage(message)) {
-            // 真实消息帧: 刷新触摸门控时钟 (心跳 ACK 不刷, 见 lastSyncDownstreamAt 注释)
-            this.lastSyncDownstreamAt = Date.now()
             const items = message.body.syncPushPackage.data || []
             for (const item of items) {
               if (!item?.data) continue
@@ -1557,11 +1516,8 @@ class XianyuAccountClient {
       if (verdict !== 'auth') {
         const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.sink.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.sink.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       if (verdict === 'ok' && token) {
@@ -1577,7 +1533,10 @@ class XianyuAccountClient {
         return
       }
       if (verdict === 'auth') {
-        this.setState('need_relogin', ret.join('; ') || '登录态失效, 请重新扫码')
+        // 与 sessionTouch auth 分支同守卫 (v2.3.8, 与后台 ws-client.ts 同源): cookie
+        // 保活 (3min) + 重连退避都会走到这里, 状态已标记时绝不重复 setState —
+        // 否则会话死亡期间每次保活/重连都重发一次「登录态失效」状态上报。
+        if (this.state !== 'need_relogin') this.setState('need_relogin', ret.join('; ') || '登录态失效, 请重新扫码')
         return
       }
       log(`账号 ${this.cookieId} token 刷新未成功: ${ret.join('; ') || '空响应'}`)
@@ -2027,12 +1986,6 @@ const sink = {
     enqueueReport({ type: 'risk', account: cookieId, event_id: 'r:' + createHash('sha1').update([cookieId, description].join('|')).digest('hex') })
   },
   onCookieRotated(cookieId, mergedStr) {
-    // (v2.3.8) 上报守卫: 轮换结果缺失 unb (身份字段) 的串绝不进 latestCookies/上报 —
-    // latestCookies 是进程级缓存且重建客户端时优先采用, 毒化串入缓存 = 账号永久变砖。
-    if (!String(transCookies(mergedStr)['unb'] || '').trim()) {
-      log(`⚠ 账号 ${cookieId} Cookie 轮换结果缺失 unb (身份字段), 拒绝采纳/上报 — 防账号变砖`)
-      return
-    }
     latestCookies.set(cookieId, mergedStr)
     // 会话轮换必须回报后台: 代理是唯一持有活跃会话的一方, 后台发货/拉单用的库内 Cookie
     // 不跟随轮换就会带着过期 _m_h5_tk 请求平台 (发货必被判订单状态不正确/登录失效)。
@@ -2049,12 +2002,7 @@ function accountEntryFromConfig(a) {
 function createClient(account, owner = 0) {
   if (clients.has(account.id)) return
   try {
-    // (v2.3.8) 缓存自愈: latestCookies 里缺 unb 的串是历史毒化残留 (v2.3.6 及之前
-    // 的合并缺陷可能写入), 优先采用会让构造函数恒抛异常、重新扫码的新 Cookie 也被
-    // 屏蔽 — 缓存不带身份字段时回退后台下发值 (库内 Cookie 是唯一真源)。
-    const cached = latestCookies.get(account.id) || ''
-    const cachedOk = String(transCookies(cached)['unb'] || '').trim()
-    const cookieStr = cachedOk ? cached : String(account.cookies || '')
+    const cookieStr = latestCookies.get(account.id) || account.cookies
     const client = new XianyuAccountClient({ ...account, cookies: cookieStr }, sink)
     client.ownerBackend = owner
     clients.set(account.id, client)

@@ -150,8 +150,12 @@ export default defineEventHandler(
       }
       lastHeartbeatSnapshot = snapshot
       lastHeartbeatSnapshotAt = nowMs
-      // 登录态失效 (与内置引擎 onCookieInvalid 同语义): 通知用户重新扫码, 否则监听静默死亡
-      for (const acc of heartbeatAccounts) {
+      // 登录态失效 (与内置引擎 onCookieInvalid 同语义): 通知用户重新扫码, 否则监听静默死亡。
+      // v2.3.8 改为只遍历 changed (状态相对上一轮快照发生变化的账号): 心跳每 ~15s 一轮,
+      // 若每轮都对驻留 need_relogin 的账号派发通知, 单账号每小时 ≈240 条 (通知中心+邮件+
+      // 微信全渠道轰炸刷屏) — 现仅在转入 need_relogin 的那一刻通知一次; 进程重启后首轮
+      // prev 为空 → changed = 全量, 每账号最多再通知一次, 可接受。
+      for (const acc of changed) {
         if (String(acc.state) === 'need_relogin') {
           dispatchNotify({
             type: 'cookie_invalid',

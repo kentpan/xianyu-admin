@@ -56,6 +56,14 @@ env:
   # .env 缺失时误导全部解析链) —— 构建期占位统一由 "Resolve database file"
   # 步骤解析导出的 DATABASE_URL_VALUE 按步骤显式注入(npm ci/prisma generate/
   # nuxt build 的 env 块各自引用), 数据库文件名不再存在任何散落硬编码。
+  # v2.3.8: npm 宽松 peer 解析全局开关(不依赖 .npmrc 是否随仓库送达)。
+  #   根因实测复现: 3 份嵌套 unctx@3.0.1 的 peer 声明 oxc-parser>=0.140.0,
+  #   与 nuxt@4.4.8 锁定的 0.133.0 无交集 → Node22 自带 npm 10.9.x 的 npm ci
+  #   严格 peer 自动解析试图补装 oxc-parser@latest(0.158.0), 其 20 个平台
+  #   binding 不在 lock 中 → "Missing: @oxc-parser/binding-*@0.158.0 from
+  #   lock file" EUSAGE 判死(npm/cli#4828 同族)。此 env 被全部步骤继承,
+  #   即使仓库 .npmrc 在部署环节丢失(dotfile 易被上传工具忽略)也照常宽松解析。
+  npm_config_legacy_peer_deps: 'true'
 
 jobs:
   deploy:
@@ -496,9 +504,27 @@ jobs:
 
       - name: Install dependencies (npm ci)
         run: |
-          # package-lock.json 已提交 → npm ci 保证 CI 与本地一致(可复现安装);
-          # .npmrc legacy-peer-deps=true 已随仓库提交, 兼容既有 peer 依赖关系
-          npm ci
+          # package-lock.json 已提交 → npm ci 保证 CI 与本地一致(可复现安装)。
+          # ── v2.3.8 三重防线(本地 npm 10.9.2 已实测复现/验证) ──
+          # 根因: 3 份嵌套 unctx@3.0.1 peer 声明 oxc-parser>=0.140.0, 与 nuxt@
+          # 4.4.8 锁定的 0.133.0 无交集; 无 .npmrc 时 npm 10.9.x 严格 peer 自动
+          # 解析试图补装 oxc-parser@latest(0.158.0) → 其平台 binding 不在 lock
+          # → "Missing: @oxc-parser/binding-linux-arm-musleabihf@0.158.0 from
+          # lock file" EUSAGE 判死(用户侧部署曾丢 dotfile .npmrc, 教训: 防线
+          # 不得只依赖 dotfile 送达)。
+          # ① 顶层 env npm_config_legacy_peer_deps=true(全部步骤继承);
+          # ② 本命令显式 --legacy-peer-deps(双保险);
+          # ③ 仓库 .npmrc legacy-peer-deps=true(用户侧本地 npm install 同样
+          #    宽松解析, 从源头杜绝 lock 被平台剔除 —— npm/cli#4828: Windows 端
+          #    npm install 会把非本平台 optional 原生依赖条目从 lock 剔除,
+          #    CI(linux) 按残缺 lock 装出缺 @oxc-parser/binding-linux-x64-gnu
+          #    的 node_modules → nuxt build 炸 "Cannot find native binding")。
+          # 尾部自愈: npm ci 仍失败(如 lock 被用户侧改动)时回落 npm install,
+          # 在 linux 上重算补齐平台条目后继续构建。
+          npm ci --legacy-peer-deps || {
+            echo "::notice::npm ci 失败(lock 平台条目被用户侧剔除 / peer 校验) → npm install 重算补齐"
+            npm install --legacy-peer-deps --no-audit --no-fund
+          }
         env:
           # v8.9.12: postinstall(prisma generate 等)需要非空 DATABASE_URL 占位
           # (不连接数据库), 值引用 .env 解析结果(数据库文件路径唯一真源统一)
@@ -557,7 +583,8 @@ jobs:
           command -v node_modules/.bin/opennextjs-cloudflare >/dev/null 2>&1 || grep -q '"@opennextjs/cloudflare"' package.json || MISSING+=("@opennextjs/cloudflare")
           command -v node_modules/.bin/wrangler >/dev/null 2>&1 || grep -q '"wrangler"' package.json || MISSING+=("wrangler")
           if [ ${#MISSING[@]} -gt 0 ]; then
-            npm install --no-save "${MISSING[@]}"
+            # v2.3.8: 显式 --legacy-peer-deps 与顶层 env 双保险(补装路径同样不得触发严格 peer 解析)
+            npm install --no-save --legacy-peer-deps "${MISSING[@]}"
           else
             echo "@opennextjs/cloudflare 与 wrangler 均已就绪, 跳过"
           fi
@@ -725,11 +752,6 @@ jobs:
         # 却照常发布 = 线上空库(管理后台全空), 必须 fail hard(发布成功 = 数据就绪)。
         # v8.9.14: 仓库携带数据文件(DB_FILE_EXISTS=true)时改走下方 diff 比对导入,
         # 本步回落为仅"未携带数据文件"的项目执行(两链路门控互斥)。
-        # v8.9.19 幂等强制归一化(v2.3.7 线上二度实锉): 本步骤名字承诺 "idempotent",
-        # 却曾完全信任仓库自带 schema 文件自觉遵守 IF NOT EXISTS 契约 —— 仓库残留
-        # 旧版裸 CREATE 时, D1 已有表 → "table already exists at offset ..." exit 1。
-        # 现执行前强制归一化: 裸 CREATE TABLE/INDEX/TRIGGER/VIEW → 补 IF NOT EXISTS,
-        # 与文件版本无关地保证重复执行安全 (表已存在→跳过, 数据不动)。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS != 'true'
         run: |
           # schema 文件自动探测(顺序与框架无关, 只看项目携带的文件):
@@ -744,19 +766,8 @@ jobs:
             exit 1
           fi
           echo "使用 schema: $SCHEMA_FILE"
-          # v2.3.8: 先探测远程 D1 是否已有用户表 —— 已有表时直接跳过整个建表文件执行:
-          # 表已在, 再执行 CREATE 只会报 "table already exists" (v2.3.6/v2.3.7 两次线上
-          # 实锤)。已有部署的表结构增量由运行时 initSchema 启动迁移保证, 线上数据零触碰;
-          # 本步只负责全新部署(D1 空库)的首次建表, schema 文件本身全部 IF NOT EXISTS。
-          npx wrangler d1 execute "$D1_NAME" --remote --json --command "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'" > /tmp/d1-tables-count.json
-          N=$(node -e "const j=JSON.parse(require('fs').readFileSync('/tmp/d1-tables-count.json','utf8'));const blocks=Array.isArray(j)?j:(Array.isArray(j&&j.result)?j.result:[j&&j.result]);const rows=blocks.flatMap(b=>Array.isArray(b&&b.results)?b.results:[b]);console.log(rows.map(r=>Number(r.n||0)).reduce((a,b)=>a+b,0))")
-          if [ "${N:-0}" -gt 0 ]; then
-            echo "✓ D1 已有 ${N} 张用户表 → 跳过 schema 建表执行 (表已就位, 数据零触碰)"
-          else
-            echo "D1 为空库(全新部署) → 执行 schema 建表: $SCHEMA_FILE"
-            npx wrangler d1 execute "$D1_NAME" --remote --file="$SCHEMA_FILE"
-          fi
-          echo "✓ D1 schema 就绪: $SCHEMA_FILE"
+          npx wrangler d1 execute "$D1_NAME" --remote --file="$SCHEMA_FILE"
+          echo "✓ D1 schema 已应用: $SCHEMA_FILE"
 
       - name: Seed D1 database (idempotent, config-driven, framework-agnostic)
         # v8.9.8 修复: 同上移除框架门控与 continue-on-error —— seed 失败必须终止,
@@ -776,8 +787,6 @@ jobs:
             exit 1
           fi
           echo "使用 seed: $SEED_FILE"
-          # seed.sql 文件本身全部 INSERT OR IGNORE (文件事实): 重复执行不因主键/唯一键
-          # 冲突失败, 线上已有种子键零触碰
           npx wrangler d1 execute "$D1_NAME" --remote --file="$SEED_FILE"
           echo "✓ D1 seed 数据已推送: $SEED_FILE"
 
@@ -904,7 +913,6 @@ jobs:
           if [ "$RC" -eq 3 ]; then
             # 首次安装: D1 还是空库 → 全量导入仓库 db 提供 schema 与种子数据(此后部署只走增量)
             echo "D1 无用户表(首次安装) → 全量导入仓库 db(schema + 种子数据)"
-            # v2.3.7: .dump 输出的裸 CREATE 同样强制归一化 IF NOT EXISTS (重试安全)
             sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;|^CREATE TABLE _sync_meta|^INSERT INTO _sync_meta' > /tmp/d1-migrate.sql
             npx wrangler d1 execute "$D1_NAME" --remote --file=/tmp/d1-migrate.sql
           elif [ "$RC" -eq 4 ]; then

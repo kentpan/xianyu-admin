@@ -9,6 +9,12 @@ const ALLOWED_PREFIXES = [
   '/api/install',
   '/api/system/status',
   '/api/health',
+  // 引擎回连接口 (v2.3.8): 独立代理 (scripts/xianyu-proxy.mjs) 的保活回连
+  // (config/events/tasks) 走独立 Bearer 引擎令牌鉴权 (requireEngine), 与登录态无关;
+  // 未安装时令牌校验必然失败, install 门对它没有存在意义 —— 不加白会把代理回连打成
+  // 503「系统未安装」, 保活定时器链断裂 → cookie2/skt 短登录 ~24h 必死 (账号每天过期
+  // 需重登+人脸核验) + cookie 轮换上报丢失 → 自动发货整链静默中断。
+  '/api/engine',
   '/_nuxt',
   '/assets',
   '/favicon',

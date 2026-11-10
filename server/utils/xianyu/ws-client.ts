@@ -161,7 +161,16 @@ export function applySetCookies(record: Record<string, string>, setCookieList: s
       }
     }
     if (expired) delete record[name]
-    else record[name] = value
+    else {
+      // 空值/占位值不覆盖 (毒化防护, v2.3.8): 服务端对失效/异常会话常下发空值清理
+      // 指令 (如 cookie2=、havana_lgc2_77=、xxx=deleted), 若照单全收, 仍在生效的
+      // 登录态核心 cookie 会被写成空值并经轮换链持久化入库 → 账号永久
+      // SESSION_EXPIRED、重启也无法恢复监听; 瞬时误判时更会误伤有效会话。
+      // 一律保留旧值, 真正的删除语义只由 expired 分支 (Max-Age=0/Expires 已过) 负责。
+      const lv = value.toLowerCase()
+      if (!value || lv === 'deleted' || lv === 'null' || lv === 'undefined') continue
+      record[name] = value
+    }
   }
 }
 
@@ -236,48 +245,22 @@ export async function fetchTokenDetailed(
 }
 
 /**
- * 删除型 Set-Cookie 判定 (v2.3.8 语义对齐修复): 与 applySetCookies 的真实删除判定完全
- * 同源 — Max-Age<=0 (数字解析, 不只字面量 "0") 或 Expires 为任何过去时间 (不只 1970)。
- * 旧版只挡 "max-age=0"/"1970" 两种字面量, 漏网的删除指令进 applySetCookies 会把
- * unb/cookie2 等身份字段从工作串中删除 (会话毒化)。
+ * passport 续期链专用: 过滤 Max-Age=0 / Expires 1970 的删除型 Set-Cookie
+ * (参考项目 cookie_renew_api_service 同款 — 删除指令直接跳过保留旧值, 绝不把
+ * 仍在生效的旧 cookie 清掉; 与 token 链 applySetCookies 的「应用删除」语义不同)。
  */
-function isDeletionSetCookie(sc: string): boolean {
-  const attrs = String(sc || '').split(';').slice(1)
-  for (const attr of attrs) {
-    const a = attr.trim()
-    const al = a.toLowerCase()
-    if (al.startsWith('max-age=')) {
-      const n = Number(a.slice(8))
-      if (Number.isFinite(n) && n <= 0) return true
-    } else if (al.startsWith('expires=')) {
-      const ts = Date.parse(a.slice(8))
-      if (Number.isFinite(ts) && ts <= Date.now()) return true
-    }
-  }
-  return false
-}
-
-/** passport 续期链/触摸链/主站保活专用: 过滤删除型 Set-Cookie (保留旧值不清掉)。 */
 function filterDeletionSetCookies(setCookieList: string[]): string[] {
-  return (setCookieList || []).filter((sc) => !isDeletionSetCookie(sc))
-}
-
-/**
- * 身份字段安全合并 (v2.3.8): unb (监听身份) / cookie2 (会话主键) 任一在合并后丢失/变空
- * = 平台在该响应里下发了会话清理指令, 合并结果是被毒化的串, 一旦写入工作串并落库,
- * 配置重新下发的也是毒化 Cookie, 账号再也无法建连。合并丢失身份字段时整体拒绝,
- * 原样保留合并前工作串 — 正常轮换绝不会丢失这两个字段, 只拦截毒化合并。
- */
-function safeMergedCookieStr(prevStr: string, mergedStr: string): string {
-  const prev = transCookies(prevStr)
-  const next = transCookies(mergedStr)
-  for (const k of ['unb', 'cookie2']) {
-    if (String(prev[k] || '').trim() && !String(next[k] || '').trim()) {
-      logWarn(`[${prev.unb || ''}] Cookie 合并结果丢失身份字段 ${k} (会话清理指令), 拒绝本次合并保留原串`)
-      return prevStr
-    }
-  }
-  return mergedStr
+  return (setCookieList || []).filter((sc) => {
+    const s = String(sc || '')
+    if (/max-age=0/i.test(s) || /expires=.*1970/i.test(s)) return false
+    // 空值/占位值同步过滤 (与 applySetCookies 毒化防护同语义, v2.3.8): passport 链
+    // 的 Set-Cookie 常含 cookie2= 空值清理指令, 放行会毒化仍在生效的登录态。
+    const pair = s.split(';')[0] || ''
+    const eq = pair.indexOf('=')
+    if (eq <= 0) return false
+    const v = pair.slice(eq + 1).trim().toLowerCase()
+    return Boolean(v) && v !== 'deleted' && v !== 'null' && v !== 'undefined'
+  })
 }
 
 /**
@@ -320,7 +303,7 @@ async function fetchLoginUserDetailed(
     const ret: string[] = Array.isArray(json?.ret) ? json.ret : []
     const merged: Record<string, string> = { ...cookies }
     try {
-      applySetCookies(merged, filterDeletionSetCookies((res.headers as any).getSetCookie?.() || []))
+      applySetCookies(merged, (res.headers as any).getSetCookie?.() || [])
     } catch {}
     return { ret, mergedCookies: merged }
   }
@@ -809,17 +792,14 @@ export class XianyuAccountClient {
         },
         signal: AbortSignal.timeout(20_000),
       })
-      const setCookies: string[] = filterDeletionSetCookies((res.headers as any).getSetCookie?.() || [])
+      const setCookies: string[] = (res.headers as any).getSetCookie?.() || []
       if (setCookies.length) {
         const merged = transCookies(this.cookieStr)
         applySetCookies(merged, setCookies)
         const mergedStr = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.events.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.events.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       // 重定向到 passport = 会话已失效 (仅留痕; 登录态判定与状态机仍由 token 链路负责)
@@ -849,16 +829,12 @@ export class XianyuAccountClient {
     try {
       const { ret, mergedCookies } = await fetchLoginUserDetailed(this.cookieStr)
       const verdict = classifyTokenError(ret)
-      // (v2.3.8) 仅成功响应回写: auth 是清理指令 (毒化会话), risk 是挑战/惩罚响应
-      // (Set-Cookie 带挑战态/x5sec, 合并进去会持久化风控状态) — 两者都不回写
-      if (verdict === 'ok' || verdict === 'token_roll') {
+      // 登录失效 (auth) 响应的 Set-Cookie 不回写 — 与 refreshTokenSafely 同策略
+      if (verdict !== 'auth') {
         const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.events.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.events.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       if (verdict === 'ok') {
@@ -866,7 +842,12 @@ export class XianyuAccountClient {
         return
       }
       if (verdict === 'risk') {
-        this.tripRisk(`登录态触摸被风控拦截: ${ret.join('; ')}`, '', ret)
+        // 触摸链被风控 = 本周期该续期通道不可用, 仅跳过本次触摸 — 绝不 tripRisk 反噬
+        // 主链路 (v2.3.8 修复「无法恢复已监听」回归的根因): loginuser.get 是 v2.3.6
+        // 新接入的端点, 其风控判定与主站 token 链的 RGV587 语义并不等价, 照搬
+        // tripRisk 会清空健康账号的 live token 并打入 5min→2h 冷却阶梯, 监听中的
+        // 账号被无故踢出「监听中」且冷却期内无法恢复。账号生死仍由 token 链判定。
+        logWarn(`[${this.cookieId}] 登录态触摸被风控拦截 (仅跳过本次触摸, 不影响监听链路): ${ret.join('; ')}`)
         return
       }
       if (verdict === 'auth') {
@@ -900,11 +881,8 @@ export class XianyuAccountClient {
     try {
       const { cookieStr: mergedStr, notes } = await renewLongLoginChain(this.cookieStr)
       if (mergedStr !== this.cookieStr) {
-        const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-        if (safeStr !== this.cookieStr) {
-          this.cookieStr = safeStr
-          this.events.onCookieRotated(this.cookieId, safeStr)
-        }
+        this.cookieStr = mergedStr
+        this.events.onCookieRotated(this.cookieId, mergedStr)
       }
       logWarn(`[${this.cookieId}] 长登录续期: ${notes.join('; ')}`)
     } catch (e: any) {
@@ -928,11 +906,8 @@ export class XianyuAccountClient {
       if (verdict !== 'auth') {
         const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
         if (mergedStr !== this.cookieStr) {
-          const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-          if (safeStr !== this.cookieStr) {
-            this.cookieStr = safeStr
-            this.events.onCookieRotated(this.cookieId, safeStr)
-          }
+          this.cookieStr = mergedStr
+          this.events.onCookieRotated(this.cookieId, mergedStr)
         }
       }
       if (verdict === 'ok' && token) {
@@ -952,8 +927,13 @@ export class XianyuAccountClient {
         return
       }
       if (verdict === 'auth') {
-        this.setState('need_relogin', '登录态失效, 请重新扫码')
-        this.events.onCookieInvalid(this.cookieId, ret.join('; ') || 'Session 过期')
+        // 与 sessionTouch auth 分支同守卫 (v2.3.8): cookie 保活 (3min) + 重连退避都会
+        // 走到这里, 状态已标记时绝不重复 setState/通知 — 否则会话死亡期间每小时
+        // 重发 20~30 条「登录态失效」通知 (通知中心/邮件/微信全渠道刷屏)。
+        if (this.state !== 'need_relogin') {
+          this.setState('need_relogin', '登录态失效, 请重新扫码')
+          this.events.onCookieInvalid(this.cookieId, ret.join('; ') || 'Session 过期')
+        }
         return
       }
       recordTokenFailure(this.cookieId, ret, punishUrl)
@@ -975,11 +955,8 @@ export class XianyuAccountClient {
     if (verdict !== 'auth') {
       const mergedStr = Object.entries(mergedCookies).map(([k, v]) => `${k}=${v}`).join('; ')
       if (mergedStr !== this.cookieStr) {
-        const safeStr = safeMergedCookieStr(this.cookieStr, mergedStr)
-        if (safeStr !== this.cookieStr) {
-          this.cookieStr = safeStr
-          this.events.onCookieRotated(this.cookieId, safeStr)
-        }
+        this.cookieStr = mergedStr
+        this.events.onCookieRotated(this.cookieId, mergedStr)
       }
     }
     if (verdict === 'ok' && token) {
