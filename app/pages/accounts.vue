@@ -462,6 +462,9 @@ function listenerBadge(a: Account): { text: string; cls: string } | null {
   if (st === 'need_relogin') return { text: '需重新登录', cls: 'text-rose-500' }
   if (st === 'risk_cooldown') return { text: '风控冷却', cls: 'text-rose-500' }
   if (st === 'error') return { text: '监听异常', cls: 'text-rose-500' }
+  // (v2.3.8) 代理上报 'disabled' (连接已释放/面板禁用) 不再落进兜底「心跳正常」—
+  // 心跳新鲜 ≠ 正在监听, 误导排查 (线上实锤: 用户看到「心跳正常」却恢复不了监听)
+  if (st === 'disabled') return { text: '未在监听', cls: 'text-slate-400' }
   return { text: '心跳正常', cls: 'text-emerald-500' }
 }
 

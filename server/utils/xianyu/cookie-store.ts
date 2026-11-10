@@ -77,6 +77,11 @@ export async function mergeReportedCookies(db: DbLike, cookieId: string, reporte
   let changed = false
   for (const [k, v] of parseCookieStr(reported)) {
     if (jar.get(k) !== v) {
+      // (v2.3.8) 空值覆盖守卫: 上报方把已有非空字段清成空值 = 会话清理指令 (合并缺陷/
+      // 风控响应), 采纳会把 unb/cookie2 等身份字段清空 — 配置重新下发毒化 Cookie,
+      // 客户端构造函数 (Cookie 缺少 unb) 恒抛异常, 账号永久无法建连。拒绝空值覆盖,
+      // 库内真源保持完整; 真实登录态变更由重新扫码全量覆盖, 不走逐 key 合并。
+      if (!v && jar.get(k)) continue
       jar.set(k, v)
       changed = true
     }
