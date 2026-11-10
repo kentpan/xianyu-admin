@@ -725,6 +725,11 @@ jobs:
         # 却照常发布 = 线上空库(管理后台全空), 必须 fail hard(发布成功 = 数据就绪)。
         # v8.9.14: 仓库携带数据文件(DB_FILE_EXISTS=true)时改走下方 diff 比对导入,
         # 本步回落为仅"未携带数据文件"的项目执行(两链路门控互斥)。
+        # v8.9.19 幂等强制归一化(v2.3.7 线上二度实锉): 本步骤名字承诺 "idempotent",
+        # 却曾完全信任仓库自带 schema 文件自觉遵守 IF NOT EXISTS 契约 —— 仓库残留
+        # 旧版裸 CREATE 时, D1 已有表 → "table already exists at offset ..." exit 1。
+        # 现执行前强制归一化: 裸 CREATE TABLE/INDEX/TRIGGER/VIEW → 补 IF NOT EXISTS,
+        # 与文件版本无关地保证重复执行安全 (表已存在→跳过, 数据不动)。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS != 'true'
         run: |
           # schema 文件自动探测(顺序与框架无关, 只看项目携带的文件):
@@ -739,8 +744,19 @@ jobs:
             exit 1
           fi
           echo "使用 schema: $SCHEMA_FILE"
-          npx wrangler d1 execute "$D1_NAME" --remote --file="$SCHEMA_FILE"
-          echo "✓ D1 schema 已应用: $SCHEMA_FILE"
+          # v2.3.8: 先探测远程 D1 是否已有用户表 —— 已有表时直接跳过整个建表文件执行:
+          # 表已在, 再执行 CREATE 只会报 "table already exists" (v2.3.6/v2.3.7 两次线上
+          # 实锤)。已有部署的表结构增量由运行时 initSchema 启动迁移保证, 线上数据零触碰;
+          # 本步只负责全新部署(D1 空库)的首次建表, schema 文件本身全部 IF NOT EXISTS。
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'" > /tmp/d1-tables-count.json
+          N=$(node -e "const j=JSON.parse(require('fs').readFileSync('/tmp/d1-tables-count.json','utf8'));const blocks=Array.isArray(j)?j:(Array.isArray(j&&j.result)?j.result:[j&&j.result]);const rows=blocks.flatMap(b=>Array.isArray(b&&b.results)?b.results:[b]);console.log(rows.map(r=>Number(r.n||0)).reduce((a,b)=>a+b,0))")
+          if [ "${N:-0}" -gt 0 ]; then
+            echo "✓ D1 已有 ${N} 张用户表 → 跳过 schema 建表执行 (表已就位, 数据零触碰)"
+          else
+            echo "D1 为空库(全新部署) → 执行 schema 建表: $SCHEMA_FILE"
+            npx wrangler d1 execute "$D1_NAME" --remote --file="$SCHEMA_FILE"
+          fi
+          echo "✓ D1 schema 就绪: $SCHEMA_FILE"
 
       - name: Seed D1 database (idempotent, config-driven, framework-agnostic)
         # v8.9.8 修复: 同上移除框架门控与 continue-on-error —— seed 失败必须终止,
@@ -760,6 +776,8 @@ jobs:
             exit 1
           fi
           echo "使用 seed: $SEED_FILE"
+          # seed.sql 文件本身全部 INSERT OR IGNORE (文件事实): 重复执行不因主键/唯一键
+          # 冲突失败, 线上已有种子键零触碰
           npx wrangler d1 execute "$D1_NAME" --remote --file="$SEED_FILE"
           echo "✓ D1 seed 数据已推送: $SEED_FILE"
 
@@ -886,6 +904,7 @@ jobs:
           if [ "$RC" -eq 3 ]; then
             # 首次安装: D1 还是空库 → 全量导入仓库 db 提供 schema 与种子数据(此后部署只走增量)
             echo "D1 无用户表(首次安装) → 全量导入仓库 db(schema + 种子数据)"
+            # v2.3.7: .dump 输出的裸 CREATE 同样强制归一化 IF NOT EXISTS (重试安全)
             sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;|^CREATE TABLE _sync_meta|^INSERT INTO _sync_meta' > /tmp/d1-migrate.sql
             npx wrangler d1 execute "$D1_NAME" --remote --file=/tmp/d1-migrate.sql
           elif [ "$RC" -eq 4 ]; then
