@@ -82,12 +82,23 @@ async function writeInApp(evt: NotifyEvent, text: string): Promise<void> {
   const db = await getDb()
   const users = await db.all<{ id: number }>('SELECT id FROM users WHERE is_active = 1').catch(() => [])
   for (const u of users) {
-    await db
+    const inserted = await db
       .run(
         'INSERT INTO in_app_notifications (user_id, type, title, message, read, link) VALUES (?, ?, ?, ?, 0, ?)',
         [u.id, evt.type, evt.title.slice(0, 255), text, evt.link || ''],
       )
-      .catch(() => {})
+      .catch(() => null)
+    // (v2.3.13) 计数器与通知写入同笔维护 (铃铛 unread/total O(1) 读的数据源);
+    // 仅在 INSERT 真正落库后累加, 失败不计数
+    if (inserted) {
+      await db
+        .run(
+          `INSERT INTO user_notification_state (user_id, total, unread) VALUES (?, 1, 1)
+           ON CONFLICT(user_id) DO UPDATE SET total = total + 1, unread = unread + 1, updated_at = CURRENT_TIMESTAMP`,
+          [u.id],
+        )
+        .catch(() => {})
+    }
   }
 }
 

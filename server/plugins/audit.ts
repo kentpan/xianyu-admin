@@ -8,6 +8,7 @@
  * the operation if it was a successful mutation.
  */
 import { ensureTable } from '../utils/audit'
+import { proxyModeState } from '../utils/proxy-mode'
 
 const SKIP_PATHS = [
   '/api/auth/verify',
@@ -24,6 +25,10 @@ const SKIP_PATHS = [
 ]
 
 export default defineNitroPlugin((nitroApp) => {
+  // PROXY_MODE 代理透传模式 (v2.3.12): 站点不持有数据, 写操作发生在上游并由其
+  // 审计; 本地无库可写, 整体停用 (否则每次成功写操作都会打一遍注定失败的建表/插库)。
+  if (proxyModeState().kind !== 'off') return
+
   nitroApp.hooks.hook('afterResponse', async (event, { response }) => {
     try {
       const method = getMethod(event)

@@ -121,6 +121,8 @@ async function createAdapter(event?: H3Event): Promise<DatabaseAdapter> {
     if (dir !== '.' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
     dbPath = path.resolve(dbPath)
   }
+  // ---- 库文件健康守卫 (v2.3.12, "database disk image is malformed" 执行层根修) ----
+  quarantineOrphanedWalSidecars(dbPath)
   const conn = new DatabaseSync(dbPath)
   conn.exec('PRAGMA journal_mode = WAL')
   // (v2.2.7) 写锁竞争等待而非立即失败 — 根因修复: 同进程多链路并发写库 (引擎定时同步/
@@ -129,7 +131,76 @@ async function createAdapter(event?: H3Event): Promise<DatabaseAdapter> {
   // 短暂锁竞争 (毫秒级) 排队等待, 只有真正持锁超 5s 才报错 — 所有写库链路统一受益,
   // 自动发货落库只会更稳, 无行为语义变化。
   conn.exec('PRAGMA busy_timeout = 5000')
+  // 启动期完整性核验 (库文件 MB 级, 毫秒级开销): 损坏库在此大声失败 (附文件路径与
+  // 处置指引), 绝不带病运行到业务请求期才以零散 sqlite 错误暴露。
+  const ic = conn.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined
+  if (!ic || ic.integrity_check !== 'ok') {
+    conn.close()
+    throw new Error(
+      `SQLite 库完整性核验未通过 (${dbPath}): ${JSON.stringify(ic ?? null)} — 数据库文件损坏。`
+      + '请从最近备份恢复或重新部署 --db 包后重启; 若曾人工替换过库文件, 请确认同目录无上一代遗留的 -wal/-shm 边车文件',
+    )
+  }
   return new SQLiteAdapter(conn)
+}
+
+/**
+ * 隔离孤儿 WAL/SHM 边车文件 (v2.3.12 — "database disk image is malformed" 执行层根修)。
+ *
+ * 根因机制: 服务器用新部署包 (--db 快照) 覆盖旧部署时, 上一代库遗留的 -wal/-shm
+ * 边车文件不在包内、不会被覆盖; SQLite 打开新主库时按 WAL 恢复语义重放这些异源帧,
+ * 把旧代页面写入新库 → 页面结构错乱 → 查询/integrity_check 报 malformed。
+ *
+ * 判定 (最小充分条件): 主库 mtime 比 WAL 新 = WAL 必属上一代 (其内容要么已被
+ * checkpoint 进主库, 要么主库已被整体替换) —— 两种解释下重放 WAL 都只可能引入旧
+ * 页面, 隔离是严格更安全的选择:
+ *   - 主库是 deploy.sh --db 的 VACUUM INTO 快照时自身即完整, 隔离零数据损失;
+ *   - walMtime >= dbMtime (同代或更新) 时不做任何动作, 交给 SQLite 正常恢复
+ *     (崩溃遗留的同代 WAL 含未 checkpoint 事务, 重放正是数据恢复语义)。
+ * 隔离 = 重命名保留现场 (不删除), 全程大声日志; 隔离失败则拒绝打开 (fail hard)。
+ */
+function quarantineOrphanedWalSidecars(dbPath: string): void {
+  const walPath = `${dbPath}-wal`
+  const shmPath = `${dbPath}-shm`
+  let hasWal = false
+  let hasShm = false
+  try {
+    hasWal = fs.existsSync(walPath)
+    hasShm = fs.existsSync(shmPath)
+  } catch {
+    return
+  }
+  if (!hasWal && !hasShm) return
+
+  let dbMtime = 0
+  let walMtime = 0
+  try {
+    dbMtime = fs.statSync(dbPath).mtimeMs
+    // 无 -wal (只有 -shm) 时无任何帧可重放, 视为同代不隔离
+    walMtime = hasWal ? fs.statSync(walPath).mtimeMs : dbMtime
+  } catch (e: any) {
+    console.log(`[db] 边车孤儿判定探测失败, 放行交由 SQLite 处理: ${e?.message || e}`)
+    return
+  }
+  if (walMtime >= dbMtime) return
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  for (const p of [walPath, shmPath]) {
+    if (!fs.existsSync(p)) continue
+    const dst = `${p}.orphan-${stamp}`
+    try {
+      fs.renameSync(p, dst)
+      console.warn(
+        `[db] 已隔离孤儿边车: ${p} → ${dst} (主库比 WAL 新, WAL 属于已被替换的上一代库; `
+        + '重放异源 WAL 是 "database disk image is malformed" 的根因。隔离保留现场, 运行正常后可手动删除)',
+      )
+    } catch (e: any) {
+      throw new Error(
+        `孤儿 WAL 边车隔离失败 (${p} → ${dst}): ${e?.message || e}`
+        + ' — 拒绝在异源 WAL 在场时打开主库, 请手动清理该文件后重试',
+      )
+    }
+  }
 }
 
 /* ------------------------------- SQLite ---------------------------------- */

@@ -24,13 +24,21 @@ export default defineEventHandler(
       return []
     })
 
-    const totalRow = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM in_app_notifications WHERE user_id=?', [payload.userId]).catch(() => ({ c: 0 }))
-    const unreadRow = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM in_app_notifications WHERE user_id=? AND read=0', [payload.userId]).catch(() => ({ c: 0 }))
+    // (v2.3.13) unread/total 改读 user_notification_state 计数器单行 (O(1)):
+    // 原两条 COUNT(*) 每次轮询扫全部通知行, 是云端日行读取限额的最大消耗;
+    // 计数器由全部写入点 (notify/seed/read) 同笔维护, initSchema 对存量库一次性回填。
+    // 行缺失 = 该用户尚无任何通知 = 0/0, 语义精确
+    const state = await db
+      .get<{ total: number; unread: number }>(
+        'SELECT total, unread FROM user_notification_state WHERE user_id=?',
+        [payload.userId],
+      )
+      .catch(() => null)
 
     return ok({
       items: rows,
-      total: totalRow?.c || 0,
-      unread: unreadRow?.c || 0,
+      total: Number(state?.total || 0),
+      unread: Number(state?.unread || 0),
       page: Number(page) || 1,
       pageSize: Number(pageSize) || 20,
     })

@@ -24,10 +24,22 @@ export default defineEventHandler(
     ]
 
     for (const d of demos) {
-      await db.run(
-        'INSERT INTO in_app_notifications (user_id, type, title, message, read, link) VALUES (?, ?, ?, ?, 0, ?)',
-        [payload.userId, d.type, d.title, d.message, d.link],
-      ).catch(() => {})
+      const inserted = await db
+        .run(
+          'INSERT INTO in_app_notifications (user_id, type, title, message, read, link) VALUES (?, ?, ?, ?, 0, ?)',
+          [payload.userId, d.type, d.title, d.message, d.link],
+        )
+        .catch(() => null)
+      // (v2.3.13) 计数器同笔维护: 仅 INSERT 落库后累加
+      if (inserted) {
+        await db
+          .run(
+            `INSERT INTO user_notification_state (user_id, total, unread) VALUES (?, 1, 1)
+             ON CONFLICT(user_id) DO UPDATE SET total = total + 1, unread = unread + 1, updated_at = CURRENT_TIMESTAMP`,
+            [payload.userId],
+          )
+          .catch(() => {})
+      }
     }
 
     return ok({ seeded: demos.length }, `已生成 ${demos.length} 条演示通知`)

@@ -310,6 +310,15 @@ const SCHEMA: string[] = [
     link VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+  // (v2.3.13) 铃铛轮询 (每 60s) 三条查询全表扫描是云端行读取超日限额的根因:
+  // 索引让列表查询只读 LIMIT 行; 计数器表让 unread/total 从 O(n) 扫描降为 O(1) 单行读
+  `CREATE INDEX IF NOT EXISTS idx_inapp_user_created ON in_app_notifications(user_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS user_notification_state (
+    user_id INTEGER PRIMARY KEY,
+    total INTEGER DEFAULT 0,
+    unread INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`,
 
   // ===== 返佣分销系统 (Commission / Distribution) =====
   `CREATE TABLE IF NOT EXISTS dock_records (
@@ -1255,6 +1264,18 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     }
   } catch (e: any) {
     console.error('[xianyu-admin] __AUTO__ 自检失败:', String(e?.message || e).slice(0, 120))
+  }
+
+  // (v2.3.13) user_notification_state 计数器回填 (幂等): 存量库升级/导入外部 SQL 后
+  // 计数器为空, 此处一次性按实际数据重建 — OR IGNORE 保证运行期已有的计数行绝不
+  // 被覆盖 (写路径逐笔维护, 运行期值恒精确)。仅指纹变化触发全量初始化时执行一次,
+  // 稳态启动走指纹短路零成本。
+  try {
+    await db.exec(`INSERT OR IGNORE INTO user_notification_state (user_id, total, unread)
+      SELECT user_id, COUNT(*), COALESCE(SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END), 0)
+      FROM in_app_notifications GROUP BY user_id`)
+  } catch (e: any) {
+    console.error('[xianyu-admin] user_notification_state 回填失败:', String(e?.message || e).slice(0, 120))
   }
 
   // 一次性数据迁移: 存量分散在账号级/商品级的模型接入信息聚合为 ai_configs 记录并建立引用。

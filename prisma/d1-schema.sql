@@ -432,6 +432,13 @@ CREATE TABLE IF NOT EXISTS in_app_notifications (
     link VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+-- (v2.3.13) 铃铛轮询行读取优化: 计数器表 (索引 idx_inapp_user_created 见尾部索引区)
+CREATE TABLE IF NOT EXISTS user_notification_state (
+    user_id INTEGER PRIMARY KEY,
+    total INTEGER DEFAULT 0,
+    unread INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 CREATE TABLE IF NOT EXISTS item_ai_settings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cookie_id VARCHAR(64) NOT NULL,
@@ -723,6 +730,7 @@ CREATE INDEX IF NOT EXISTS idx_enginetasks_status ON engine_tasks(status, engine
 CREATE INDEX IF NOT EXISTS idx_fund_user ON fund_flows(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_imconv_account ON im_conversations(cookie_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_inapp_user_created ON in_app_notifications(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_qrlogin_user ON qr_login_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_settle_user ON settlement_records(user_id);
 CREATE INDEX IF NOT EXISTS idx_ship_card ON card_shipments(card_id, id);

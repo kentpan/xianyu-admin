@@ -111,11 +111,11 @@ const pkg = {
   private: true,
   engines: { node: ">=22.9" },
   scripts: {
-    start: "NODE_ENV=production node --env-file-if-exists=.env .output/server/index.mjs 2>&1 | tee server.log",
+    start: "node prestart.mjs && NODE_ENV=production node --env-file-if-exists=.env .output/server/index.mjs 2>&1 | tee server.log",
   },
 };
 fs.writeFileSync("dist/package.json", JSON.stringify(pkg, null, 2) + "\n");
-console.log("    dist/package.json start → node --env-file-if-exists=.env .output/server/index.mjs(dist 结构, .env 可配 PORT/XY_*)");
+console.log("    dist/package.json start → node prestart.mjs && node --env-file-if-exists=.env .output/server/index.mjs(dist 结构, .env 可配 PORT/XY_*; prestart 负责 --db 快照一次性晋升)");
 NODEEOF
 # ---- pm2 持久化配置(与项目根 ecosystem.config.cjs 同一套约定) ----
 cat > dist/ecosystem.config.cjs <<'PM2EOF'
@@ -160,7 +160,7 @@ if [ "$WITH_DB" = "1" ]; then
     echo "!! 未找到数据库 $DB_FILE(全局唯一 SQLite 库; 若经 .env XY_DATABASE_URL 自定义过路径请检查)" >&2
     exit 1
   fi
-  echo "    --db: 打包数据库最新数据($DB_FILE → dist/prisma/xianyu_admin.db)..."
+  echo "    --db: 打包数据库最新数据($DB_FILE → dist/prisma/xianyu_admin.db.snapshot)"
   mkdir -p dist/prisma
   if command -v node >/dev/null 2>&1 && node -e 'require("node:sqlite")' 2>/dev/null; then
     # ---- 一致性快照: VACUUM INTO 会读取主库+WAL 生成合并后的完整快照,
@@ -170,8 +170,8 @@ if [ "$WITH_DB" = "1" ]; then
 const { DatabaseSync } = require("node:sqlite");
 const fs = require("fs");
 const SRC = process.env.DB_FILE;
-const TMP = "dist/prisma/xianyu_admin.db.tmp";
-const DST = "dist/prisma/xianyu_admin.db";
+const TMP = "dist/prisma/xianyu_admin.db.snapshot.tmp";
+const DST = "dist/prisma/xianyu_admin.db.snapshot";
 fs.rmSync(TMP, { force: true });
 fs.rmSync(DST, { force: true });
 const src = new DatabaseSync(SRC);
@@ -200,15 +200,103 @@ NODEEOF
   else
     # ---- 无 node:sqlite(<22.5)的兜底: 原样复制 .db + -wal + -shm(打开时会自动重放),
     #      尽力而为; 一致性快照请升级 Node ≥22.5 后重打包 ----
-    cp -f "$DB_FILE" dist/prisma/xianyu_admin.db
+    cp -f "$DB_FILE" dist/prisma/xianyu_admin.db.snapshot
     for ext in -wal -shm; do
-      if [ -f "$DB_FILE$ext" ]; then cp -f "$DB_FILE$ext" "dist/prisma/xianyu_admin.db$ext"; fi
+      if [ -f "$DB_FILE$ext" ]; then cp -f "$DB_FILE$ext" "dist/prisma/xianyu_admin.db.snapshot$ext"; fi
     done
-    echo "    (当前 Node 无内置 node:sqlite(需 ≥22.5), 已按 .db+-wal+-shm 原样复制, 建议升级 Node 后重打包以获得一致性快照)"
+    echo "    (当前 Node 无内置 node:sqlite(需 ≥22.5), 已按 .db+-wal+-shm 原样复制为快照, 建议升级 Node 后重打包以获得一致性快照)"
   fi
 else
   echo "    未带 --db, 不打包数据库(纯代码包; 起服后走内置安装向导, 或沿用服务器已有库)"
 fi
+
+# ---- 生成 prestart.mjs(dist 启动前置, 两种包型统一): --db 包内快照在首次 npm start 时
+#      一次性晋升为正式库。根修 "database disk image is malformed": 直接把快照命名为
+#      正式库时, 服务器上一代部署遗留的 -wal/-shm 边车不在包内、不会被覆盖, SQLite
+#      打开新主库会重放异源 WAL 把旧代页面写进新库 → malformed。晋升动作 = 「整库
+#      换代」这一时刻: 先移除旧代边车再改名快照, 且晋升只在快照文件在场时发生(消费后
+#      即消失, 后续重启/崩溃自启不再触发, 崩溃遗留的同代 WAL 照常恢复, 零数据损失);
+#      纯代码包无快照文件, 模板首行存在性判断直通, 零动作。 ----
+# (heredoc 用引号定界符零展开写入, 路径经占位符替换 —— 避免 shell 展开 JS 正则)
+SNAPSHOT_REL="prisma/xianyu_admin.db.snapshot"
+TARGET_REL="prisma/xianyu_admin.db"
+cat > dist/prestart.mjs <<'PRESTART_EOF'
+// prestart.mjs — dist 启动前置(npm start 首段): --db 快照一次性晋升 + 孤儿边车防护。
+// 由 deploy.sh 在打包时生成; 纯代码包同样携带(无快照文件时零动作直通)。
+import fs from 'node:fs'
+import path from 'node:path'
+
+const ROOT = __dirname
+// 以下两行占位符由 deploy.sh 按打包时实际库路径替换
+const SNAPSHOT = path.join(ROOT, '__SNAPSHOT_REL__')
+const TARGET = path.join(ROOT, '__TARGET_REL__')
+
+// 目标路径解析真源 = dist/.env 的 XY_DATABASE_URL(file: 相对路径按 dist/ 解析),
+// 兼顾服务器自定义库名(如 xianyu-admin.db); 非 SQLite 或包外绝对路径绝不自动覆盖。
+function resolveTarget() {
+  let url = ''
+  try {
+    const envPath = path.join(ROOT, '.env')
+    if (fs.existsSync(envPath)) {
+      for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+        const m = line.match(/^\s*XY_DATABASE_URL\s*=\s*(.+?)\s*$/)
+        if (m) {
+          url = m[1].replace(/^["']|["']$/g, '')
+          break
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[prestart] 读取 dist/.env 失败, 回落打包时库路径:', e && e.message)
+  }
+  if (url && !url.startsWith('file:')) return null // 非 SQLite(mysql/D1): 不晋升
+  const rel = url ? url.replace(/^file:/, '') : path.relative(ROOT, TARGET)
+  if (path.isAbsolute(rel)) return null // 包外绝对路径: 绝不自动覆盖
+  const p = path.resolve(ROOT, rel)
+  if (!p.startsWith(ROOT + path.sep)) return null // 越界防护: 只允许 dist 内路径
+  return p
+}
+
+if (!fs.existsSync(SNAPSHOT)) process.exit(0) // 无快照(纯代码包/已晋升): 零动作直通
+const target = resolveTarget()
+if (!target) {
+  console.warn('[prestart] XY_DATABASE_URL 非 SQLite 或指向包外, 快照未自动晋升(请手动处理):', SNAPSHOT)
+  process.exit(0)
+}
+
+const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+try {
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+} catch {}
+// 顺序铁律: 1) 先移除旧代边车(重放异源 WAL 是 malformed 根因), 2) 旧主库改名保留现场,
+// 3) 快照(含打包时可能自带的边车三件套)整体晋升。
+for (const ext of ['-wal', '-shm']) {
+  const p = target + ext
+  if (fs.existsSync(p)) {
+    fs.rmSync(p, { force: true })
+    console.log('[prestart] 已移除旧代边车:', path.relative(ROOT, p))
+  }
+}
+if (fs.existsSync(target)) {
+  const dst = target + '.replaced-' + stamp
+  fs.renameSync(target, dst)
+  console.log('[prestart] 旧主库已保留:', path.relative(ROOT, target), '→', path.relative(ROOT, dst))
+}
+for (const ext of ['', '-wal', '-shm']) {
+  const src = SNAPSHOT + ext
+  if (fs.existsSync(src)) {
+    fs.renameSync(src, target + ext)
+    console.log('[prestart] 快照已晋升:', path.relative(ROOT, src), '→', path.relative(ROOT, target + ext))
+  }
+}
+console.log('[prestart] --db 快照晋升完成:', path.relative(ROOT, target), '(一次性动作, 后续重启不再触发)')
+PRESTART_EOF
+sed -i "s|__SNAPSHOT_REL__|${SNAPSHOT_REL}|; s|__TARGET_REL__|${TARGET_REL}|" dist/prestart.mjs
+if [ ! -f dist/prestart.mjs ]; then
+  echo "!! prestart.mjs 生成失败" >&2
+  exit 1
+fi
+echo "    已生成 dist/prestart.mjs(启动前置: --db 快照一次性晋升 + 孤儿边车防护; 无快照直通)"
 
 # ---- 体积分布报告(便于每次打包自查体积去向) ----
 # ⚠ 管线末端禁用 head: head 取够行数即提前关管道 → 上游 sort/du 收 SIGPIPE(exit 141),
@@ -261,7 +349,7 @@ zip_dir "$ZIP" dist
 echo "==> [6/6] 完成!"
 echo "    产物: $ZIP ($(du -h "$ZIP" | cut -f1), $(unzip -l "$ZIP" 2>/dev/null | tail -1 | awk '{print $2}' || echo '?') 个文件)"
 if [ "$WITH_DB" = "1" ]; then
-  echo "    数据库已随包: dist/prisma/xianyu_admin.db(一致性快照, 起服即带最新数据)"
+  echo "    数据库已随包: dist/prisma/xianyu_admin.db.snapshot → 首次 npm start 由 prestart.mjs 一次性晋升为 prisma/xianyu_admin.db(一致性快照, 起服即带最新数据; 服务器自定义库名经 dist/.env XY_DATABASE_URL 自动适配)"
 else
   echo "    纯代码包(不含数据库): 起服后走内置安装向导, 或沿用服务器已有库"
 fi
