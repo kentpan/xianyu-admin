@@ -26,6 +26,8 @@
 # 运行时数据层: D1 绑定(binding "DB", server/utils/db.ts 自动检测) → d1Orm 轻量 ORM;
 # 本地 Node 环境则走内置 node:sqlite 打开 prisma/xianyu_admin.db, 与 D1 同一套 SQL 方言。
 
+# 注意: 本文件仅为本地手工部署参考; CI 部署名由 workflow 从 deploy.config.js 读取
+# package.json name 动态生成 —— 项目名称唯一真源 = package.json 的 name 字段。
 name = "xianyu-admin"
 # Pages 配置: pages_build_output_dir = Nitro cloudflare-pages preset 的产物目录
 pages_build_output_dir = "dist"
@@ -48,3 +50,10 @@ compatibility_flags = ["nodejs_compat"]
 
 # [vars]
 # NODE_ENV = "production"
+
+# ==== R2 备份绑定 (v2.1.15, 备份管理页「备份到 R2」) ====
+# CI 部署由 workflow 按 deploy.config.js 生成; 手动部署前先创建并填入:
+#   npx wrangler r2 bucket create xianyu-admin-backups
+# [[r2_buckets]]
+# binding = "BACKUP_R2"
+# bucket_name = "xianyu-admin-backups"

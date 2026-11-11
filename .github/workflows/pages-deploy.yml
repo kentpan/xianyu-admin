@@ -1455,15 +1455,42 @@ jobs:
             echo "✅ 添加 DO hub 绑定($REALTIME_BINDING → $REALTIME_WORKER_NAME/$REALTIME_DO_CLASS)"
           fi
 
+          # v2.3.13 热修: [vars] 必须包含运行时全部 plain env vars —— wrangler pages
+          # deploy 把 toml bindings 经 getBindings(config,{pages:true}) 写进部署上传
+          # metadata, 运行时 bindings 以 toml 为准; 此前 toml 只有 BASE_URL/NODE_ENV,
+          # PATCH 步骤写入项目配置的 PROXY_MODE/LANGUAGE/XY_INSTALLED 在部署时被覆盖
+          # 清除 (线上实锤: PATCH/Verify 全绿但 worker 三通道读不到 PROXY_MODE → 透传
+          # off → /api/* 落本地处理器 → "D1 binding DB not found"; 变量页四行 = toml
+          # 幸存 BASE_URL/NODE_ENV + secret put 幸存 ADMIN_SECRET/JWT_SECRET —— 服务端
+          # 对 secret_text 保留)。secrets 不能进 toml 明文, 仍由 "Configure secrets"
+          # 步骤写入项目配置。保留名跳过语义与 PATCH 步骤一致 (显式注入优先)。
           cat >> wrangler.toml << EOF
 
           [vars]
           BASE_URL = "/"
           NODE_ENV = "production"
+          LANGUAGE = "$(printf '%s' "${LANGUAGE_RAW:-auto}" | sed -E 's/\\/\\\\/g; s/"/\\"/g')"
           EOF
 
-          echo "=== wrangler.toml ==="
-          cat wrangler.toml
+          # deploy.config.js vars 块展开 (CFG_VARS_JSON 由 Read deploy config 步骤导出;
+          # RESERVED 与 PATCH 步骤一致: 硬编码键不重复, secret 专用键不进 toml 明文)
+          node -e '
+            const cfg = JSON.parse(process.env.CFG_VARS_JSON || "{}");
+            const RESERVED = ["DB", "KV", "ASSETS", "AI", "NODE_ENV", "PROXY_MODE", "ADMIN_SECRET", "JWT_SECRET", "AI_API_KEY", "REMOTE_WS_URL", "CLOUDFLARE_D1_DATABASE_ID", "REALTIME_DO", "REALTIME_HUB"];
+            const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+            const lines = [];
+            for (const [k, v] of Object.entries(cfg)) {
+              if (RESERVED.includes(k) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+              lines.push(k + " = \"" + esc(v) + "\"");
+            }
+            if (lines.length) require("node:fs").appendFileSync("wrangler.toml", "\n" + lines.join("\n") + "\n");
+          '
+          # PROXY_MODE: 含 apiKey 的完整透传配置 (未开启时显式写 false, 与 PATCH 语义一致)
+          printf 'PROXY_MODE = "%s"\n' "$(printf '%s' "${PROXY_MODE_RAW:-false}" | sed -E 's/\\/\\\\/g; s/"/\\"/g')" >> wrangler.toml
+
+          # 不整文件 cat(PROXY_MODE 含 apiKey): 只展示结构, PROXY_MODE 值打码
+          echo "=== wrangler.toml(结构; PROXY_MODE 值已脱敏) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml | sed -E 's/^(\s*PROXY_MODE\s*=\s*").*(")\s*$/\1***\2/'
 
       - name: Generate wrangler.toml (Nuxt → Workers)
         if: env.FRAMEWORK == 'nuxt' && env.DEPLOY_TYPE == 'workers'

@@ -14,6 +14,8 @@
 #
 # 首次部署前: npx wrangler d1 create xianyu-admin → 把返回的 database_id 填到下面。
 
+# 注意: 本文件仅为本地手工部署参考; CI 部署名由 workflow 从 deploy.config.js 读取
+# package.json name 动态生成 —— 项目名称唯一真源 = package.json 的 name 字段。
 name = "xianyu-admin"
 main = ".output/server/index.mjs"
 compatibility_date = "2026-08-01" # ≥2025-04-01: workerd 开放 node:sqlite(数据层依赖)
