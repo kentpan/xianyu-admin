@@ -403,10 +403,10 @@ async function resetSecretKey() {
 async function copyText(text: string, msg: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     toast.success(msg)
-  } catch {
-    toast.error('复制失败')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e})`)
   }
 }
 

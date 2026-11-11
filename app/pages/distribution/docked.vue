@@ -318,7 +318,7 @@ async function copyPickupUrl(d: DockRecord) {
   try {
     const r = await getPickupUrl(d.id)
     const fullUrl = window.location.origin + r.url
-    await navigator.clipboard.writeText(fullUrl)
+    await copyToClipboard(fullUrl)
     toast.success('提货链接已复制')
   } catch (e: any) {
     toast.error(e.message || '复制失败')

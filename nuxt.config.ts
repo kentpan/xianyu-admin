@@ -6,6 +6,12 @@ export default defineNuxtConfig({
   devtools: { enabled: false },
   ssr: true,
 
+  experimental: {
+    // 关闭客户端 app manifest: 全 SSR 站点 (无 islands / 无 prerender 路由检测需求),
+    // 关闭后浏览器不再请求 /assets/builds/meta/<buildId>.json (纯框架内部探测请求)
+    appManifest: false,
+  },
+
   modules: ['@nuxtjs/tailwindcss'],
 
   css: ['~/assets/css/main.css'],

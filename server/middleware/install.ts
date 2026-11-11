@@ -3,7 +3,14 @@
  * If NOT installed (ADMIN_SECRET missing), every page/api except the install
  * flow & public assets is redirected to /install. Once installed, /install is
  * blocked (redirect to /dashboard).
+ *
+ * PROXY_MODE 代理透传模式 (v2.3.13, 与 init.ts/audit.ts 的停用层对齐): 站点不持有
+ * 本地数据 (工作流跳过 D1/KV 创建与绑定), 本地安装判定与密钥兜底没有意义 —— 库探测
+ * 每次都打一遍注定失败的 getDb (D1 binding 不存在), 只能靠 fail-open 放行, 白付一次
+ * 失败开销; 安装状态/鉴权/数据真源全部由透传上游负责。整体跳过。
  */
+import { proxyModeState } from '../utils/proxy-mode'
+
 const ALLOWED_PREFIXES = [
   '/install',
   '/api/install',
@@ -21,6 +28,9 @@ const ALLOWED_PREFIXES = [
 ]
 
 export default defineEventHandler(async (event) => {
+  // 透传模式: 本地无库可探, 安装门整体跳过 (上游是安装/鉴权/数据真源)
+  if (proxyModeState(event).kind !== 'off') return
+
   const url = getRequestURL(event)
   const pathname = url.pathname
 

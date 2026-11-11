@@ -66,13 +66,16 @@ const showPwd = ref(false)
 const remember = ref(true)
 const loading = ref(false)
 
-const registrationEnabled = ref(false)
-onMounted(async () => {
-  try {
-    const data = await getPublicSettings()
-    registrationEnabled.value = !!data?.settings?.registration_enabled
-  } catch {}
-})
+// 注册入口开关由 SSR 服务端渲染期取数并注入 payload (useAsyncData): 客户端 hydration
+// 直接复用注入值, 浏览器不再发起 /api/settings/public 请求 (此前 onMounted 纯客户端
+// 取数, 每次进登录页都白打一个请求); registration_enabled 是本页唯一消费字段,
+// 取数失败时不显示注册入口 (渐进增强, 非关键路径)
+const { data: publicSettings } = await useAsyncData(
+  'login-public-settings',
+  () => getPublicSettings(),
+  { default: () => null },
+)
+const registrationEnabled = computed(() => !!publicSettings.value?.settings?.registration_enabled)
 
 async function handleLogin() {
   if (!username.value || !password.value) return toast.warning('请输入用户名和密码')

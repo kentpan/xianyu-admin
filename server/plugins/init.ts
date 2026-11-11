@@ -36,7 +36,11 @@ export default defineNitroPlugin(async (nitroApp) => {
 
   // Cloudflare: 首个请求时惰性初始化(全局只跑一次, 失败后可重试)
   let initOnce: Promise<void> | null = null
-  nitroApp.hooks.hook('request', async () => {
+  nitroApp.hooks.hook('request', async (event) => {
+    // 透传模式判定进 hook (v2.3.13): 启动期无请求上下文, process.env 桥接不可靠时
+    // 会误判 off; 首个请求起 globalThis.__env__/event.context 已就位 (与 db.ts 同通道),
+    // 此处重判才能在透传模式下停用本地初始化 —— 否则每个请求都重试一次注定失败的 getDb
+    if (proxyModeState(event).kind !== 'off') return
     if (!initOnce) {
       initOnce = (async () => {
         const db = await getDb()

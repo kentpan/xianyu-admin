@@ -31,6 +31,10 @@ export default defineNitroPlugin((nitroApp) => {
 
   nitroApp.hooks.hook('afterResponse', async (event, { response }) => {
     try {
+      // 透传模式判定进 hook (v2.3.13): 启动期无请求上下文, process.env 桥接不可靠时
+      // 会误判 off 而注册本 hook; 请求期 env 真源 (event.context/__env__, 与 db.ts
+      // 同通道) 已就位, 此处重判停用 —— 否则每次成功写操作都打一遍注定失败的插库
+      if (proxyModeState(event).kind !== 'off') return
       const method = getMethod(event)
       if (!['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) return
 

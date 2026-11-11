@@ -170,9 +170,12 @@ async function consumeOne(c: Xian18Commodity) {
   }
 }
 
-function copyText(text: string) {
-  if (import.meta.client && navigator.clipboard) {
-    navigator.clipboard.writeText(text).then(() => toast.success('已复制到剪贴板'))
+async function copyText(text: string) {
+  try {
+    await copyToClipboard(text)
+    toast.success('已复制到剪贴板')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e}), 请手动复制`)
   }
 }
 

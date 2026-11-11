@@ -421,10 +421,10 @@ function barHeight(v: number, max: number) {
 
 async function copyText(text: string, msg = '已复制') {
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     toast.success(msg)
-  } catch {
-    toast.error('复制失败, 请手动选择复制')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e}), 请手动选择复制`)
   }
 }
 

@@ -614,10 +614,10 @@ function openDeploy(e: EngineRow) {
 
 async function copyToken(token: string) {
   try {
-    await navigator.clipboard.writeText(token)
+    await copyToClipboard(token)
     toast.success('令牌已复制')
-  } catch {
-    toast.error('复制失败，请从「部署」弹窗中复制')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e})，请从「部署」弹窗中复制`)
   }
 }
 
@@ -634,11 +634,11 @@ async function resetToken(e: EngineRow) {
 
 async function copySnippet() {
   try {
-    await navigator.clipboard.writeText(deploySnippet.value)
+    await copyToClipboard(deploySnippet.value)
     snippetCopied.value = true
     setTimeout(() => (snippetCopied.value = false), 2000)
-  } catch {
-    toast.error('复制失败，请手动选择复制')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e})，请手动选择复制`)
   }
 }
 

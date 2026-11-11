@@ -1073,10 +1073,10 @@ function goCodeLogPage(p: number) {
 
 async function copyCodeLog(code: string) {
   try {
-    await navigator.clipboard.writeText(code)
+    await copyToClipboard(code)
     toast.success(`卡密 ${code} 已复制`)
-  } catch {
-    toast.error('复制失败, 请手动复制')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e}), 请手动复制`)
   }
 }
 

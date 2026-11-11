@@ -471,10 +471,10 @@ async function generateTemplate() {
 async function copyTemplate() {
   if (!pubResult.value?.template) return
   try {
-    await navigator.clipboard.writeText(pubResult.value.template)
+    await copyToClipboard(pubResult.value.template)
     toast.success('已复制, 请粘贴到闲鱼 App 内发布')
-  } catch {
-    toast.error('复制失败, 请手动选择复制')
+  } catch (e: any) {
+    toast.error(`复制失败 (${e?.message || e}), 请手动选择复制`)
   }
 }
 

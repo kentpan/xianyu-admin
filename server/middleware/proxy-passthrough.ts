@@ -25,7 +25,9 @@ const REQ_SKIP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'transfer-
 const RES_SKIP_HEADERS = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'content-encoding'])
 
 export default defineEventHandler(async (event) => {
-  const state = proxyModeState()
+  // event 必传 (v2.3.13): 请求上下文是 workerd 上 Pages env vars 的可靠真源
+  // (process.env 桥接在兼容日期不受控时不可靠, 线上实锤), 见 proxy-mode.ts
+  const state = proxyModeState(event)
   if (state.kind === 'off') return
 
   const path = event.path || ''

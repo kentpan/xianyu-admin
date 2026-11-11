@@ -217,7 +217,10 @@ fi
 #      换代」这一时刻: 先移除旧代边车再改名快照, 且晋升只在快照文件在场时发生(消费后
 #      即消失, 后续重启/崩溃自启不再触发, 崩溃遗留的同代 WAL 照常恢复, 零数据损失);
 #      纯代码包无快照文件, 模板首行存在性判断直通, 零动作。 ----
-# (heredoc 用引号定界符零展开写入, 路径经占位符替换 —— 避免 shell 展开 JS 正则)
+# (heredoc 用引号定界符零展开写入, 路径经占位符替换 —— 避免 shell 展开 JS 正则;
+#  替换用 node 而非 sed -i: sed -i 在 GNU/BSD(macOS) 参数语义不同, BSD 的 -i 必须带
+#  备份后缀参数, 否则文件名被当作 sed 脚本解析而报错(extra characters at the end of
+#  d command); node 是本脚本硬依赖(快照/manifest 生成), 替换行为跨平台 100% 一致)
 SNAPSHOT_REL="prisma/xianyu_admin.db.snapshot"
 TARGET_REL="prisma/xianyu_admin.db"
 cat > dist/prestart.mjs <<'PRESTART_EOF'
@@ -291,7 +294,7 @@ for (const ext of ['', '-wal', '-shm']) {
 }
 console.log('[prestart] --db 快照晋升完成:', path.relative(ROOT, target), '(一次性动作, 后续重启不再触发)')
 PRESTART_EOF
-sed -i "s|__SNAPSHOT_REL__|${SNAPSHOT_REL}|; s|__TARGET_REL__|${TARGET_REL}|" dist/prestart.mjs
+node -e 'const fs = require("fs"); const p = "dist/prestart.mjs"; fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(/__SNAPSHOT_REL__/g, process.argv[1]).replace(/__TARGET_REL__/g, process.argv[2]));' "$SNAPSHOT_REL" "$TARGET_REL"
 if [ ! -f dist/prestart.mjs ]; then
   echo "!! prestart.mjs 生成失败" >&2
   exit 1
