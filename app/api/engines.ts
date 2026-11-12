@@ -32,6 +32,10 @@ export interface EngineRow {
   health_error?: string
   /** 内置引擎专用: 当前运行时能否真实承载 (cloudflare 无常驻进程 → false) */
   runtime_supported?: boolean
+  /** 代理配置轮询实际打到的站点 host (共库多站点判定用) */
+  poll_host?: string
+  /** 代理在服务别的站点 (轮询目标 ≠ 本站): 本站收不到任何监听数据, 展示为未连接本站 */
+  poll_host_mismatch?: boolean
   last_seen_at: string | null
   last_status: string
 }
@@ -41,6 +45,8 @@ export interface EnginesResponse {
   active_slug: string
   origin: string
   runtime: 'node' | 'cloudflare'
+  /** 内置引擎是否处于手动停止状态 (开关持久化在数据库, 重启进程后保持) */
+  builtin_disabled?: boolean
 }
 
 export function getEngines() {
@@ -69,4 +75,14 @@ export function deleteEngine(id: number) {
 
 export function activateEngine(id: number) {
   return useApi().post<{ active_slug: string; active_name: string }>(`/api/engines/${id}/activate`)
+}
+
+/** 手动停止内置监听引擎 (开关持久化, 重启进程后保持停止; 远程代理授权立即归还) */
+export function stopBuiltinEngine() {
+  return useApi().post<{ disabled: boolean }>('/api/engines/builtin-stop')
+}
+
+/** 解除内置引擎手动停止 (巡检恢复, 是否接管仍按引擎切换状态与失联仲裁决定) */
+export function startBuiltinEngine() {
+  return useApi().post<{ disabled: boolean }>('/api/engines/builtin-start')
 }

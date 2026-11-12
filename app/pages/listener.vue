@@ -90,6 +90,20 @@
                     {{ switching === e.id ? '切换中...' : '设为使用' }}
                   </button>
                   <button
+                    v-if="e.type === 'builtin' && !builtinDisabled"
+                    class="btn-secondary !text-rose-600 dark:!text-rose-400"
+                    @click="stopBuiltin"
+                  >
+                    停止内置引擎
+                  </button>
+                  <button
+                    v-if="e.type === 'builtin' && builtinDisabled"
+                    class="btn-primary"
+                    @click="startBuiltin"
+                  >
+                    启动内置引擎
+                  </button>
+                  <button
                     v-if="e.type === 'remote' && e.is_active && e.online && e.host && e.port"
                     class="btn-secondary"
                     :title="`打开代理 Web 管理面板 (新窗口): http://${e.host}:${e.port}/`"
@@ -415,7 +429,7 @@
 <script setup lang="ts">
 import { getListenerStatus, manualFetchToken, type ListenerStatus, type ListenerAccount } from '~/api/listener'
 import { useVerifyGuard } from '~/composables/useVerifyGuard'
-import { getEngines, createEngine, updateEngine, deleteEngine, activateEngine, type EngineRow } from '~/api/engines'
+import { getEngines, createEngine, updateEngine, deleteEngine, activateEngine, stopBuiltinEngine, startBuiltinEngine, type EngineRow } from '~/api/engines'
 import { getSubscribers, createSubscriber, updateSubscriber, deleteSubscriber, testSubscriber, type SubscriberRow } from '~/api/subscribers'
 import { useToast } from '~/composables/useToast'
 
@@ -457,6 +471,7 @@ const origin = ref('')
 const enginesRuntime = ref<'node' | 'cloudflare'>('node')
 const enginesLoading = ref(true)
 const switching = ref(0)
+const builtinDisabled = ref(false)
 
 const formOpen = ref(false)
 const saving = ref(false)
@@ -472,10 +487,20 @@ function maskToken(token: string): string {
   return token.length > 12 ? `${token.slice(0, 8)}••••••••${token.slice(-4)}` : token
 }
 
-/** 在线状态列四态: 在线(实测健康) / 待拉取(进程活着但未在服务) / 地址不可达(实测失败) / 心跳回退 */
+/** 在线状态列五态: 在线(实测健康) / 未连接本站(代理轮询目标为其他站点) / 待拉取(进程活着但未在服务) / 地址不可达(实测失败) / 心跳回退 */
 function engineStatusMeta(e: EngineRow): { label: string; dot: string; tip: string } {
   if (e.type === 'builtin') {
+    if (builtinDisabled.value) {
+      return { label: '已手动停止', dot: 'bg-slate-300 dark:bg-slate-600', tip: '内置引擎已被手动停止: 账号连接全部下线且不再接管监听 (开关持久化, 重启进程后保持停止)。「启动内置引擎」可恢复' }
+    }
     return { label: e.online ? '在线' : '离线', dot: e.online ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600', tip: '按内置引擎进程心跳判定' }
+  }
+  if (e.poll_host_mismatch) {
+    return {
+      label: '未连接本站',
+      dot: 'bg-amber-500',
+      tip: `代理的配置轮询/事件上报实际打到: ${e.poll_host || '(空)'}; 当前站点: ${origin.value || '(未知)'} — 代理 XY_ADMIN_URL 未包含本站地址, 本站不会收到任何监听数据 (消息/订单/日志也不会显示已连接), 也不会参与监听仲裁。若两个地址属同一后台请核对代理 .env`,
+    }
   }
   if (e.health) {
     if (e.health.engine_active) {
@@ -525,6 +550,7 @@ async function loadEngines() {
     engines.value = r.engines || []
     origin.value = r.origin || ''
     enginesRuntime.value = r.runtime || 'node'
+    builtinDisabled.value = !!r.builtin_disabled
   } catch (e: any) {
     toast.error(e?.message || '获取引擎列表失败')
   } finally {
@@ -587,6 +613,29 @@ async function switchTo(e: EngineRow) {
     toast.error(err?.message || '切换失败')
   } finally {
     switching.value = 0
+  }
+}
+
+/** 手动停止内置监听引擎: 账号连接全部下线 + 退出监听仲裁 + 远程代理授权立即归还 (开关持久化) */
+async function stopBuiltin() {
+  if (!confirm('确认停止内置监听引擎?\n\n全部账号连接将下线, 内置引擎不再接管监听, 远程代理授权立即归还 (代理 ≤30s 恢复监听)。\n开关持久化在数据库, 重启本服务后保持停止 — 用于本地开发服务器连生产库时防止抢占线上监听。')) return
+  try {
+    const r = await stopBuiltinEngine()
+    toast.success(r?.message || '内置引擎已停止')
+    await loadEngines()
+  } catch (err: any) {
+    toast.error(err?.message || '停止失败')
+  }
+}
+
+/** 解除内置引擎手动停止 (巡检恢复; 是否真正接管仍按引擎切换状态与失联仲裁决定) */
+async function startBuiltin() {
+  try {
+    const r = await startBuiltinEngine()
+    toast.success(r?.message || '内置引擎已恢复巡检')
+    await loadEngines()
+  } catch (err: any) {
+    toast.error(err?.message || '启动失败')
   }
 }
 

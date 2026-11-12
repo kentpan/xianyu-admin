@@ -51,7 +51,7 @@ function readProxyModeRaw(event?: H3Event): string {
 }
 
 export function proxyModeState(event?: H3Event): ProxyModeState {
-  const raw = readProxyModeRaw(event).trim().replace(/^["']|["']$/g, '')
+  const raw = readProxyModeRaw(event).trim().replace(/^["']|["']$/g, '').replace(/\/(\:[0-9]+)/, '$1')
   if (_cache && _cache.raw === raw) return _cache.state
 
   let state: ProxyModeState

@@ -787,6 +787,10 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE message_notifications ADD COLUMN event_types TEXT`,
   // 监听引擎: 回连来源 IP (cf-connecting-ip/XFF, 不可伪造) — 登记地址与回连来源一致即真实部署点
   `ALTER TABLE engines ADD COLUMN last_poll_ip VARCHAR(64) DEFAULT ''`,
+  // 监听引擎: 代理回连目标站 host (配置轮询实际打到的后台域名) — 共库多站点部署
+  // (本地开发连生产库) 下判定代理实际在服务哪个站点: 与本站 host 不符时本进程绝不
+  // 仲裁接管监听, 监听页也不显示已连接 (防开发服务器抢占线上监听)
+  `ALTER TABLE engines ADD COLUMN last_poll_host VARCHAR(255) DEFAULT ''`,
   // 关键词回复: 回复随机延时 (秒; 都空/0=立即, min==max=固定, min<max=高斯随机) — 配套关键词 | 分隔多匹配
   `ALTER TABLE keywords ADD COLUMN delay_min REAL DEFAULT 0`,
   `ALTER TABLE keywords ADD COLUMN delay_max REAL DEFAULT 0`,

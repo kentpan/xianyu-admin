@@ -1,4 +1,6 @@
 import { probeEngines, type EngineProbeResult } from '../../utils/xianyu/engine-probe'
+import { noteOwnSiteHost, normalizeSiteHost, isOwnSiteHost } from '../../utils/xianyu/site-origin'
+import { isBuiltinEngineDisabled } from '../../utils/xianyu/engine-manager'
 
 /**
  * GET /api/engines — 监听引擎列表 (内置引擎 + 远程代理)。
@@ -19,6 +21,16 @@ export default defineEventHandler(
   withApi(async (event) => {
     requireAdmin(event)
     const db = await getDb()
+
+    // 登记本站对外 host (浏览器请求 Host 头): 本地开发服务器等无代理回连的进程也能
+    // 用它与 engines.last_poll_host 比对, 判定代理是否真的在服务本站
+    noteOwnSiteHost(getRequestURL(event).host)
+    const requestHost = normalizeSiteHost(getRequestURL(event).host)
+    // 代理是否在服务别的站点: 仅 Node 运行时判定 (本进程与代理回连同进程, host 登记可靠;
+    // CF 每请求独立隔离无法可靠登记, 且 CF 无内置引擎不存在抢占, 展示维持原样零影响)
+    const mismatchDetectable = detectRuntime() === 'node' && !!requestHost
+
+    const builtinDisabled = await isBuiltinEngineDisabled(db).catch(() => false)
 
     const rows = await db.all<any>('SELECT * FROM engines ORDER BY id ASC')
     const now = Date.now()
@@ -75,6 +87,11 @@ export default defineEventHandler(
             : null,
         health_error: probe && !probe.ok ? probe.error || '不可达' : '',
         runtime_supported: r.type === 'builtin' ? builtinSupported : true,
+        /** 代理配置轮询实际打到的站点 host (site-origin 判定用) */
+        poll_host: String(r.last_poll_host || ''),
+        /** 代理在服务别的站点 (轮询目标 ≠ 本站 host): 本站不会收到任何监听数据, 展示为未连接本站 */
+        poll_host_mismatch:
+          r.type === 'remote' && mismatchDetectable && !!r.last_poll_host && !isOwnSiteHost(String(r.last_poll_host)),
         last_seen_at: r.last_seen_at || null,
         last_status: r.last_status || '',
       }
@@ -86,6 +103,7 @@ export default defineEventHandler(
       active_slug: active?.slug || '',
       origin: getRequestURL(event).origin,
       runtime,
+      builtin_disabled: builtinDisabled,
     })
   }),
 )

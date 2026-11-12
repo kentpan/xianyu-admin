@@ -40,6 +40,7 @@
  * Response: { "actions": [...], "pending": ["evt_2"], "expired": ["evt_3"] }
  */
 import type { H3Event } from 'h3'
+import { getRequestURL } from 'h3'
 import { handleChatEvent, handleSystemEvent, type EngineAction } from '../../utils/xianyu/brain'
 import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from '../../utils/xianyu/im-store'
 import { dispatchNotify } from '../../utils/notify'
@@ -49,6 +50,7 @@ import { parseLosslessJson } from '../../utils/xianyu/lossless-json'
 import { parseSyncItem, type ParsedMessage } from '../../utils/xianyu/protocol'
 import { parseCookieStr, mtopFailMessage } from '../../utils/xianyu/mtop'
 import { mergeReportedCookies } from '../../utils/xianyu/cookie-store'
+import { noteOwnSiteHost, normalizeSiteHost } from '../../utils/xianyu/site-origin'
 
 /** 占位超时: 决策挂后台后超过此时长仍无结果视为进程中断, 释放占位由代理重报自愈 */
 const PENDING_TTL_MS = 3 * 60_000
@@ -67,6 +69,9 @@ const DECISION_BUDGET_MS = 150_000
 export default defineEventHandler(
   withApi(async (event) => {
     const engine = await requireEngine(event)
+
+    // 登记本站对外 host + 记录代理上报目标站 (与 config 轮询同一口径, 共库多站点判定用)
+    noteOwnSiteHost(getRequestURL(event).host)
 
     const rl = consumeRate(`engine:${engine.id}`, { capacity: 40, perMinute: 120 })
     if (!rl.ok) {
@@ -558,9 +563,10 @@ async function touchEngine(
   status: string,
 ): Promise<void> {
   await db
-    .run('UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ? WHERE id = ?', [
+    .run('UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ?, last_poll_ip = ?, last_poll_host = ? WHERE id = ?', [
       status,
       enginePollIp(event),
+      normalizeSiteHost(getRequestURL(event).host),
       engine.id,
     ])
     .catch(() => {})

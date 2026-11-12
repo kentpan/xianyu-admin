@@ -97,7 +97,7 @@ export default defineEventHandler(
     // 远程代理存活: 登记地址 /health 实测 (与引擎列表同一判定源);
     //   实测失败时回退「回连来源核验」: 心跳新鲜 且 回连来源 IP 与登记 host 一致 (cf-connecting-ip/XFF 不可伪造)
     const engineRows = await db.all<any>(
-      `SELECT slug, type, is_active, host, port, last_seen_at, last_poll_ip FROM engines`,
+      `SELECT slug, type, is_active, host, port, last_seen_at, last_poll_ip, last_poll_host FROM engines`,
     )
     const parseTs = (v: any) => (v ? new Date(String(v).replace(' ', 'T') + 'Z').getTime() || 0 : 0)
     const builtinRow = engineRows.find((e) => e.slug === 'builtin')
@@ -106,7 +106,17 @@ export default defineEventHandler(
     const builtinHeartbeatFresh = !!builtinRow?.last_seen_at && now - parseTs(builtinRow.last_seen_at) < FRESH_MS
     const builtinOnline = inProcessRunning || builtinHeartbeatFresh
 
-    const withAddr = remoteRows.filter((e) => e.host && e.port)
+    // 共库多站点防误显: 代理配置轮询目标站 host ≠ 本站 host = 代理在服务别的站点
+    // (本地开发服务器连生产库), 本站不能显示「运行中/已连接」。仅 Node 运行时判定 —
+    // CF 每请求独立隔离无法可靠登记本站 host, 且 CF 无内置引擎不存在抢占, 展示维持原样
+    const ownHostOk = (e: any) => {
+      if (detectRuntime() !== 'node') return true
+      const pollHost = String(e.last_poll_host || '').trim().toLowerCase()
+      return !pollHost || isOwnSiteHost(pollHost)
+    }
+    const servingRemoteRows = remoteRows.filter((e) => ownHostOk(e))
+
+    const withAddr = servingRemoteRows.filter((e) => e.host && e.port)
     const remoteProbes = withAddr.length
       ? await probeEngines(withAddr.map((e) => ({ id: e.id, host: e.host, port: e.port })))
       : new Map()
@@ -116,8 +126,8 @@ export default defineEventHandler(
       !!e.last_poll_ip &&
       String(e.last_poll_ip) === String(e.host).trim()
     const remoteOnline = withAddr.length
-      ? [...remoteProbes.values()].some((p) => p.ok && p.engine_active) || remoteRows.some((e) => pollVerified(e))
-      : remoteRows.some((e) => now - parseTs(e.last_seen_at) < FRESH_MS)
+      ? [...remoteProbes.values()].some((p) => p.ok && p.engine_active) || servingRemoteRows.some((e) => pollVerified(e))
+      : servingRemoteRows.some((e) => now - parseTs(e.last_seen_at) < FRESH_MS)
 
     // 引擎状态 = 当前「使用中」引擎是否真实在服务:
     // 内置引擎待命 (远程代理使用中) 时其心跳不冒充引擎存活

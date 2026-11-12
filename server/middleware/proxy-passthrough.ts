@@ -52,9 +52,19 @@ export default defineEventHandler(async (event) => {
     return { success: false, code: 500, message: 'PROXY_MODE 上游地址指向站点自身, 已拒绝转发 (自指环路防护)' }
   }
 
-  const target = state.upstream.replace(/\/+$/, '') + path
+  /*
+  { 
+  kind: 'on',
+  raw:
+   'xyk_03177e83129f65080bb981e946295b1982e2bc02ee50f282@http://xianyu-proxy.mfzl.cn/:2095',
+  apiKey: 'xyk_03177e83129f65080bb981e946295b1982e2bc02ee50f282',
+  upstream: 'http://xianyu-proxy.mfzl.cn/:2095',
+  upstreamOrigin: 'http://xianyu-proxy.mfzl.cn' 
+  }
+  */
+  const target = state.upstream.replace(/\/+$/, '').replace(/\/(\:[0-9]+)/, '$1') + path
   const method = getMethod(event)
-
+  
   const fwdHeaders = new Headers()
   for (const [k, v] of Object.entries(getRequestHeaders(event))) {
     if (REQ_SKIP_HEADERS.has(k.toLowerCase())) continue
@@ -71,7 +81,7 @@ export default defineEventHandler(async (event) => {
   try {
     upstreamRes = await fetch(target, { method, headers: fwdHeaders, body, redirect: 'manual' })
   } catch (e: any) {
-    console.error(`[proxy-passthrough] 上游请求失败: ${method} ${path} → ${state.upstreamOrigin} — ${e?.message || e}`)
+    console.error(`[proxy-passthrough] 上游请求失败: ${method} ${path} → ${state.upstreamOrigin} — ${e?.message || e}`, state)
     setResponseStatus(event, 502)
     return { success: false, code: 502, message: `代理上游不可达 (${state.upstreamOrigin}): ${e?.message || e}` }
   }

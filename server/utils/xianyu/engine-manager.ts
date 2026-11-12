@@ -21,6 +21,7 @@ import { publishChatEvent, publishSystemEvent, publishRiskEvent } from './publis
 import { persistChatMessage, persistSystemMessage, persistOutgoingMessage } from './im-store'
 import { persistCookieRotation } from './cookie-store'
 import { getFailoverOwner, setFailoverOwner, FAILOVER_BUILTIN, FAILOVER_REMOTE } from './failover'
+import { isOwnSiteHost } from './site-origin'
 
 const POLL_INTERVAL_MS = 5_000
 const HEARTBEAT_INTERVAL_MS = 10_000
@@ -29,6 +30,8 @@ const ITEM_SYNC_MIN_INTERVAL_S = 60
 const MAINTENANCE_TICK_MS = 5 * 60_000
 /** 远程代理心跳失联阈值: 超此时间无 last_seen_at 更新即视为未在服务本后台 (内置接管)。 */
 const REMOTE_STALE_MS = 5 * 60_000
+/** 手动停止开关 (system_settings key, 监听服务页「停止内置引擎」按钮写入): 'true' = 停止 */
+export const BUILTIN_DISABLED_KEY = 'builtin_engine_disabled'
 /**
  * 远程代理失联接管确认窗口: probe 结果有 30s 缓存,
  * 瞬时网络抖动/边缘波动 <90s 一律不接管 — 误接管会与代理形成两条闲鱼长连接
@@ -150,6 +153,33 @@ export function stopBuiltinEngineSupervisor(): void {
   console.log('[xianyu-engine] 内置监听引擎调度器已停止')
 }
 
+/* ------------------- 手动停止开关 (监听服务页「停止内置引擎」按钮) -------------------
+ * 开关持久化在 system_settings (共库全局): 所有共享该库的内置引擎每轮巡检 (5s) 遵守 —
+ * 停止态常驻待命: 停全部账号连接、退出失联仲裁 (绝不接管)、所有权归还远程代理。
+ * 场景: 本地开发服务器连生产库时, 内置引擎随进程自动启动并可能抢占线上监听 —
+ * 停止后即使重启进程也保持停止, 从源头杜绝再次抢占; 「启动内置引擎」按钮恢复。 */
+
+export async function isBuiltinEngineDisabled(db: Awaited<ReturnType<typeof getDb>>): Promise<boolean> {
+  const row = await db
+    .get<{ value: string }>('SELECT value FROM system_settings WHERE key_name = ?', [BUILTIN_DISABLED_KEY])
+    .catch(() => null)
+  return String(row?.value || '') === 'true'
+}
+
+export async function setBuiltinEngineDisabled(db: Awaited<ReturnType<typeof getDb>>, disabled: boolean): Promise<void> {
+  if (disabled) {
+    await db
+      .run(
+        `INSERT INTO system_settings (key_name, value) VALUES (?, 'true')
+         ON CONFLICT(key_name) DO UPDATE SET value = 'true', updated_at = CURRENT_TIMESTAMP`,
+        [BUILTIN_DISABLED_KEY],
+      )
+      .catch(() => {})
+  } else {
+    await db.run('DELETE FROM system_settings WHERE key_name = ?', [BUILTIN_DISABLED_KEY]).catch(() => {})
+  }
+}
+
 /* ---------------------------------- 门控巡检 ---------------------------------- */
 
 async function pollOnce(): Promise<void> {
@@ -162,6 +192,31 @@ async function pollOnce(): Promise<void> {
   try {
     const active = await db.get<any>('SELECT slug, type FROM engines WHERE is_active = 1 LIMIT 1')
     const builtinActive = active?.slug === 'builtin'
+
+    // 手动停止开关 (监听服务页按钮, 共库全局): 停止态常驻待命 — 不巡检/不仲裁/不建连,
+    // 停全部账号连接, 所有权归还远程代理 (内置非活跃引擎时)。开关持久化, 重启进程后保持,
+    // 防止开发服务器重启后再次抢占线上监听。
+    if (await isBuiltinEngineDisabled(db).catch(() => false)) {
+      if (!runtime.standby || runtime.clients.size) {
+        for (const client of runtime.clients.values()) await client.stop()
+        runtime.clients.clear()
+        runtime.cookieCache.clear()
+        runtime.lastClientRotateAt.clear()
+        runtime.standby = true
+        runtime.takeoverDrainUntil = 0
+        console.log('[xianyu-engine] 内置引擎处于手动停止状态: 全部账号连接已下线 (监听服务页「启动内置引擎」恢复)')
+      }
+      if (!builtinActive) {
+        const owner = await getFailoverOwner(db).catch(() => FAILOVER_REMOTE)
+        if (owner !== FAILOVER_REMOTE) {
+          await setFailoverOwner(db, FAILOVER_REMOTE)
+          console.log('[xianyu-engine] 内置引擎手动停止: 所有权已归还远程代理')
+        }
+      }
+      runtime.remoteDownSince = 0
+      runtime.remoteFreshSince = 0
+      return
+    }
 
     if (!builtinActive) {
       // 远程代理健康实测 (登记 host:port 的 /health, 30s 缓存) + 心跳新鲜度 (可靠通道):
@@ -449,13 +504,22 @@ async function markActionResult(action: EngineAction, sent: boolean, error: stri
  */
 async function probeActiveRemote(db: Awaited<ReturnType<typeof getDb>>): Promise<{ serving: boolean; reason: string }> {
   try {
-    const row = await db.get<{ host: string; port: number; last_seen_at: string | null }>(
-      `SELECT host, port, last_seen_at FROM engines
+    const row = await db.get<{ host: string; port: number; last_seen_at: string | null; last_poll_host: string | null }>(
+      `SELECT host, port, last_seen_at, last_poll_host FROM engines
        WHERE is_active = 1 AND type != 'builtin' AND enabled = 1
          AND host IS NOT NULL AND host != '' AND port IS NOT NULL AND port > 0
        LIMIT 1`,
     )
     if (!row) return { serving: true, reason: '' }
+    // 共库多站点仲裁隔离 (本地开发服务器连生产库抢占线上监听的根治):
+    // 代理配置轮询实际打到的站点 host (last_poll_host) 与本进程对外 host 不符 =
+    // 代理在服务别的站点 — 哪怕心跳陈旧/健康探测失败, 本进程也绝无权仲裁接管
+    // (接管 = 吊销真正在服务站点的代理授权 + 双连接风控)。last_poll_host 为空 =
+    // 代理从未回连 (旧版后台/全新部署), 维持原判定不改变兼容性。
+    const pollHost = String(row.last_poll_host || '').trim().toLowerCase()
+    if (pollHost && !isOwnSiteHost(pollHost)) {
+      return { serving: true, reason: '' }
+    }
     if (row.last_seen_at) {
       const raw = String(row.last_seen_at)
       const seenMs = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z')
@@ -531,6 +595,14 @@ async function heartbeatOnce(): Promise<void> {
   const db = await getDb().catch(() => null)
   if (!db) return
   try {
+    // 手动停止态不写心跳: 内置心跳陈旧 (>120s) 是 config 接口所有权残留自愈的判据 —
+    // 停止态若继续写心跳, 线上 (无内置引擎运行时) 的自愈将永不触发, 代理永久拿不到授权
+    if (await isBuiltinEngineDisabled(db).catch(() => false)) {
+      await db
+        .run("UPDATE engines SET last_status = '手动停止 (监听服务页)', updated_at = CURRENT_TIMESTAMP WHERE slug = 'builtin'")
+        .catch(() => {})
+      return
+    }
     await db
       .run(
         "UPDATE engines SET last_seen_at = CURRENT_TIMESTAMP, last_status = ? WHERE slug = 'builtin'",
