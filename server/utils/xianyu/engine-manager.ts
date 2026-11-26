@@ -426,10 +426,10 @@ async function executeActions(actions: EngineAction[]): Promise<void> {
     try {
       if (action.type === 'send_text') {
         await client.sendText(action.chat_id, action.to_user_id, action.text, action.delay_ms)
-        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.text, 'text', !!(action as any).is_ai)
+        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.text, 'text', !!(action as any).is_ai, (action as any).msg_source || '')
       } else {
         await client.sendImage(action.chat_id, action.to_user_id, action.image_url, action.width, action.height, action.delay_ms)
-        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.image_url, 'image', !!(action as any).is_ai)
+        void persistOutgoingMessage(action.account, action.chat_id, action.to_user_id, action.image_url, 'image', !!(action as any).is_ai, (action as any).msg_source || '')
       }
       await markActionResult(action, true, '')
     } catch (e: any) {
@@ -453,14 +453,14 @@ export async function sendTextToAccount(
   const client = runtime.clients.get(cookieId)
   if (client) {
     await client.sendText(chatId, toUserId, text)
-    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text')
+    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text', false, 'manual')
     return
   }
   const db = await getDb()
   if (await isProxyEngineMode(db)) {
     const r = await sendTextViaProxy(db, cookieId, chatId, toUserId, text)
     if (!r.ok) throw new Error(r.error || '代理发送失败')
-    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text')
+    await persistOutgoingMessage(cookieId, chatId, toUserId, text, 'text', false, 'manual')
     return
   }
   throw new Error(`账号 ${cookieId} 不由内置引擎托管 (切换引擎或账号未启用)`)

@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS im_messages (
     amount VARCHAR(32) DEFAULT '',
     status_text VARCHAR(64) DEFAULT '',
     msg_time TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_ai INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_ai INTEGER DEFAULT 0, send_source VARCHAR(20) DEFAULT '',
     UNIQUE(cookie_id, message_key)
   );
 CREATE TABLE IF NOT EXISTS in_app_notifications (
@@ -508,6 +508,16 @@ CREATE TABLE IF NOT EXISTS kb_groups (
   sort INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+-- AI 知识库按商品分组 (v2.4.0): 分组成员是商品 (cookie_id + item_id),
+-- 多账号商品可同组, 同一商品可进多组; AI 回复按所属分组聚合读取组内商品历史对话
+CREATE TABLE IF NOT EXISTS kb_group_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  cookie_id VARCHAR(64) NOT NULL,
+  item_id VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(group_id, cookie_id, item_id)
 );
 CREATE TABLE IF NOT EXISTS kb_questions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -730,6 +740,7 @@ CREATE INDEX IF NOT EXISTS idx_enginetasks_status ON engine_tasks(status, engine
 CREATE INDEX IF NOT EXISTS idx_fund_user ON fund_flows(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_imconv_account ON im_conversations(cookie_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_immsg_chat ON im_messages(cookie_id, chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_kbgi_item ON kb_group_items(cookie_id, item_id);
 CREATE INDEX IF NOT EXISTS idx_inapp_user_created ON in_app_notifications(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_qrlogin_user ON qr_login_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_settle_user ON settlement_records(user_id);

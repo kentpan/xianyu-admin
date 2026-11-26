@@ -228,7 +228,7 @@ cat > dist/prestart.mjs <<'PRESTART_EOF'
 // 由 deploy.sh 在打包时生成; 纯代码包同样携带(无快照文件时零动作直通)。
 import fs from 'node:fs'
 import path from 'node:path'
-
+const  __dirname = path.resolve()
 const ROOT = __dirname
 // 以下两行占位符由 deploy.sh 按打包时实际库路径替换
 const SNAPSHOT = path.join(ROOT, '__SNAPSHOT_REL__')

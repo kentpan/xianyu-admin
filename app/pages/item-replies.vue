@@ -107,8 +107,23 @@
         </label>
         <div>
           <label class="label">AI 接入配置</label>
-          <AiConfigSelect v-model="aiForm.ai_config_id" placeholder="请选择 AI 配置 (在「AI配置」页管理)" />
-          <p class="mt-1 text-slate-400">模型 / API Key / 地址统一在管理员「AI配置」页维护, 此处直接引用; 配置一处修改全局生效</p>
+          <div class="flex items-center gap-2">
+            <div class="flex-1">
+              <AiConfigSelect v-model="aiForm.ai_config_id" placeholder="留空跟随账号级 AI 配置" />
+            </div>
+            <button
+              v-if="Number(aiForm.ai_config_id) > 0"
+              class="btn-ghost !px-2 !py-1 shrink-0 text-slate-400"
+              title="清除选择, 恢复跟随账号级配置"
+              @click="aiForm.ai_config_id = 0"
+            >
+              <Icon name="x" />
+            </button>
+          </div>
+          <p class="mt-1 text-slate-400">
+            模型 / API Key / 地址统一在管理员「AI配置」页维护, 此处直接引用; 配置一处修改全局生效。
+            {{ accountConfigId ? `留空时默认使用账号级配置 (当前账号级引用 #${accountConfigId})` : '当前账号级未引用配置, 留空则该商品 AI 不生效' }}
+          </p>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
@@ -124,47 +139,29 @@
             <input v-model.number="aiForm.max_bargain_rounds" type="number" min="0" class="input" />
           </div>
         </div>
-        <!-- v2.3.0: 知识库与回复风格三开关 -->
+        <!-- v2.4.0: 知识库按商品分组 — 直接使用该商品所属分组, 同一商品允许加入多个分组 -->
         <div class="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
           <div class="px-3 py-2 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-700">
-            <p class="text-sm font-medium text-slate-700 dark:text-slate-200">知识库与回复风格 (v2.3.0)</p>
+            <p class="text-sm font-medium text-slate-700 dark:text-slate-200">知识库分组 (按商品)</p>
           </div>
-          <div class="p-3 space-y-3">
-            <label class="flex items-start gap-2 cursor-pointer">
-              <input
-                v-model="aiForm.use_item_kb"
-                type="checkbox"
-                class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500"
-                @change="onUseItemKbChange"
-              />
-              <span>
-                使用商品消息作为知识库
-                <span class="block mt-0.5 text-slate-400">AI 回复时引用本商品历史真实对话作为上下文</span>
-              </span>
-            </label>
-            <label
-              class="flex items-start gap-2"
-              :class="aiForm.use_item_kb ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
-              :title="aiForm.use_item_kb ? '' : '先开启商品消息知识库'"
-            >
-              <input
-                v-model="aiForm.share_item_kb"
-                type="checkbox"
-                class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500"
-                :disabled="!aiForm.use_item_kb"
-              />
-              <span>
-                同商品消息跨账号共享
-                <span class="block mt-0.5 text-slate-400">商品历史对话样本不限当前账号 (多账号聚合)</span>
-              </span>
-            </label>
-            <label class="flex items-start gap-2 cursor-pointer">
-              <input v-model="aiForm.use_account_style" type="checkbox" class="w-4 h-4 mt-0.5 rounded text-brand-600 focus:ring-brand-500" />
-              <span>
-                使用当前账号回复风格
-                <span class="block mt-0.5 text-slate-400">AI 语气/用语与该账号历史回复保持一致</span>
-              </span>
-            </label>
+          <div class="p-3 space-y-2">
+            <p class="text-xs text-slate-400">勾选该商品所属分组 (可多选): AI 回复时自动读取所属分组内全部商品 (跨账号) 的买家「客户」/卖家「卖家」真实消息作上下文, 自动排除自动发货回复与系统消息。分组在「AI 知识库」页管理。</p>
+            <div v-if="kbGroups.length" class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <label
+                v-for="g in kbGroups"
+                :key="g.id"
+                class="flex items-center gap-2 cursor-pointer rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+              >
+                <input
+                  v-model="aiGroupIds"
+                  type="checkbox"
+                  :value="g.id"
+                  class="w-4 h-4 rounded text-brand-600 focus:ring-brand-500"
+                />
+                <span class="text-sm text-slate-700 dark:text-slate-200 truncate">{{ g.name }}</span>
+              </label>
+            </div>
+            <p v-else class="text-sm text-slate-400">暂无分组, 请先到「AI 知识库」页创建商品分组</p>
           </div>
         </div>
         <div>
@@ -238,6 +235,9 @@ import type { AccountLite } from '~/api/accounts'
 import { getItems } from '~/api/items'
 import type { Item } from '~/api/items'
 import { getItemAiSettings, saveItemAiSettings } from '~/api/item-ai-settings'
+import { getAiSettings } from '~/api/ai-settings'
+import { getKbData, getItemKbGroups, toggleKbGroupItem } from '~/api/kb'
+import type { KbGroup } from '~/api/kb'
 
 definePageMeta({ layout: 'default' })
 
@@ -259,6 +259,13 @@ const aiModalOpen = ref(false)
 const aiSaving = ref(false)
 const aiTarget = ref<ItemReply | null>(null)
 const aiForm = ref<any>(null)
+/** 账号级 AI 配置引用 (商品级留空时的默认值) */
+const accountConfigId = ref(0)
+/** 知识库分组 (按商品): 全量分组 + 该商品当前勾选的分组 ID */
+const kbGroups = ref<KbGroup[]>([])
+const aiGroupIds = ref<number[]>([])
+/** 打开弹窗时的分组勾选快照, 保存时算差集增量同步 */
+const aiGroupIdsSnapshot = ref<number[]>([])
 
 const filtered = computed(() => {
   const k = keyword.value.trim().toLowerCase()
@@ -318,20 +325,28 @@ function openEdit(r: ItemReply) {
 async function openAiConfig(r: ItemReply) {
   aiTarget.value = r
   aiForm.value = null
+  aiGroupIds.value = []
+  aiGroupIdsSnapshot.value = []
   aiModalOpen.value = true
   try {
-    const conf = await getItemAiSettings(r.cookie_id, r.item_id)
+    const [conf, accountConf, kbData, itemGroups] = await Promise.all([
+      getItemAiSettings(r.cookie_id, r.item_id),
+      getAiSettings(r.cookie_id).catch(() => null),
+      getKbData().catch(() => ({ groups: [] as KbGroup[], members: [] })),
+      getItemKbGroups(r.cookie_id, r.item_id).catch(() => ({ groups: [] as { id: number; name: string }[] })),
+    ])
+    accountConfigId.value = Number(accountConf?.ai_config_id) || 0
+    kbGroups.value = kbData.groups
+    aiGroupIds.value = itemGroups.groups.map((g) => g.id)
+    aiGroupIdsSnapshot.value = [...aiGroupIds.value]
     aiForm.value = {
       ai_enabled: !!Number(conf.ai_enabled),
-      ai_config_id: Number(conf.ai_config_id) || 0,
+      // v2.4.0 默认值: 商品级未引用时预填账号级引用配置 (留空=跟随账号级, 运行时回退)
+      ai_config_id: Number(conf.ai_config_id) || accountConfigId.value || 0,
       max_discount_percent: conf.max_discount_percent ?? 10,
       max_discount_amount: conf.max_discount_amount ?? 100,
       max_bargain_rounds: conf.max_bargain_rounds ?? 3,
       custom_prompts: conf.custom_prompts || '',
-      // v2.3.0 三开关 (0/1 → 布尔, 默认关闭)
-      use_item_kb: !!Number(conf.use_item_kb ?? 0),
-      share_item_kb: !!Number(conf.share_item_kb ?? 0),
-      use_account_style: !!Number(conf.use_account_style ?? 0),
     }
   } catch (e: any) {
     toast.error(e.message || 'AI 配置加载失败')
@@ -339,20 +354,25 @@ async function openAiConfig(r: ItemReply) {
   }
 }
 
-/** 关闭「使用商品消息作为知识库」时, 子选项「跨账号共享」一并关闭 */
-function onUseItemKbChange() {
-  if (aiForm.value && !aiForm.value.use_item_kb) {
-    aiForm.value.share_item_kb = false
+/** 分组勾选差集增量同步 (v2.4.0): 新勾选的加入分组, 取消勾选的移出分组 */
+async function syncItemGroups() {
+  const t = aiTarget.value
+  if (!t) return
+  const before = new Set(aiGroupIdsSnapshot.value)
+  const after = new Set(aiGroupIds.value)
+  const toAdd = [...after].filter((id) => !before.has(id))
+  const toRemove = [...before].filter((id) => !after.has(id))
+  for (const groupId of toAdd) {
+    await toggleKbGroupItem(groupId, t.cookie_id, t.item_id, 'add')
+  }
+  for (const groupId of toRemove) {
+    await toggleKbGroupItem(groupId, t.cookie_id, t.item_id, 'remove')
   }
 }
 
 async function saveAiConfig() {
   const t = aiTarget.value
   if (!t || !aiForm.value) return
-  if (aiForm.value.ai_enabled && !Number(aiForm.value.ai_config_id)) {
-    toast.error('开启该商品 AI 回复前请选择 AI 配置 (可先到管理员「AI配置」页新建)')
-    return
-  }
   aiSaving.value = true
   try {
     await saveItemAiSettings({
@@ -364,11 +384,8 @@ async function saveAiConfig() {
       max_discount_amount: Number(aiForm.value.max_discount_amount) || 0,
       max_bargain_rounds: Number(aiForm.value.max_bargain_rounds) || 0,
       custom_prompts: aiForm.value.custom_prompts || '',
-      // v2.3.0 三开关: 布尔 → 0/1 (后端两者均兼容)
-      use_item_kb: aiForm.value.use_item_kb ? 1 : 0,
-      share_item_kb: aiForm.value.share_item_kb ? 1 : 0,
-      use_account_style: aiForm.value.use_account_style ? 1 : 0,
     })
+    await syncItemGroups()
     toast.success('商品 AI 配置已保存')
     aiModalOpen.value = false
     reload()

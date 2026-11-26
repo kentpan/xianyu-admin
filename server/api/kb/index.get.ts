@@ -1,49 +1,39 @@
 /**
- * GET /api/kb — AI 知识库全量数据 (v2.3.0)。
+ * GET /api/kb — AI 知识库 (v2.4.0 商品分组模型) 全量数据。
  *
- * 一次拉取: 分组 + 问话 + 回答 + 分组成员映射 + 已捕获消息 ID 集合
- * (消息管理页「已添加到知识库 ✅」标志依据)。知识库条目为人工精选规模
- * (数十~数百条), 全量拉取最简单可靠, 前端 3 列表各自分页渲染。
- * 问话/回答按 sort 升序 (sort 即优先级, AI 检索同序)。
+ * 分组 = 商品组: 成员是商品 (cookie_id + item_id), 多账号商品可同组, 同一商品可进多组。
+ * AI 回复时按当前商品所属分组聚合读取组内全部商品的历史真实对话作知识库
+ * (买家=客户 / 卖家, 排除自动发货回复与系统消息, 见 brain.loadGroupKbContext)。
+ * 分组与成员为人工精选规模, 全量拉取最简单可靠; 成员行 LEFT JOIN item_info/cookies
+ * 补齐商品标题与账号备注供前端展示。
  */
 export default defineEventHandler(
   withApi(async (event) => {
     requireUser(event)
     const db = await getDb()
 
-    const [groups, questions, answers, members, capturedQ, capturedA] = await Promise.all([
+    const [groups, members] = await Promise.all([
       db.all('SELECT id, name, sort, created_at, updated_at FROM kb_groups ORDER BY sort ASC, id ASC').catch(() => []),
       db
         .all(
-          `SELECT id, content, source_message_id, source_chat_id, source_cookie_id, item_id, buyer_id,
-                  freq, sort, ai_hit_count, ai_last_used_at, created_at, updated_at
-           FROM kb_questions ORDER BY sort ASC, id ASC`,
+          `SELECT gi.id, gi.group_id, gi.cookie_id, gi.item_id,
+                  COALESCE(i.item_title, '') AS item_title,
+                  COALESCE(c.remark, '') AS cookie_remark,
+                  gi.created_at
+           FROM kb_group_items gi
+           LEFT JOIN item_info i ON i.cookie_id = gi.cookie_id AND i.item_id = gi.item_id
+           LEFT JOIN cookies c ON c.id = gi.cookie_id
+           ORDER BY gi.group_id ASC, gi.id ASC`,
         )
         .catch(() => []),
-      db
-        .all(
-          `SELECT id, content, source_message_id, source_chat_id, source_cookie_id, item_id,
-                  is_ai_generated, freq, sort, ai_hit_count, ai_last_used_at, created_at, updated_at
-           FROM kb_answers ORDER BY sort ASC, id ASC`,
-        )
-        .catch(() => []),
-      db.all('SELECT group_id, item_type, item_id FROM kb_group_members').catch(() => []),
-      db.all("SELECT source_message_id FROM kb_questions WHERE source_message_id != ''").catch(() => []),
-      db.all("SELECT source_message_id FROM kb_answers WHERE source_message_id != ''").catch(() => []),
     ])
 
-    const captured = [...capturedQ, ...capturedA].map((r: any) => String(r.source_message_id))
     return ok({
       groups,
-      questions,
-      answers,
       members,
-      captured,
       stats: {
         groups: groups.length,
-        questions: questions.length,
-        answers: answers.length,
-        ai_hits: questions.concat(answers).reduce((s: number, r: any) => s + Number(r.ai_hit_count || 0), 0),
+        members: members.length,
       },
     })
   }),

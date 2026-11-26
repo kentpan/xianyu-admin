@@ -228,13 +228,18 @@ export default defineEventHandler(
                 .catch(() => null)
               if (logRow?.chat_id && logRow.reply_text) {
                 // AI 标志 (v2.3.0): reply_strategy=ai 的日志随单落 is_ai (仅管理后台可见)
+                // 来源标记 (v2.4.0): reply_strategy 作为 send_source 落库, 与内置引擎
+                // executeActions 的 EngineAction.msg_source 同语义 (回声去重/知识库过滤依赖)
+                const strategy = String(logRow.reply_strategy || '')
+                const source = ['ai', 'keyword', 'item_replay', 'default', 'delivery'].includes(strategy) ? strategy : ''
                 void persistOutgoingMessage(
                   logRow.cookie_id || account,
                   logRow.chat_id,
                   logRow.sender_user_id || '',
                   logRow.reply_text,
                   'text',
-                  String(logRow.reply_strategy || '') === 'ai',
+                  strategy === 'ai',
+                  source,
                 )
               }
             }

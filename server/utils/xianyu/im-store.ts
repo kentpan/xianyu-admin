@@ -61,6 +61,30 @@ function messageKey(parts: (string | number)[]): string {
   return crypto.createHash('md5').update(parts.join('|')).digest('hex')
 }
 
+/**
+ * 引擎回声检测 (v2.4.0): 引擎自动发出 (关键词/AI/发货/后台手动发送, send_source 非空) 的
+ * 消息会经平台同步通道以 isSelf 事件原样回传。命中 10 分钟内同会话同内容的引擎发出记录
+ * → 返回其来源标记, 调用方据此跳过重复落库 / 跳过「人工回复」误判 (暂停+决策日志)。
+ * 真正的 APP 人工回复没有先行落库的引擎记录 (send_source='') → 不命中, 走人工语义。
+ */
+export async function findRecentEngineSent(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  chatId: string,
+  content: string,
+): Promise<string> {
+  const row = await db
+    .get<{ send_source: string }>(
+      `SELECT send_source FROM im_messages
+       WHERE cookie_id = ? AND chat_id = ? AND direction = 'out' AND send_source != ''
+         AND content = ? AND msg_time >= datetime('now', '-10 minutes')
+       ORDER BY id DESC LIMIT 1`,
+      [cookieId, chatId, content],
+    )
+    .catch(() => null)
+  return row?.send_source || ''
+}
+
 export interface ImUpsertResult {
   stored: boolean
   conversationId: string
@@ -71,6 +95,13 @@ export async function persistChatMessage(cookieId: string, msg: ParsedChatMessag
   const db = await getDb().catch(() => null)
   if (!db || !msg.chatId) return { stored: false, conversationId: '' }
   const direction = msg.isSelf ? 'out' : 'in'
+  // 引擎回声去重: 引擎自动发出的消息 (关键词/AI/发货等, send_source 非空) 会经平台同步
+  // 以 isSelf 事件回传, 与 persistOutgoingMessage 已落的行重复 — 命中近期同内容引擎发出
+  // 记录时直接跳过, 不再重复落库 (后台手动发送的回声同理, send_source='manual')
+  if (msg.isSelf) {
+    const echoed = await findRecentEngineSent(db, cookieId, msg.chatId, msg.content)
+    if (echoed) return { stored: false, conversationId: msg.chatId }
+  }
   const key = messageKey([cookieId, msg.chatId, msg.senderUserId, msg.createTime, msg.content, direction])
   const timeStr = imTimestamp(msg.createTime)
   const contentType = msg.content.startsWith('[图片]') || msg.raw?.['1']?.['10']?.reminderContentType === 2 ? 'image' : 'text'
@@ -121,7 +152,12 @@ export async function persistSystemMessage(cookieId: string, msg: ParsedSystemMe
   }
 }
 
-/** 出站消息落库 (引擎回复/手动发送共用)。isAi=true 时写入 AI 标志 (仅管理后台可见, v2.3.0)。 */
+/**
+ * 出站消息落库 (引擎回复/手动发送共用)。isAi=true 时写入 AI 标志 (仅管理后台可见, v2.3.0)。
+ * source = 消息来源标记 (v2.4.0, 写入 im_messages.send_source): ''=APP 人工回复,
+ * 'manual'=后台消息页手动发送, keyword/item_replay/ai/default/delivery = 引擎自动发出 —
+ * 引擎回声去重与分组知识库读取 (排除自动发货回复) 都依赖此标记。
+ */
 export async function persistOutgoingMessage(
   cookieId: string,
   chatId: string,
@@ -129,6 +165,7 @@ export async function persistOutgoingMessage(
   content: string,
   contentType: 'text' | 'image',
   isAi = false,
+  source = '',
 ): Promise<void> {
   const db = await getDb().catch(() => null)
   if (!db || !chatId) return
@@ -136,9 +173,9 @@ export async function persistOutgoingMessage(
   const key = messageKey([cookieId, chatId, 'out', Date.now(), content, Math.random()])
   await db
     .run(
-      `INSERT OR IGNORE INTO im_messages (cookie_id, chat_id, direction, message_key, sender_user_id, sender_nick, content, content_type, msg_time, is_ai)
-       VALUES (?, ?, 'out', ?, ?, '我', ?, ?, ?, ?)`,
-      [cookieId, chatId, key, toUserId, content, contentType, timeStr, isAi ? 1 : 0],
+      `INSERT OR IGNORE INTO im_messages (cookie_id, chat_id, direction, message_key, sender_user_id, sender_nick, content, content_type, msg_time, is_ai, send_source)
+       VALUES (?, ?, 'out', ?, ?, '我', ?, ?, ?, ?, ?)`,
+      [cookieId, chatId, key, toUserId, content, contentType, timeStr, isAi ? 1 : 0, source],
     )
     .catch(() => {})
   await upsertConversation(cookieId, chatId, {

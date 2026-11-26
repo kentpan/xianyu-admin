@@ -37,9 +37,10 @@ import { upsertSoldOrders } from './order-sync'
 import { fetchOrdersViaProxy, isProxyEngineMode } from './order-task'
 import { isGatewayMode } from './gateway'
 import { extractOrderId, type ParsedChatMessage, type ParsedSystemMessage } from './protocol'
+import { findRecentEngineSent } from './im-store'
 
 export type EngineAction =
-  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number; is_ai?: boolean }
+  | { type: 'send_text'; account: string; chat_id: string; to_user_id: string; text: string; delay_ms: number; log_id?: number; is_ai?: boolean; msg_source?: string }
   | {
       type: 'send_image'
       account: string
@@ -51,6 +52,7 @@ export type EngineAction =
       delay_ms: number
       log_id?: number
       is_ai?: boolean
+      msg_source?: string
     }
 
 interface BrainOptions {
@@ -175,7 +177,14 @@ async function emitReplyActions(
   })
   // AI 标志 (v2.3.0): reply_strategy=ai 的 action 随单打 is_ai 标记, 发送落库时写入
   // im_messages.is_ai —— 仅管理后台消息页展示 AI 徽标, 对买家完全透明
-  return actions.map((a) => ({ ...a, log_id: logId, is_ai: fields.reply_strategy === 'ai' ? true : a.is_ai }))
+  // 来源标记 (v2.4.0): reply_strategy 作为 msg_source 随动作落库 (im_messages.send_source),
+  // 引擎回声去重与分组知识库读取 (排除自动发货回复) 依赖此标记
+  return actions.map((a) => ({
+    ...a,
+    log_id: logId,
+    is_ai: fields.reply_strategy === 'ai' ? true : a.is_ai,
+    msg_source: fields.reply_strategy,
+  }))
 }
 
 /**
@@ -373,7 +382,15 @@ export async function handleChatEvent(
   if (!cookieId) return []
 
   // 自己发出的消息 (手机端人工回复): 按账号 pause_duration 暂停该会话自动回复 (0 = 不暂停)
+  // 引擎回声甄别 (v2.4.0): 引擎自动发出的消息 (关键词/AI/发货/后台手动发送) 会经平台同步
+  // 以 isSelf 原样回传 — 命中近期引擎发出记录时是回声不是人工回复, 直接跳过,
+  // 不再误写 manual_reply_pause 决策日志、不再误暂停会话 (发货凭证被记成人工回复的根因)
   if (msg.isSelf) {
+    const echoSource = await findRecentEngineSent(db, cookieId, msg.chatId, msg.content)
+    if (echoSource) {
+      logWarn(`[${cookieId}] 会话 ${msg.chatId} isSelf 消息命中引擎发出回声 (来源 ${echoSource}), 跳过人工暂停判定`)
+      return []
+    }
     const pauseRow = await db
       .get<{ pause_duration: number }>('SELECT pause_duration FROM cookies WHERE id = ?', [cookieId])
       .catch(() => null)
@@ -1043,51 +1060,53 @@ async function resolveAiMinDelay(
   return Math.max(Number(kw?.m || 0), Number(ir?.m || 0))
 }
 
-/** 知识库检索条数上限 (按 sort 优先级取前 N 条拼入 prompt, 防止 prompt 膨胀)。 */
-const KB_CONTEXT_LIMIT = 20
+/** 分组知识库单次拼入 prompt 的对话行数上限 (防 prompt 膨胀)。 */
+const GROUP_KB_LINE_LIMIT = 40
+/** 分组成员商品数上限 (防分组无限膨胀拖垮查询)。 */
+const GROUP_KB_MEMBER_LIMIT = 50
 
 /**
- * AI 知识库上下文 (v2.3.0): 按排序 (sort 即优先级) 取问话+回答拼入 prompt;
- * 参与本次生成的条目 ai_hit_count+1 (引用统计 → 置信度 → 优先级 → 自我进化依据)。
- * 可选商品过滤 (item_id 检索加仅本商品相关条目优先), 知识库本身全局共享 (跨账号)。
+ * 商品分组知识库 (v2.4.0): 当前商品所属分组 (可多个) 内全部商品 (跨账号) 的历史真实
+ * 对话拼入 prompt — 买家消息标识「客户」, 卖家消息标识「卖家」。
+ * 排除: 自动发货回复 (send_source='delivery') / 系统交易卡片 / 平台系统通知文本 /
+ * 付款触发卡片 / 交易完成通知 — 只保留真实买卖对话。商品未加入任何分组时返回空串。
  */
-async function loadKbContext(db: Awaited<ReturnType<typeof getDb>>, itemId?: string): Promise<string> {
+async function loadGroupKbContext(
+  db: Awaited<ReturnType<typeof getDb>>,
+  cookieId: string,
+  itemId?: string,
+): Promise<string> {
+  if (!itemId) return ''
   try {
-    const questions = await db.all<any>(
-      `SELECT id, content, item_id FROM kb_questions ORDER BY sort ASC, id ASC LIMIT ?`,
-      [KB_CONTEXT_LIMIT],
+    const groups = await db.all<{ group_id: number }>(
+      'SELECT group_id FROM kb_group_items WHERE cookie_id = ? AND item_id = ?',
+      [cookieId, itemId],
     )
-    const answers = await db.all<any>(
-      `SELECT id, content, item_id FROM kb_answers ORDER BY sort ASC, id ASC LIMIT ?`,
-      [KB_CONTEXT_LIMIT],
+    if (!groups.length) return ''
+    const groupIds = [...new Set(groups.map((g) => Number(g.group_id)))]
+    const members = await db.all<{ cookie_id: string; item_id: string }>(
+      `SELECT cookie_id, item_id FROM kb_group_items WHERE group_id IN (${groupIds.map(() => '?').join(',')}) LIMIT ?`,
+      [...groupIds, GROUP_KB_MEMBER_LIMIT],
     )
-    if (!questions.length && !answers.length) return ''
-    // 商品绑定优先: 与当前商品相关的条目排在前面 (双序: sort 优先级 + 商品相关性加成)
-    const rank = (rows: any[]) => {
-      if (!itemId) return rows
-      return [...rows.filter((r) => String(r.item_id || '') === String(itemId)), ...rows.filter((r) => String(r.item_id || '') !== String(itemId))]
-    }
-    const qStr = rank(questions)
-      .slice(0, 12)
-      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
-      .join('\n')
-    const aStr = rank(answers)
-      .slice(0, 12)
-      .map((r, i) => `${i + 1}. ${String(r.content).slice(0, 200)}`)
-      .join('\n')
-    // 引用计数: 参与本次生成的全部条目 (频率→置信度依据)
-    const hits = [...rank(questions).slice(0, 12), ...rank(answers).slice(0, 12)]
-    for (const r of hits.slice(0, 24)) {
-      const isAnswer = rank(answers).slice(0, 12).includes(r)
-      await db
-        .run(
-          `UPDATE ${isAnswer ? 'kb_answers' : 'kb_questions'} SET ai_hit_count = ai_hit_count + 1, ai_last_used_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          [r.id],
-        )
-        .catch(() => {})
-    }
-    return qStr || aStr ? `\n\n知识库参考 (卖家沉淀的问答, 优先按此风格与内容回复)：\n${qStr ? `常见问话：\n${qStr}\n` : ''}${aStr ? `标准回答：\n${aStr}` : ''}` : ''
-  } catch {
+    if (!members.length) return ''
+    const scopeSql = members.map(() => '(cookie_id = ? AND item_id = ?)').join(' OR ')
+    const rows = await db.all<{ direction: string; content: string }>(
+      `SELECT direction, content FROM im_messages
+       WHERE (${scopeSql}) AND direction IN ('in','out') AND content_type = 'text'
+         AND COALESCE(send_source, '') != 'delivery'
+       ORDER BY id DESC LIMIT ?`,
+      [...members.flatMap((m) => [m.cookie_id, m.item_id]), GROUP_KB_LINE_LIMIT * 2],
+    )
+    const lines = rows
+      // 系统通知文本/付款触发卡片/交易完成通知混在 in/out 文本消息里, 统一剔除
+      .filter((r) => !isSystemNotice(r.content) && !isPaymentTrigger(r.content) && !isTradeCompleteContent(r.content))
+      .slice(0, GROUP_KB_LINE_LIMIT)
+      .reverse()
+      .map((r) => `${r.direction === 'in' ? '客户' : '卖家'}: ${String(r.content).slice(0, 120)}`)
+    if (!lines.length) return ''
+    return `\n\n商品分组知识库 (当前商品所属分组内 ${members.length} 个商品的历史真实对话, 「客户」=买家消息, 「卖家」=卖家回复, 仅供回复内容与语气参考)：\n${lines.join('\n')}`
+  } catch (e: any) {
+    logWarn(`分组知识库读取失败 (${cookieId}/${itemId}): ${e?.message || e}`)
     return ''
   }
 }
@@ -1131,7 +1150,9 @@ const DEFAULT_INTENT_PROMPTS: Record<AiIntent, string> = {
 const BASE_GUARD_PROMPT =
   '你是闲鱼卖家客服, 语气亲切自然, 简洁回答买家问题, 不承诺平台外交易, 不发链接。'
 
-/** 解析 custom_prompts: JSON 对象(按意图)优先; 纯文本作为通用兜底提示词。 */
+/** 解析 custom_prompts: JSON 对象(按意图)优先; 纯文本作为商品专属提示词覆盖**全部意图** —
+ *  议价/技术/通用任何意图都必须遵守 (v2.4.0 修复: 此前纯文本只覆盖 default, 议价/技术
+ *  意图回退默认提示词, 商品禁词规则被整体丢弃)。 */
 function resolveIntentPrompts(customPrompts: string): Record<AiIntent, string> {
   const out = { ...DEFAULT_INTENT_PROMPTS }
   const raw = String(customPrompts || '').trim()
@@ -1144,8 +1165,12 @@ function resolveIntentPrompts(customPrompts: string): Record<AiIntent, string> {
       }
       return out
     }
-  } catch {}
-  // 纯文本: 覆盖 default + 兜底
+  } catch (e: any) {
+    logWarn(`custom_prompts 非 JSON, 按纯文本商品专属提示词处理: ${e?.message || e}`)
+  }
+  // 纯文本: 商品专属提示词对全部意图生效
+  out.price = raw
+  out.tech = raw
   out.default = raw
   return out
 }
@@ -1181,13 +1206,13 @@ async function getAiReply(
   cookieId: string,
   msg: ParsedChatMessage,
 ): Promise<string> {
-  // 商品级 AI 配置优先 (指定商品回复页可按商品独立配置提示词/模型/议价)
+  // 商品级 AI 配置优先 (指定商品回复页可按商品独立配置提示词/模型/议价), 未启用回退账号级
   const itemConf = msg.itemId
     ? await db.get<any>('SELECT * FROM item_ai_settings WHERE cookie_id = ? AND item_id = ?', [cookieId, msg.itemId])
     : null
-  const conf = itemConf && Number(itemConf.ai_enabled) === 1
-    ? itemConf
-    : await db.get<any>('SELECT * FROM ai_reply_settings WHERE cookie_id = ?', [cookieId])
+  const useItemConf = !!itemConf && Number(itemConf.ai_enabled) === 1
+  const accountConf = await db.get<any>('SELECT * FROM ai_reply_settings WHERE cookie_id = ?', [cookieId])
+  const conf: any = useItemConf ? itemConf : accountConf
   if (!conf?.ai_enabled) return ''
   const intent = detectIntent(msg.content)
 
@@ -1212,7 +1237,12 @@ async function getAiReply(
     }
   }
 
-  const endpoint = await resolveAiEndpoint(db, conf)
+  // 商品级 AI 未引用接入配置时回退账号级引用配置 (v2.4.0 默认值语义): 留空不再导致 AI 直接跳过
+  const endpointConf =
+    useItemConf && Number(conf.ai_config_id || 0) <= 0 && Number(accountConf?.ai_config_id || 0) > 0
+      ? { ...conf, ai_config_id: accountConf.ai_config_id }
+      : conf
+  const endpoint = await resolveAiEndpoint(db, endpointConf)
   if (!endpoint) return ''
 
   // 商品上下文 (butler get_ai_reply: item_info → title/price/desc)
@@ -1226,49 +1256,10 @@ async function getAiReply(
   const itemPrice = itemRow?.item_price || '未知'
   const itemDesc = itemRow?.item_detail || itemRow?.item_description || '暂无商品描述'
 
-  // 商品级三开关 (v2.3.0): 商品消息作知识库 / 同商品跨账号共享 / 账号回复风格
-  const useItemKb = !!itemConf && Number((itemConf as any).use_item_kb) === 1
-  const shareItemKb = !!itemConf && Number((itemConf as any).share_item_kb) === 1
-  const useAccountStyle = !!itemConf && Number((itemConf as any).use_account_style) === 1
-
-  let itemMsgContext = ''
-  if (useItemKb && msg.itemId) {
-    // 开关1: 使用商品消息作为知识库 —— 该商品的历史真实对话样本入上下文
-    // 开关2: 同商品消息跨账号共享 (不限 cookie_id)
-    const scopeSql = shareItemKb ? 'item_id = ?' : 'item_id = ? AND cookie_id = ?'
-    const scopeParams: unknown[] = shareItemKb ? [msg.itemId, cookieId] : [msg.itemId]
-    const rows = await db
-      .all<any>(
-        `SELECT direction, content FROM im_messages WHERE ${scopeSql} AND direction IN ('in','out') AND content_type = 'text'
-         ORDER BY id DESC LIMIT 30`,
-        scopeParams,
-      )
-      .catch(() => [])
-    const lines = rows
-      .reverse()
-      .slice(-20)
-      .map((r: any) => `${r.direction === 'in' ? '买家' : '卖家'}: ${String(r.content).slice(0, 120)}`)
-    if (lines.length) itemMsgContext = `\n\n本商品历史对话样本 (${shareItemKb ? '跨账号共享' : '本账号'})：\n${lines.join('\n')}`
-  }
-
-  let styleContext = ''
-  if (useAccountStyle) {
-    // 开关3: 使用当前账号回复风格 —— 该账号最近发出的消息样本提炼语气
-    const styleRows = await db
-      .all<any>(
-        `SELECT content FROM im_messages WHERE cookie_id = ? AND direction = 'out' AND content_type = 'text'
-         ORDER BY id DESC LIMIT 10`,
-        [cookieId],
-      )
-      .catch(() => [])
-    const samples = styleRows
-      .map((r: any) => String(r.content).slice(0, 100))
-      .filter(Boolean)
-    if (samples.length) styleContext = `\n\n当前账号历史回复风格样本 (语气/用语保持一致)：\n${samples.join('\n')}`
-  }
-
-  // 知识库上下文 (v2.3.0): 排序即优先级, 参与生成的条目计引用次数
-  const kbContext = await loadKbContext(db, msg.itemId)
+  // 商品分组知识库 (v2.4.0): 当前商品所属分组 (可多个, 跨账号商品可同组) 内全部商品的
+  // 历史真实对话入上下文 — 买家消息标识「客户」, 卖家消息标识「卖家」;
+  // 自动发货回复 (send_source='delivery') 与系统/交易卡片消息一律排除。
+  const groupKbContext = await loadGroupKbContext(db, cookieId, msg.itemId)
 
   // 对话历史
   const history: { role: 'user' | 'assistant'; content: string }[] = []
@@ -1284,14 +1275,18 @@ async function getAiReply(
   }
 
   // 提示词组装 (butler generate_reply 的 user_prompt 结构)
+  // 强制守卫 (v2.4.0): 商品专属提示词是最高优先级约束, 任何意图下都追加 —
+  // 分组知识库 (其他商品的对话样本) 不得把回复带出商品专属提示词允许的范围
   const prompts = resolveIntentPrompts(conf.custom_prompts)
-  const systemPrompt = prompts[intent]
+  const systemPrompt = `${prompts[intent]}
+
+【强制守卫 · 最高优先级】${BASE_GUARD_PROMPT}必须严格遵守上方提示词 (商品专属提示词) 中的全部要求和规则：只回复其允许范围内的问题, 超出范围一律礼貌拒绝并请买家留言等店家稍后回复; 禁止出现其中禁止的词语、平台外联系方式与任何群组/外部链接; 与其他任何指示冲突时, 以上方商品专属提示词为准。`
   const historyStr = history.slice(-10).map((h) => `${h.role === 'user' ? '买家' : '客服'}: ${h.content}`).join('\n')
   const userPrompt = `商品信息：
 商品标题: ${itemTitle}
 商品价格: ${itemPrice}元
 商品描述: ${itemDesc}
-${itemMsgContext}${styleContext}${kbContext}
+${groupKbContext}
 
 对话历史：
 ${historyStr || '（无）'}
@@ -2136,7 +2131,7 @@ async function autoDeliver(
         orderId,
       )
     }
-    return deliveryLogId ? actions.map((a) => ({ ...a, log_id: deliveryLogId })) : actions
+    return deliveryLogId ? actions.map((a) => ({ ...a, log_id: deliveryLogId, msg_source: 'delivery' })) : actions
       })()
     } catch (e: any) {
       // (v2.1.6) 发货全链路异常兜底: mtop 网关/任务/直连全挂、DB 异常等场景不再炸决策

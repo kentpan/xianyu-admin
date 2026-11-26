@@ -6,6 +6,7 @@ dist
 *.log
 dev.log
 prisma/*.db
+prisma/*.db-*
 prisma/dev.db-journal
 install.lock
 .env.local

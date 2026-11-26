@@ -550,6 +550,8 @@ const SCHEMA: string[] = [
     status_text VARCHAR(64) DEFAULT '',
     msg_time TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_ai INTEGER DEFAULT 0,
+    send_source VARCHAR(20) DEFAULT '',
     UNIQUE(cookie_id, message_key)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_immsg_chat ON im_messages(cookie_id, chat_id, id)`,
@@ -1101,6 +1103,28 @@ const MIGRATIONS: string[] = [
     write_queries INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
+
+  // ---- AI 知识库按商品分组 (v2.4.0) ----
+  // 分组 = 商品组: 成员是商品 (cookie_id + item_id), 多个账号下的商品可归入同一组,
+  // 同一商品允许加入多个分组。AI 回复时按当前商品所属分组聚合读取组内全部商品的
+  // 历史真实对话 (买家=客户 / 卖家, 排除自动发货回复与系统消息) 作为知识库上下文。
+  `CREATE TABLE IF NOT EXISTS kb_group_items (
+    id __AUTO__,
+    group_id INTEGER NOT NULL,
+    cookie_id VARCHAR(64) NOT NULL,
+    item_id VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(group_id, cookie_id, item_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_kbgi_item ON kb_group_items(cookie_id, item_id)`,
+  // 消息来源标记: ''=买家消息/APP 人工回复, 'manual'=后台消息页手动发送,
+  // ai/keyword/item_replay/default/delivery = 引擎自动发出 (随 EngineAction.msg_source 落库)。
+  // 用途: ① 引擎回声去重 — 引擎自己发出的消息经平台同步回来 (isSelf) 不再重复落库,
+  //   也不再被误判为「人工回复」写手动回复暂停日志/误暂停会话;
+  // ② 分组知识库读取时排除自动发货回复 (send_source='delivery')。
+  `ALTER TABLE im_messages ADD COLUMN send_source VARCHAR(20) DEFAULT ''`,
+  // is_ai 列补齐 (d1-schema.sql 建表含此列但本文件 im_messages CREATE 历史遗漏, ALTER 幂等)
+  `ALTER TABLE im_messages ADD COLUMN is_ai INTEGER DEFAULT 0`,
 ]
 
 const DEFAULT_SETTINGS: { key: string; value: string; description: string }[] = [
